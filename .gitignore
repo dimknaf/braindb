@@ -1,0 +1,36 @@
+# Environment — never commit real credentials
+.env
+.env.local
+.env.*.local
+
+# Claude Code — settings.json, scheduled_tasks.lock, and any future state
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Test / lint artifacts
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+*.stackdump
+
+# Datasources — user content, not tracked except .gitkeep and README.md
+data/sources/*
+!data/sources/.gitkeep
+!data/sources/README.md
