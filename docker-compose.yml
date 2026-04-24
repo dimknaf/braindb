@@ -30,7 +30,7 @@ services:
     networks:
       - local-network
     environment:
-      BRAINDB_API_URL: http://api:8000
+      BRAINDB_API_URL: http://api:${API_PORT:-8000}
       INGEST_POLL_INTERVAL: ${INGEST_POLL_INTERVAL:-7}
     volumes:
       - .:/app
