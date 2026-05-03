@@ -1,8 +1,32 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: braindb_postgres
+    restart: unless-stopped
+    networks:
+      local-network:
+        aliases:
+          - braindb_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-braindb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-braindb}
+      POSTGRES_DB: ${POSTGRES_DB:-braindb}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
   api:
     build: .
+    image: braindb:local
     container_name: braindb_api
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - local-network
     environment:
@@ -11,6 +35,9 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       LLM_PROFILE: ${LLM_PROFILE:-deepinfra}
       AGENT_MODEL: ${AGENT_MODEL:-}
+      AGENT_BASE_URL: ${AGENT_BASE_URL:-}
+      AGENT_API_KEY: ${AGENT_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       NVIDIA_NIM_API_KEY: ${NVIDIA_NIM_API_KEY:-}
       DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY:-}
       VLLM_API_KEY: ${VLLM_API_KEY:-}
@@ -25,10 +52,10 @@ services:
     volumes:
       - .:/app
     command: >
-      sh -c "alembic upgrade head && uvicorn braindb.main:app --host 0.0.0.0 --port ${API_PORT:-8000} --reload"
+      sh -c "until python -c 'import os, psycopg2; conn = psycopg2.connect(os.environ[\"DATABASE_URL\"]); conn.close()'; do echo waiting for database; sleep 2; done; alembic upgrade head && uvicorn braindb.main:app --host 0.0.0.0 --port ${API_PORT:-8000} --reload"
 
   watcher:
-    build: .
+    image: braindb:local
     container_name: braindb_watcher
     restart: unless-stopped
     depends_on:
@@ -45,3 +72,6 @@ services:
 networks:
   local-network:
     external: true
+
+volumes:
+  postgres-data:

@@ -5,6 +5,8 @@
 
 # Claude Code — settings.json, scheduled_tasks.lock, and any future state
 .claude/
+.codex
+.codex/
 
 # Python
 __pycache__/

@@ -1,0 +1,34 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# VCS and local agent/editor state
+.git/
+.gitignore
+.claude/
+.codex
+.codex/
+.vscode/
+.idea/
+
+# Python/test/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+dist/
+build/
+
+# Runtime/user data
+data/sources/*
+!data/sources/.gitkeep
+!data/sources/README.md
+
+# OS noise
+.DS_Store
+Thumbs.db
+*.stackdump
