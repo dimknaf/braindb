@@ -10,7 +10,7 @@ Prerequisites: Docker Desktop (or any Docker Engine), Python 3.12, a Postgres 16
 git clone <repo-url> braindb
 cd braindb
 cp .env.example .env
-# edit .env — set DATABASE_URL, pick an LLM_PROFILE, fill in the matching API key
+# edit .env — set DATABASE_URL, pick an LLM_PROFILE, fill in the matching API key or OpenAI-compatible endpoint
 
 docker network create local-network       # one-time; docker-compose expects this
 docker compose up -d --build
@@ -45,8 +45,8 @@ LiteLLM does the heavy lifting — providers are selected by a prefix in the mod
        "api_key_env": "MY_PROVIDER_API_KEY",
    },
    ```
-2. Add `MY_PROVIDER_API_KEY=` to [`.env.example`](.env.example).
-3. Add the env passthrough to [`docker-compose.yml`](docker-compose.yml) under the `api` service.
+2. Add `MY_PROVIDER_API_KEY=` to [`.env.example`](.env.example) if the provider needs auth.
+3. Add the env passthrough to [`docker-compose.yml`](docker-compose.yml) under the `api` service. OpenAI-compatible endpoints can use `LLM_PROFILE=openai_compatible` plus `AGENT_BASE_URL` / `AGENT_API_KEY` variables.
 4. (Optional) Document the provider in the README and BRAINDB_GUIDE.
 
 No other code changes required — the agent resolves model and key through `settings.resolved_agent_model` and `settings.resolved_api_key`, which read the active profile.

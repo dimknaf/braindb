@@ -306,7 +306,7 @@ curl -X POST http://localhost:8000/api/v1/entities/datasources/ingest \
 
 ### BrainDB Agent — natural language queries
 
-`POST /api/v1/agent/query` — instead of orchestrating individual API calls, send a plain English request and let BrainDB's internal agent handle it. The agent uses the OpenAI Agents SDK with LiteLLM (provider pluggable via `LLM_PROFILE` — default `deepinfra`, `nim` also supported) and has access to all 21 BrainDB operations as function tools.
+`POST /api/v1/agent/query` — instead of orchestrating individual API calls, send a plain English request and let BrainDB's internal agent handle it. The agent uses the OpenAI Agents SDK with LiteLLM (provider pluggable via `LLM_PROFILE` — default `deepinfra`, with `nim`, `codex`, and generic OpenAI-compatible local endpoints also supported) and has access to all 21 BrainDB operations as function tools.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/agent/query \
@@ -340,6 +340,7 @@ The agent has these tools internally: `recall_memory`, `quick_search`, `save_fac
 - **Self-hosted vLLM**: set `LLM_PROFILE=vllm_workstation` for a vLLM server bound to the Docker host's loopback at `:8002`. No API key needed if the server runs without auth. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to add your own self-hosted profile.
 - Profiles live in `braindb/config.py::_LLM_PROFILES`. Add new providers there (e.g. `together`, `openai`) by adding a dict entry — no code change required.
 - Optional override: set `AGENT_MODEL=` in `.env` to use a non-default model for the active profile.
+- Optional auth override: set `AGENT_API_KEY=` only if your OpenAI-compatible endpoint requires auth; copilot-api and Ollama can run without it when local auth is disabled.
 
 **Verbose logging**: set `AGENT_VERBOSE=true` in `.env` to log every tool call to stdout (visible via `docker logs braindb_api -f`). The HTTP response stays clean — only `answer` and `max_turns`.
 

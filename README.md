@@ -72,18 +72,28 @@ Any reachable hostname/IP works — the connecting user just needs network acces
 
 ### 4. Pick an LLM provider (for the internal agent)
 
-The agent talks to any LiteLLM-supported backend. BrainDB ships with two profiles pre-configured: **DeepInfra** (default, fast, paid) and **NVIDIA NIM** (free tier, can be flaky).
+The agent talks to any LiteLLM-supported backend. BrainDB ships with four profiles pre-configured: **DeepInfra** (default, fast, paid), **NVIDIA NIM** (free tier, can be flaky), **Codex** (`gpt-5.3-codex-spark` via OpenAI routing), and **openai_compatible** for local OpenAI-compatible APIs such as copilot-api or Ollama (`local_ollama` remains as a legacy alias).
 
 In `.env`:
 ```
-LLM_PROFILE=deepinfra        # or 'nim' — default is 'deepinfra'
+LLM_PROFILE=deepinfra        # or 'codex'/'nim'/'openai_compatible' — default is 'deepinfra'
 DEEPINFRA_API_KEY=...        # if profile=deepinfra — get from https://deepinfra.com/
 NVIDIA_NIM_API_KEY=...       # if profile=nim       — get from https://build.nvidia.com/
+OPENAI_API_KEY=...            # if profile=codex    — OpenAI API key for Codex
 ```
 
-Only the key matching your chosen profile needs to be filled. Leave the other blank or absent.
+For a local OpenAI-compatible server such as `copilot-api`:
 
-Adding a third provider (Together, OpenAI, local vLLM, whatever) is a two-line entry in [`braindb/config.py::_LLM_PROFILES`](braindb/config.py) + an env var — no other code changes. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the recipe.
+```
+LLM_PROFILE=openai_compatible
+AGENT_BASE_URL=http://<host-ip>:4141/v1    # copilot-api default port
+AGENT_MODEL=openai/gpt-5-mini
+AGENT_API_KEY=                             # optional; only set if your endpoint requires auth
+```
+
+Only the key matching your chosen hosted profile needs to be filled. Leave the other blank or absent. For OpenAI-compatible local endpoints with auth disabled, leave `AGENT_API_KEY` blank.
+
+Adding another hosted provider (Together, OpenAI, local vLLM, whatever) is usually a small entry in [`braindb/config.py::_LLM_PROFILES`](braindb/config.py) + env passthrough — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the recipe.
 
 ### 5. Create the Docker network, then bring the stack up
 
@@ -109,6 +119,19 @@ curl http://localhost:8000/health
 API at `http://localhost:8000`. Swagger UI at `http://localhost:8000/docs`. Database migrations run automatically on startup.
 
 Drop a markdown file into `data/sources/` and the watcher sidecar picks it up within ~7 seconds — see [File Ingestion](#file-ingestion) below.
+
+### Operational helper
+
+For a safer one-command workflow, use `scripts/braindb-manage.sh`:
+
+```bash
+./scripts/braindb-manage.sh start
+./scripts/braindb-manage.sh update
+./scripts/braindb-manage.sh status
+./scripts/braindb-manage.sh logs api
+```
+
+It creates `.env` from `.env.example` if needed, ensures the `local-network` Docker network exists, starts/recreates the Compose services, and checks `http://localhost:8000/health`.
 
 ---
 
@@ -162,7 +185,7 @@ Single `query` (string) still works for backward compatibility.
 Instead of orchestrating individual API calls, you can talk to BrainDB in plain English via `POST /api/v1/agent/query`. The agent (built on the OpenAI Agents SDK + LiteLLM) decides which tools to call and returns a summary.
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/agent/query \
+curl -X POST http://localhost:8100/api/v1/agent/query \
   -H "Content-Type: application/json" \
   -d '{"query":"What do you know about the user role and recent projects?"}'
 
@@ -173,14 +196,17 @@ The agent has 21 tools — every single BrainDB endpoint plus `delegate_to_subag
 
 **LLM provider — pluggable via `.env`**:
 
-`LLM_PROFILE` selects the backend. Profiles are defined in [braindb/config.py](braindb/config.py) (`_LLM_PROFILES`) — currently `deepinfra` (default, model `google/gemma-4-31B-it`) and `nim` (NVIDIA NIM, model `google/gemma-4-31b-it`). Each profile is a model-prefix + env-var pair; adding a new one is a dict entry.
+`LLM_PROFILE` selects the backend. Profiles are defined in [braindb/config.py](braindb/config.py) (`_LLM_PROFILES`) — currently `deepinfra` (default, model `google/gemma-4-31B-it`), `nim` (NVIDIA NIM, model `google/gemma-4-31b-it`), `codex` (OpenAI Codex, model `gpt-5.3-codex-spark`), and `openai_compatible` (generic OpenAI-compatible `/v1` endpoints; `local_ollama` is a legacy alias).
 
 ```
-LLM_PROFILE=deepinfra         # or nim — default is deepinfra
+LLM_PROFILE=deepinfra         # or codex/nim/openai_compatible — default is deepinfra
 DEEPINFRA_API_KEY=...         # required if profile=deepinfra (https://deepinfra.com/)
 NVIDIA_NIM_API_KEY=...        # required if profile=nim (https://build.nvidia.com/)
+OPENAI_API_KEY=...             # required if profile=codex
 AGENT_MODEL=                  # optional: override the profile's default model
 ```
+
+For copilot-api, set `AGENT_BASE_URL=http://<host-ip>:4141/v1` and `AGENT_MODEL=openai/gpt-5-mini`. For Ollama, use `AGENT_BASE_URL=http://<ollama-host>:11434/v1` and an Ollama model such as `AGENT_MODEL=openai/llama3.2:3b`. `AGENT_API_KEY` is optional and only needed if your OpenAI-compatible endpoint enforces auth.
 
 **Verbose logging**: set `AGENT_VERBOSE=true` in `.env` to log every tool call (entry args + exit elapsed/result) to stdout, visible via `docker logs braindb_api -f`.
 
@@ -276,5 +302,5 @@ It's idempotent by content hash — re-calling with the same bytes returns 200 (
 - PostgreSQL 16 with `pg_trgm` and `pgvector`
 - Alembic migrations
 - `sentence-transformers` + `Qwen/Qwen3-Embedding-0.6B` for keyword embeddings
-- `openai-agents[litellm]` + LiteLLM for the internal agent (DeepInfra / NIM / others pluggable via `LLM_PROFILE`)
+- `openai-agents[litellm]` + LiteLLM for the internal agent (DeepInfra / NIM / Codex / others pluggable via `LLM_PROFILE`)
 - Docker Compose — `api` + `watcher` services, external PostgreSQL

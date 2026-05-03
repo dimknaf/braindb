@@ -127,7 +127,7 @@ curl -s -X DELETE http://localhost:8000/api/v1/entities/<UUID>
 
 **Direct API** (what's shown above) — call individual endpoints yourself. Full control, more verbose context. Good when you want to be precise about what's saved or recalled.
 
-**Agent endpoint** — `POST /api/v1/agent/query` — send a natural language request and let BrainDB's internal agent handle it. The agent (LiteLLM with pluggable provider via `LLM_PROFILE` — default `deepinfra/google/gemma-4-31B-it`, NIM also supported) has all 21 BrainDB operations as tools. Cleaner conversation context, but slower (5-30 seconds for a query).
+**Agent endpoint** — `POST /api/v1/agent/query` — send a natural language request and let BrainDB's internal agent handle it. The agent (LiteLLM with pluggable provider via `LLM_PROFILE` — default `deepinfra/google/gemma-4-31B-it`, NIM, Codex, and generic OpenAI-compatible endpoints such as copilot-api or Ollama also supported) has all 21 BrainDB operations as tools. Cleaner conversation context, but slower (5-30 seconds for a query).
 
 ```bash
 # Recall via the agent
@@ -156,7 +156,7 @@ When debugging the agent: set `AGENT_VERBOSE=true` in `.env` and watch `docker l
 
 ## Important Notes
 
-- `.env` contains real DB credentials and provider API keys (`DEEPINFRA_API_KEY`, `NVIDIA_NIM_API_KEY`, etc.) — **never commit it**, it is in `.gitignore`. Active provider is picked by `LLM_PROFILE` (see `braindb/config.py::_LLM_PROFILES`).
+- `.env` contains real DB credentials and provider API keys (`DEEPINFRA_API_KEY`, `NVIDIA_NIM_API_KEY`, `OPENAI_API_KEY`, `AGENT_API_KEY`, etc.) — **never commit it**, it is in `.gitignore`. Active provider is picked by `LLM_PROFILE` (see `braindb/config.py::_LLM_PROFILES`).
 - Always-on rules (priority 100, `always_on: true`) are returned on every `/memory/context` call
 - `notes` field on any entity or relation is for running commentary — append observations over time
 - Keywords are stored as both a `TEXT[]` column on the entity AND as separate keyword entities linked via `tagged_with` relations (the keyword entities carry the embeddings for semantic search)
