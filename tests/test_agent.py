@@ -49,3 +49,12 @@ def test_agent_endpoint_rejects_missing_query(api):
         timeout=10,
     )
     assert r.status_code in (400, 422), f"expected 4xx for missing query, got {r.status_code}"
+
+
+@pytest.mark.unit
+def test_agent_builder_stops_at_submit_result():
+    from braindb.agent.agent import create_braindb_agent
+
+    agent = create_braindb_agent()
+
+    assert agent.tool_use_behavior["stop_at_tool_names"] == ["submit_result"]
