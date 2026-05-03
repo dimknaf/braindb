@@ -42,8 +42,10 @@ def _wait_for_health(url: str, timeout: int = 30) -> bool:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _require_live_api() -> None:
-    """Fail fast and loud if the stack isn't up — tests have nothing to run against."""
+def _require_live_api(request: pytest.FixtureRequest) -> None:
+    """Fail fast for integration tests; pure unit tests do not need the stack."""
+    if request.session.items and all(item.get_closest_marker("unit") for item in request.session.items):
+        return
     if not _wait_for_health(API_URL):
         pytest.fail(
             f"BrainDB API not healthy at {API_URL}. "

@@ -11,17 +11,15 @@ from pydantic import BaseModel, Field
 
 from braindb.db import get_conn
 from braindb.schemas.search import ContextRequest, ContextResponse, SearchRequest, SearchResultItem
-from braindb.services.activity_log import log_activity, query_log
+from braindb.services.activity_log import log_activity, log_activity_in_new_transaction, query_log
 from braindb.services.embedding_service import get_embedding_service
 from braindb.services.keyword_service import generate_missing_embeddings
 from braindb.services.context import (
     assemble_context,
     effective_importance,
-    fetch_always_on_rules,
     fetch_ext,
     track_access,
 )
-from braindb.services.graph import graph_expand
 from braindb.services.search import fuzzy_search
 
 router = APIRouter(prefix="/api/v1/memory", tags=["memory"])
@@ -180,9 +178,9 @@ def read_only_sql(body: SqlRequest):
         raise HTTPException(400, "Only SELECT or WITH queries are allowed")
 
     start = time.perf_counter()
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            try:
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
                 cur.execute("SET LOCAL statement_timeout = '5s'")
                 cur.execute("SET LOCAL transaction_read_only = on")
                 cur.execute(body.query)
@@ -190,21 +188,27 @@ def read_only_sql(body: SqlRequest):
                 rows = cur.fetchmany(1000)
                 # Convert rows to JSON-safe format
                 safe_rows = [[_to_safe(v) for v in row] for row in rows]
-            except Exception as e:
-                raise HTTPException(400, f"Query error: {e}")
-
+    except Exception as e:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-        log_activity(conn, "sql_query", details={
+        log_activity_in_new_transaction("sql_query", details={
             "query": body.query[:500],
-            "rows": len(safe_rows),
+            "error": str(e),
             "elapsed_ms": elapsed_ms,
         })
-        return {
-            "columns": columns,
-            "rows": safe_rows,
-            "row_count": len(safe_rows),
-            "elapsed_ms": elapsed_ms,
-        }
+        raise HTTPException(400, f"Query error: {e}")
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    log_activity_in_new_transaction("sql_query", details={
+        "query": body.query[:500],
+        "rows": len(safe_rows),
+        "elapsed_ms": elapsed_ms,
+    })
+    return {
+        "columns": columns,
+        "rows": safe_rows,
+        "row_count": len(safe_rows),
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 def _to_safe(value):

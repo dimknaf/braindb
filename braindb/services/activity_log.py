@@ -4,7 +4,14 @@ Karpathy-inspired: traceability of what happened, when, and in what context.
 
 The log_activity function is fire-and-forget: it must never fail the main operation.
 """
+import logging
+
 import psycopg2.extras
+
+from braindb.db import get_conn
+
+
+logger = logging.getLogger(__name__)
 
 
 def log_activity(
@@ -33,6 +40,21 @@ def log_activity(
             )
     except Exception:
         pass
+
+
+def log_activity_in_new_transaction(
+    operation: str,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    details: dict | None = None,
+    context_note: str | None = None,
+) -> None:
+    """Write an activity log entry using its own normal transaction."""
+    try:
+        with get_conn() as conn:
+            log_activity(conn, operation, entity_type, entity_id, details, context_note)
+    except Exception as exc:
+        logger.warning("Activity log write failed in separate transaction: %s", exc)
 
 
 def query_log(

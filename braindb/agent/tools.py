@@ -16,17 +16,19 @@ import functools
 import json
 import logging
 import time
-from typing import Optional
+from typing import Optional, get_args
 from uuid import UUID
 
+import psycopg2
 import psycopg2.extras
 from agents import function_tool
 
 from braindb.config import settings
 from braindb.db import get_conn
+from braindb.schemas.relations import RELATION_TYPES
 from braindb.schemas.search import ContextRequest
-from braindb.services.activity_log import log_activity, query_log
-from braindb.services.context import assemble_context, effective_importance, track_access
+from braindb.services.activity_log import log_activity, log_activity_in_new_transaction, query_log
+from braindb.services.context import assemble_context, track_access
 from braindb.services.embedding_service import get_embedding_service
 from braindb.services.keyword_service import (
     ensure_keyword_entities,
@@ -50,6 +52,38 @@ def _truncate(s: str) -> str:
 def _err(msg: str) -> str:
     logger.warning("Tool error: %s", msg)
     return f"ERROR: {msg}"
+
+
+_PLACEHOLDER_UUIDS = {
+    "<root-entity-id>",
+    "<existing-entity-id>",
+    "search-mode-context",
+}
+
+_ALLOWED_RELATION_TYPES = frozenset(get_args(RELATION_TYPES))
+
+
+def _validate_uuid_string(value: str | UUID | None, field_name: str) -> str:
+    """Return a normalized UUID string or raise ValueError before SQL sees it."""
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    if (
+        text in _PLACEHOLDER_UUIDS
+        or (text.startswith("<") and text.endswith(">"))
+        or text.startswith("entity-id-of-")
+    ):
+        raise ValueError(f"{field_name} must be a real UUID, got placeholder {text!r}")
+    try:
+        return str(UUID(text))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a valid UUID, got {text!r}") from exc
+
+
+def _entity_exists(conn, entity_id: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM entities WHERE id = %s", (entity_id,))
+        return cur.fetchone() is not None
 
 
 def _verbose(name: str):
@@ -181,6 +215,27 @@ def _insert_entity_raw(conn, entity_type: str, content: str, keywords: list[str]
     return str(eid)
 
 
+def _save_fact_impl(
+    content: str,
+    keywords: list[str],
+    source: str = "user-stated",
+    certainty: float = 0.8,
+    importance: float = 0.6,
+    notes: Optional[str] = None,
+) -> str:
+    try:
+        with get_conn() as conn:
+            eid = _insert_entity_raw(conn, "fact", content, keywords, source, importance, notes)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO facts_ext (entity_id, certainty, is_verified) VALUES (%s, %s, FALSE)",
+                    (eid, certainty),
+                )
+        return f"Saved fact id={eid}"
+    except Exception as e:
+        return _err(str(e))
+
+
 @function_tool
 @_verbose("save_fact")
 async def save_fact(
@@ -201,17 +256,7 @@ async def save_fact(
         importance: Weight 0-1 (default 0.6).
         notes: Optional running commentary.
     """
-    try:
-        with get_conn() as conn:
-            eid = _insert_entity_raw(conn, "fact", content, keywords, source, importance, notes)
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO facts_ext (entity_id, certainty, is_verified) VALUES (%s, %s, FALSE)",
-                    (eid, certainty),
-                )
-        return f"Saved fact id={eid}"
-    except Exception as e:
-        return _err(str(e))
+    return _save_fact_impl(content, keywords, source, certainty, importance, notes)
 
 
 @function_tool
@@ -276,6 +321,27 @@ async def save_source(
         return _err(str(e))
 
 
+def _save_rule_impl(
+    content: str,
+    category: str = "behavior",
+    priority: int = 50,
+    always_on: bool = False,
+    keywords: Optional[list[str]] = None,
+    importance: float = 0.8,
+) -> str:
+    try:
+        with get_conn() as conn:
+            eid = _insert_entity_raw(conn, "rule", content, keywords or [], "user-stated", importance, None)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO rules_ext (entity_id, always_on, category, priority, is_active) VALUES (%s, %s, %s, %s, TRUE)",
+                    (eid, always_on, category, priority),
+                )
+        return f"Saved rule id={eid}"
+    except Exception as e:
+        return _err(str(e))
+
+
 @function_tool
 @_verbose("save_rule")
 async def save_rule(
@@ -296,17 +362,7 @@ async def save_rule(
         keywords: Optional topic keywords.
         importance: Weight 0-1 (default 0.8).
     """
-    try:
-        with get_conn() as conn:
-            eid = _insert_entity_raw(conn, "rule", content, keywords or [], "user-stated", importance, None)
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO rules_ext (entity_id, always_on, category, priority, is_active) VALUES (%s, %s, %s, %s, TRUE)",
-                    (eid, always_on, category, priority),
-                )
-        return f"Saved rule id={eid}"
-    except Exception as e:
-        return _err(str(e))
+    return _save_rule_impl(content, category, priority, always_on, keywords, importance)
 
 
 # ====================================================================== #
@@ -322,6 +378,7 @@ async def get_entity(entity_id: str) -> str:
         entity_id: UUID of the entity.
     """
     try:
+        entity_id = _validate_uuid_string(entity_id, "entity_id")
         with get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("SELECT * FROM entities WHERE id = %s", (entity_id,))
@@ -413,6 +470,7 @@ async def update_entity(
         importance: New importance 0-1.
     """
     try:
+        entity_id = _validate_uuid_string(entity_id, "entity_id")
         # Datasource guardrail — look up type and strip content if protected.
         content_dropped = False
         with get_conn() as conn:
@@ -466,6 +524,7 @@ async def delete_entity(entity_id: str) -> str:
         entity_id: UUID to delete.
     """
     try:
+        entity_id = _validate_uuid_string(entity_id, "entity_id")
         with get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("SELECT entity_type FROM entities WHERE id = %s", (entity_id,))
@@ -502,8 +561,21 @@ async def create_relation(
         description: Why this relation exists.
     """
     try:
+        from_entity_id = _validate_uuid_string(from_entity_id, "from_entity_id")
+        to_entity_id = _validate_uuid_string(to_entity_id, "to_entity_id")
+        if relation_type not in _ALLOWED_RELATION_TYPES:
+            allowed = ", ".join(sorted(_ALLOWED_RELATION_TYPES))
+            return _err(f"relation_type must be one of: {allowed}")
         with get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id FROM entities WHERE id IN (%s, %s)",
+                    (from_entity_id, to_entity_id),
+                )
+                found_ids = {str(r["id"]) for r in cur.fetchall()}
+                missing_ids = [eid for eid in (from_entity_id, to_entity_id) if eid not in found_ids]
+                if missing_ids:
+                    return _err(f"entity {missing_ids[0]} not found")
                 try:
                     cur.execute(
                         """INSERT INTO relations (from_entity_id, to_entity_id, relation_type, relevance_score, description)
@@ -514,6 +586,10 @@ async def create_relation(
                 except psycopg2.errors.UniqueViolation:
                     conn.rollback()
                     return _err(f"relation {relation_type} already exists between these entities")
+                except psycopg2.IntegrityError as e:
+                    conn.rollback()
+                    message = getattr(getattr(e, "diag", None), "message_primary", None) or str(e)
+                    return _err(f"could not create relation: {message}")
             log_activity(conn, "create", "relation", rid, details={
                 "from": from_entity_id, "to": to_entity_id, "type": relation_type,
             })
@@ -531,7 +607,10 @@ async def view_entity_relations(entity_id: str) -> str:
         entity_id: UUID of the entity.
     """
     try:
+        entity_id = _validate_uuid_string(entity_id, "entity_id")
         with get_conn() as conn:
+            if not _entity_exists(conn, entity_id):
+                return _err(f"entity {entity_id} not found")
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     """SELECT id, from_entity_id, to_entity_id, relation_type, relevance_score, description
@@ -563,6 +642,7 @@ async def delete_relation(relation_id: str) -> str:
         relation_id: UUID of the relation.
     """
     try:
+        relation_id = _validate_uuid_string(relation_id, "relation_id")
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM relations WHERE id = %s RETURNING id", (relation_id,))
@@ -588,7 +668,10 @@ async def view_tree(entity_id: str, max_depth: int = 2) -> str:
         max_depth: How far to traverse (1-3, default 2).
     """
     try:
+        entity_id = _validate_uuid_string(entity_id, "entity_id")
         with get_conn() as conn:
+            if not _entity_exists(conn, entity_id):
+                return _err(f"entity {entity_id} not found")
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     """SELECT e.*, r.relation_type, r.relevance_score, r.description AS rel_desc,
@@ -631,10 +714,11 @@ async def search_sql(query: str) -> str:
                 cur.execute(query)
                 columns = [d[0] for d in cur.description] if cur.description else []
                 rows = cur.fetchmany(1000)
-            log_activity(conn, "sql_query", details={"query": query[:500], "rows": len(rows)})
+        log_activity_in_new_transaction("sql_query", details={"query": query[:500], "rows": len(rows)})
         result = {"columns": columns, "rows": [[str(v) if v is not None else None for v in r] for r in rows], "row_count": len(rows)}
         return _truncate(json.dumps(result, default=str, indent=2))
     except Exception as e:
+        log_activity_in_new_transaction("sql_query", details={"query": query[:500], "error": str(e)})
         return _err(str(e))
 
 
@@ -653,6 +737,8 @@ async def view_log(
         limit: Max entries (default 30).
     """
     try:
+        if entity_id is not None:
+            entity_id = _validate_uuid_string(entity_id, "entity_id")
         with get_conn() as conn:
             rows = query_log(conn, operation=operation, entity_id=entity_id, limit=limit)
         if not rows:
