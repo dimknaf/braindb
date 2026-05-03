@@ -83,7 +83,8 @@ class Settings(BaseSettings):
 
     @property
     def resolved_agent_model(self) -> str:
-        model = self.agent_model or self._active_llm_profile["model"]
+        profile = self._active_llm_profile
+        model = self.agent_model or profile["model"]
         if not model:
             raise ValueError(
                 f"AGENT_MODEL must be set for LLM_PROFILE={self.llm_profile!r}; "

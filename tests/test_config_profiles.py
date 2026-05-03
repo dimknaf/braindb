@@ -7,7 +7,7 @@ pytestmark = pytest.mark.unit
 
 
 def test_codex_profile_resolves_default_model():
-    settings = Settings(_env_file=None, llm_profile="codex", openai_api_key="test-key")
+    settings = Settings(_env_file=None, llm_profile="codex", agent_model="", openai_api_key="test-key")
 
     assert settings.resolved_agent_model == "openai/gpt-5.3-codex-spark"
 
@@ -37,7 +37,7 @@ def test_agent_model_override_wins_for_codex_profile():
 
 
 def test_unknown_profile_error_lists_known_profiles():
-    settings = Settings(_env_file=None, llm_profile="missing")
+    settings = Settings(_env_file=None, llm_profile="missing", agent_model="")
 
     with pytest.raises(ValueError, match="openai_compatible"):
         _ = settings.resolved_agent_model
