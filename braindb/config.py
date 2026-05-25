@@ -20,6 +20,10 @@ _LLM_PROFILES: dict[str, dict[str, str]] = {
         "model": "deepinfra/google/gemma-4-31B-it",
         "api_key_env": "DEEPINFRA_API_KEY",
     },
+    "openai_compatible": {
+        "model": "",
+        "api_key_env": "AGENT_API_KEY",
+    },
     "vllm_workstation": {
         "model": "openai/cyankiwi/gemma-4-31B-it-AWQ-4bit",
         "api_key_env": "VLLM_API_KEY",
@@ -105,6 +109,7 @@ class Settings(BaseSettings):
     # Agent (LiteLLM — provider selected via llm_profile)
     llm_profile: str = "deepinfra"
     agent_model: str = ""          # blank = use profile's default model
+    agent_base_url: str = ""
     # Bumped 15 → 20 after live observation on Qwen 27B AWQ-INT4 (vLLM):
     # deep-research-style runs commonly need >15 tool turns to land
     # `final_answer`. 20 gives breathing room; finishes-fast providers
@@ -176,13 +181,13 @@ class Settings(BaseSettings):
         key = os.getenv(profile["api_key_env"], "")
         # Self-hosted profiles (vLLM/Ollama) may run without auth, but the
         # OpenAI client still needs a non-empty key — supply a placeholder.
-        if not key and profile.get("base_url"):
+        if not key and self.resolved_base_url:
             return "EMPTY"
         return key
 
     @property
     def resolved_base_url(self) -> str | None:
-        return _LLM_PROFILES[self.llm_profile].get("base_url")
+        return self.agent_base_url or _LLM_PROFILES[self.llm_profile].get("base_url")
 
 
 settings = Settings()

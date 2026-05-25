@@ -61,3 +61,6 @@ packages = ["braindb"]
 testpaths = ["tests"]
 timeout = 60
 addopts = "-ra"
+markers = [
+    "unit: tests that do not require a live BrainDB stack",
+]

@@ -42,8 +42,9 @@ def _wait_for_health(url: str, timeout: int = 30) -> bool:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _require_live_api() -> None:
-    """Fail fast and loud if the stack isn't up — tests have nothing to run against."""
+def _require_live_api(request: pytest.FixtureRequest) -> None:
+    if request.session.items and all(item.get_closest_marker("unit") for item in request.session.items):
+        return
     if not _wait_for_health(API_URL):
         pytest.fail(
             f"BrainDB API not healthy at {API_URL}. "
@@ -52,7 +53,7 @@ def _require_live_api() -> None:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _purge_pytest_artefacts_at_session_end() -> Iterator[None]:
+def _purge_pytest_artefacts_at_session_end(request: pytest.FixtureRequest) -> Iterator[None]:
     """Session teardown safety net for the per-test `created_entities`
     fixture: any test that errors before registering its IDs (or that
     bypasses the factories entirely) still leaks `_pytest_<hex>` rows
@@ -68,6 +69,8 @@ def _purge_pytest_artefacts_at_session_end() -> Iterator[None]:
     entities themselves.
     """
     yield
+    if request.session.items and all(item.get_closest_marker("unit") for item in request.session.items):
+        return
     try:
         from braindb.db import get_conn  # only imported at teardown
     except Exception as exc:   # noqa: BLE001 — defensive, never block the session
