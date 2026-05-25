@@ -72,7 +72,7 @@ Any reachable hostname/IP works — the connecting user just needs network acces
 
 ### 4. Pick an LLM provider (for the internal agent)
 
-The agent talks to any LiteLLM-supported backend. **Recommended for new users: `deepinfra` with `google/gemma-4-31B-it`** — fast (5–30s per agent call), cheap, validated end-to-end on the wiki/maintainer/writer pipeline. `nim` is a free-tier fallback (occasionally flaky). The `vllm_*` profiles run a local model on your own GPU workstation — useful for offline / cost-free experiments, but require a running vLLM server reachable from the docker network (typically via SSH tunnel).
+The agent talks to any LiteLLM-supported backend. **Recommended for new users: `deepinfra` with `google/gemma-4-31B-it`** — fast (5–30s per agent call), cheap, validated end-to-end on the wiki/maintainer/writer pipeline. `nim` is a free-tier fallback (occasionally flaky). The `vllm_*` profiles run a local model on your own GPU workstation — useful for offline / cost-free experiments, but require a running vLLM server reachable from the docker network (typically via SSH tunnel). Use `openai_compatible` for generic OpenAI-compatible `/v1` endpoints such as Ollama, copilot-api, or LM Studio.
 
 In `.env`:
 ```
@@ -81,9 +81,18 @@ DEEPINFRA_API_KEY=...        # if profile=deepinfra — get from https://deepinf
 NVIDIA_NIM_API_KEY=...       # if profile=nim       — get from https://build.nvidia.com/
 ```
 
+For an OpenAI-compatible local endpoint:
+
+```
+LLM_PROFILE=openai_compatible
+AGENT_MODEL=openai/llama3.2:3b
+AGENT_BASE_URL=http://host.docker.internal:11434/v1
+AGENT_API_KEY=              # optional; set only if the endpoint requires auth
+```
+
 Only the key matching your chosen profile needs to be filled. Leave the other blank or absent.
 
-Adding a third provider (Together, OpenAI, local vLLM, whatever) is a two-line entry in [`braindb/config.py::_LLM_PROFILES`](braindb/config.py) + an env var — no other code changes. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the recipe.
+Adding another hosted provider (Together, OpenAI, whatever) is a two-line entry in [`braindb/config.py::_LLM_PROFILES`](braindb/config.py) + an env var — no other code changes. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the recipe.
 
 ### 5. Create the Docker network, then bring the stack up
 
@@ -180,16 +189,26 @@ The agent has 21 tools — every single BrainDB endpoint plus `delegate_to_subag
 
 - **`deepinfra` — recommended default.** Model `google/gemma-4-31B-it`. Fast (5–30s per agent call), cheap, validated end-to-end.
 - `nim` — NVIDIA NIM, model `google/gemma-4-31b-it`. Free tier, occasionally flaky.
+- `openai_compatible` — any OpenAI-compatible `/v1` endpoint. Set `AGENT_MODEL=openai/<model-id>` and `AGENT_BASE_URL`.
 - `vllm_workstation` / `vllm_workstation_qwen` / `vllm_workstation_gemma` — local vLLM running on your own GPU (advanced / offline; needs the server reachable from the docker network, usually via SSH tunnel).
 
 Each profile is a model-prefix + env-var pair; adding a new one is a dict entry.
 
 ```
-LLM_PROFILE=deepinfra         # or nim / vllm_workstation / vllm_workstation_qwen
+LLM_PROFILE=deepinfra         # or nim / openai_compatible / vllm_workstation
 DEEPINFRA_API_KEY=...         # required if profile=deepinfra (https://deepinfra.com/)
 NVIDIA_NIM_API_KEY=...        # required if profile=nim (https://build.nvidia.com/)
 VLLM_API_KEY=...              # optional, only if local vLLM is started with --api-key
 AGENT_MODEL=                  # optional: override the profile's default model
+```
+
+For `openai_compatible`, `AGENT_MODEL` is required because BrainDB does not know which model your endpoint serves:
+
+```
+LLM_PROFILE=openai_compatible
+AGENT_MODEL=openai/llama3.2:3b
+AGENT_BASE_URL=http://host.docker.internal:11434/v1
+AGENT_API_KEY=
 ```
 
 **Verbose logging**: set `AGENT_VERBOSE=true` in `.env` to log every tool call (entry args + exit elapsed/result) to stdout, visible via `docker logs braindb_api -f`.
