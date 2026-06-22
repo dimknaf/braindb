@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Query
 
+from braindb import custom_profile
 from braindb.agent.agent import run_typed, get_maintainer_agent, get_writer_agent
 from braindb.agent.run_state import install_handoff_slot, release_handoff_slot
 from braindb.agent.schemas import MaintainerClusterDecision, WikiWriteResult
@@ -95,9 +96,14 @@ async def wiki_maintain():
         or "(no existing wikis yet — attach/consolidate are impossible; "
            "use create/skip/ambiguous)"
     )
-    prompt = _MAINTAINER_PROMPT.format(
+    # Optional custom-profile shaping: a `.replace.md` may swap the template
+    # (before `.format`), and `.add.md` fragments are appended AFTER `.format`
+    # (so a fragment's literal `{`/`}` can never reach str.format). No active
+    # profile -> both are no-ops and this prompt is byte-identical to the base.
+    _maintainer_tmpl = custom_profile.replace_or_base(_MAINTAINER_PROMPT, "wiki_maintainer")
+    prompt = _maintainer_tmpl.format(
         seeds=_seeds_block(seeds), wiki_catalog=catalog_txt
-    )
+    ) + custom_profile.additions("wiki_maintainer")
     # `run_typed` returns an SDK-validated MaintainerClusterDecision, or raises
     # if the model never submitted — handled below like any agent failure.
     try:
@@ -339,16 +345,20 @@ async def wiki_write():
             for i, d in enumerate(ds, 1)
         )
 
-    # 2. One focused agent call.
+    # 2. One focused agent call. Optional custom-profile shaping: a
+    # `.replace.md` may swap the template (it then owns the `%%...%%` tokens);
+    # `.add.md` fragments are appended after substitution. No active profile ->
+    # both are no-ops and this prompt is byte-identical to the base.
+    _writer_tmpl = custom_profile.replace_or_base(_WRITER_PROMPT, "wiki_writer")
     prompt = (
-        _WRITER_PROMPT
+        _writer_tmpl
         .replace("%%MODE%%", mode)
         .replace("%%CANONICAL%%", canonical)
         .replace("%%WIKI_ID%%", bucket["target_wiki_id"] or "(assigned after write)")
         .replace("%%MEMBERS%%", _members_block(members))
         .replace("%%CURRENT_BODY%%", _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
         .replace("%%DUPLICATES%%", _dupes_block(dupes))
-    )
+    ) + custom_profile.additions("wiki_writer")
     # Capture pre-run revision on the target wiki for `attach` mode so we
     # can detect whether the writer used the section-edit tools (each
     # bumps `wikis_ext.revision` directly). The writer may then submit an

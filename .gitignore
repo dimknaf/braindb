@@ -65,3 +65,26 @@ data_test/
 # Hermes sandbox (integrations/hermes/sandbox): throwaway agent profile dir —
 # holds a .env with the LLM key + provider state; never commit it.
 integrations/hermes/sandbox/hermes-data/
+
+# Custom profiles — only the contract docs + the example/ profile are public.
+# Every real profile (its prompt fragments, ingestor.py, and .env secret) is
+# local-only: domain-specific content + credentials that must not be committed.
+custom-profiles/*
+!custom-profiles/README.md
+!custom-profiles/SKILL.md
+!custom-profiles/example/
+!custom-profiles/example/**
+!custom-profiles/hackernews/
+!custom-profiles/hackernews/**
+# ...but never the hackernews ingestor's runtime files (created when it runs)
+custom-profiles/hackernews/.env
+custom-profiles/hackernews/.state/
+custom-profiles/hackernews/__pycache__/
+!custom-profiles/gdrive/
+!custom-profiles/gdrive/**
+# ...but never the gdrive ingestor's runtime files OR its credentials — the
+# service-account JSON key must NEVER be committed (public repo).
+custom-profiles/gdrive/.env
+custom-profiles/gdrive/.state/
+custom-profiles/gdrive/__pycache__/
+custom-profiles/gdrive/*.json
