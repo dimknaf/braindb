@@ -42,11 +42,14 @@ WIKI_ENABLED = os.getenv("WIKI_ENABLED", "true").lower() in ("1", "true", "yes",
 # model, so a 600s deadline at the scheduler caused the client to give up
 # WHILE the api kept working in the background — the write still committed,
 # but the scheduler couldn't see the completion in time to drain the queue
-# efficiently. With 1200s the client now waits long enough to see most
-# writes finish, while still surfacing genuinely-stuck jobs as failures
-# rather than blocking indefinitely. The api itself is not bounded by this
-# value; this knob only controls how patient the scheduler's HTTP client is.
-AGENT_TIMEOUT = int(os.getenv("WIKI_AGENT_TIMEOUT", "1200"))
+# efficiently. Bumped again 1200 → 2400 (20 → 40 min) for smaller/slower
+# quantised models (e.g. Gemma 12B QAT-W4A16): their full-body writes can
+# exceed 20 min, so a 1200s deadline abandoned slow-but-completing writes
+# and forced needless retries. With 2400s the client waits out most writes
+# while still surfacing genuinely-stuck jobs as failures rather than blocking
+# indefinitely. The api itself is not bounded by this value; this knob only
+# controls how patient the scheduler's HTTP client is.
+AGENT_TIMEOUT = int(os.getenv("WIKI_AGENT_TIMEOUT", "2400"))
 
 logging.basicConfig(
     level=logging.INFO,
