@@ -7,6 +7,7 @@ non-destructive; `/maintain` and `/write` (later steps) drive the existing
 agent endpoint.
 """
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,6 +40,19 @@ def _now_line() -> str:
         f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} — treat this as \"now\" when "
         "judging recency, dating claims, or bucketing events.\n"
     )
+
+
+# A wiki body that carries no real page content: the empty string, whitespace,
+# or a small-model serialization artifact echoed verbatim (`""`, `body=""`,
+# `{}`). The regex matches ONLY an optional `body=`/`body:` prefix followed by
+# quotes/braces/whitespace to the end — a genuine body (meta header + markdown)
+# always has real characters, so it never matches. The single definition the
+# router uses to decide a body is unpersistable.
+_BLANK_BODY = re.compile(r'^\s*(?:body\s*[:=]\s*)?["\'{}\s]*$', re.IGNORECASE)
+
+
+def _is_blank_body(body: str | None) -> bool:
+    return bool(_BLANK_BODY.match(body or ""))
 
 
 @router.post("/cron")
@@ -467,7 +481,7 @@ async def wiki_write():
         release_handoff_slot(handoff_token)
 
     used_section_edits = False
-    if not (res.body or "").strip():
+    if _is_blank_body(res.body):
         # Empty body — only valid in attach mode if section edits bumped
         # the revision during the run. Otherwise the agent did nothing
         # persistable and we fail the jobs.
@@ -541,8 +555,25 @@ async def wiki_write():
     else:
         new_body = res.body
 
-    # 3. Persist (one transaction). No content gate — the LLM's body is
-    #    authoritative; we only snapshot (reversible) and reconcile additively.
+    # Final blank-body backstop. `new_body` is now whatever we are about to
+    # persist — either the LLM's submission or the post-section-edit DB body.
+    # A genuine page always has real characters; only serialization garbage
+    # (`""`, `body=""`, `{}`) reaches here blank. Persisting it would write an
+    # empty page AND bump the revision, which self-perpetuates into a high-rev
+    # empty loop. Reject instead (same release/retry path as the gates above) —
+    # the entity stays a healable orphan and is re-tried next cycle. The legit
+    # no-op (all members already cited) already returned above, so this never
+    # touches it.
+    if _is_blank_body(new_body):
+        with get_conn() as conn:
+            disp = wiki_jobs.release_or_fail_jobs(
+                conn, job_ids,
+                f"blank/garbage body not persisted ({mode}): {new_body[:80]!r}")
+        return {"written": 0, "result": disp, "reason": "blank body"}
+
+    # 3. Persist (one transaction). The LLM's body is authoritative (guarded
+    #    above against blank); we only snapshot (reversible) and reconcile
+    #    additively.
     with get_conn() as conn:
         summary, disambig = wiki_jobs.extract_summary_disambig(new_body)
         kw = wiki_jobs.keywords_from_meta(new_body)
