@@ -88,3 +88,10 @@ custom-profiles/gdrive/.env
 custom-profiles/gdrive/.state/
 custom-profiles/gdrive/__pycache__/
 custom-profiles/gdrive/*.json
+!custom-profiles/hermes/
+!custom-profiles/hermes/**
+# ...but never the hermes ingestor's runtime files OR its secret (the Hermes bearer
+# token lives in .env, which must never be committed).
+custom-profiles/hermes/.env
+custom-profiles/hermes/.state/
+custom-profiles/hermes/__pycache__/
