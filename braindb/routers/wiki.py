@@ -7,6 +7,7 @@ non-destructive; `/maintain` and `/write` (later steps) drive the existing
 agent endpoint.
 """
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Query
@@ -27,6 +28,17 @@ router = APIRouter(prefix="/api/v1/wiki", tags=["wiki"])
 _PROMPTS = Path(__file__).parent.parent / "agent" / "prompts"
 _MAINTAINER_PROMPT = (_PROMPTS / "wiki_maintainer_prompt.md").read_text(encoding="utf-8")
 _WRITER_PROMPT = (_PROMPTS / "wiki_writer_prompt.md").read_text(encoding="utf-8")
+
+
+def _now_line() -> str:
+    """One neutral line giving the model the current date, so temporal reasoning
+    (recency, 'as of', dated/bucketed sections) has an anchor. Appended to every
+    maintainer/writer prompt; harmless when a subject has no time element."""
+    return (
+        "\n\n---\n**Current date (UTC):** "
+        f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} — treat this as \"now\" when "
+        "judging recency, dating claims, or bucketing events.\n"
+    )
 
 
 @router.post("/cron")
@@ -103,7 +115,7 @@ async def wiki_maintain():
     _maintainer_tmpl = custom_profile.replace_or_base(_MAINTAINER_PROMPT, "wiki_maintainer")
     prompt = _maintainer_tmpl.format(
         seeds=_seeds_block(seeds), wiki_catalog=catalog_txt
-    ) + custom_profile.additions("wiki_maintainer")
+    ) + _now_line() + custom_profile.additions("wiki_maintainer")
     # `run_typed` returns an SDK-validated MaintainerClusterDecision, or raises
     # if the model never submitted — handled below like any agent failure.
     try:
@@ -358,7 +370,7 @@ async def wiki_write():
         .replace("%%MEMBERS%%", _members_block(members))
         .replace("%%CURRENT_BODY%%", _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
         .replace("%%DUPLICATES%%", _dupes_block(dupes))
-    ) + custom_profile.additions("wiki_writer")
+    ) + _now_line() + custom_profile.additions("wiki_writer")
     # Capture pre-run revision on the target wiki for `attach` mode so we
     # can detect whether the writer used the section-edit tools (each
     # bumps `wikis_ext.revision` directly). The writer may then submit an

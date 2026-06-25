@@ -27,7 +27,8 @@ ONLY if a source supports it (and append its `[[ref:UUID]]`); otherwise write `(
 
 ### Chronicle aging
 
-`current-developments` is a rolling window of what's happening NOW. As items get old or
-superseded, demote their lasting substance into `background` (carrying the `[[ref:UUID]]`
-along) and drop the stale line from `current-developments`. Never silently drop a cited
-fact — move its citation to `background`.
+`current-developments` is a rolling window of what's happening NOW. As items get old (relative to
+the current date given above) or superseded, demote their lasting substance into `background`
+(carrying the `[[ref:UUID]]` along) and drop the stale line from `current-developments`. Never
+silently drop a cited fact — move its citation to `background`. Dated items use one consistent
+format: `- 2026-06-20 — <what happened> [[ref:UUID]]` (ISO date, em-dash, claim, citation).
