@@ -352,6 +352,24 @@ automatically. To run without it, bring the stack up excluding the service or
 scale it to 0 (`docker compose up -d --scale wiki_scheduler=0`), exactly as
 you would for the watcher; or point `LLM_PROFILE` at a local model.
 
+### Custom profiles — shape ingestion and wiki structure
+
+A **custom profile** is an opt-in, self-contained folder under [`custom-profiles/`](custom-profiles/)
+that reshapes what BrainDB ingests and how its auto-maintained wikis read — without touching core. A
+profile can append (or replace) the maintainer/writer prompts via `*.add.md` fragments and run its own
+supervised `ingestor.py` to feed a custom source into the watcher. Activate with `CUSTOM_PROFILE=<name>`
+(comma-separated to compose); when unset, defaults are byte-for-byte unchanged.
+
+Two ship ready to run:
+
+- **[`hackernews`](custom-profiles/hackernews/)** — keyless: polls Hacker News and grows
+  company/project/tech pages as dated chronicles.
+- **[`hermes`](custom-profiles/hermes/)** — asks an external web-search agent about an evolving
+  situation and keeps a dated, sourced, dashboard-shaped status page; dormant until configured.
+
+See [`custom-profiles/README.md`](custom-profiles/README.md) for the contract and
+[`SKILL.md`](custom-profiles/SKILL.md) to author your own.
+
 ## Frontend (read-only browser UI)
 
 A small vanilla-JS frontend ships under `frontend/` — no build step — and is served by the stack itself: after `docker compose up -d`, open **`http://localhost:8642`** (change the port with `FRONTEND_PORT` in `.env`). Three views (Reader for browsing wikis, Graph for visual exploration, Ops for watching the maintainer/writer pipeline) plus an Ask drawer that talks to the agent endpoint. The UI calls the BrainDB API at `http://localhost:8000` from your browser.
