@@ -7,10 +7,13 @@ non-destructive; `/maintain` and `/write` (later steps) drive the existing
 agent endpoint.
 """
 import logging
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Query
 
+from braindb import custom_profile
 from braindb.agent.agent import run_typed, get_maintainer_agent, get_writer_agent
 from braindb.agent.run_state import install_handoff_slot, release_handoff_slot
 from braindb.agent.schemas import MaintainerClusterDecision, WikiWriteResult
@@ -26,6 +29,30 @@ router = APIRouter(prefix="/api/v1/wiki", tags=["wiki"])
 _PROMPTS = Path(__file__).parent.parent / "agent" / "prompts"
 _MAINTAINER_PROMPT = (_PROMPTS / "wiki_maintainer_prompt.md").read_text(encoding="utf-8")
 _WRITER_PROMPT = (_PROMPTS / "wiki_writer_prompt.md").read_text(encoding="utf-8")
+
+
+def _now_line() -> str:
+    """One neutral line giving the model the current date, so temporal reasoning
+    (recency, 'as of', dated/bucketed sections) has an anchor. Appended to every
+    maintainer/writer prompt; harmless when a subject has no time element."""
+    return (
+        "\n\n---\n**Current date (UTC):** "
+        f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} — treat this as \"now\" when "
+        "judging recency, dating claims, or bucketing events.\n"
+    )
+
+
+# A wiki body that carries no real page content: the empty string, whitespace,
+# or a small-model serialization artifact echoed verbatim (`""`, `body=""`,
+# `{}`). The regex matches ONLY an optional `body=`/`body:` prefix followed by
+# quotes/braces/whitespace to the end — a genuine body (meta header + markdown)
+# always has real characters, so it never matches. The single definition the
+# router uses to decide a body is unpersistable.
+_BLANK_BODY = re.compile(r'^\s*(?:body\s*[:=]\s*)?["\'{}\s]*$', re.IGNORECASE)
+
+
+def _is_blank_body(body: str | None) -> bool:
+    return bool(_BLANK_BODY.match(body or ""))
 
 
 @router.post("/cron")
@@ -95,9 +122,14 @@ async def wiki_maintain():
         or "(no existing wikis yet — attach/consolidate are impossible; "
            "use create/skip/ambiguous)"
     )
-    prompt = _MAINTAINER_PROMPT.format(
+    # Optional custom-profile shaping: a `.replace.md` may swap the template
+    # (before `.format`), and `.add.md` fragments are appended AFTER `.format`
+    # (so a fragment's literal `{`/`}` can never reach str.format). No active
+    # profile -> both are no-ops and this prompt is byte-identical to the base.
+    _maintainer_tmpl = custom_profile.replace_or_base(_MAINTAINER_PROMPT, "wiki_maintainer")
+    prompt = _maintainer_tmpl.format(
         seeds=_seeds_block(seeds), wiki_catalog=catalog_txt
-    )
+    ) + _now_line() + custom_profile.additions("wiki_maintainer")
     # `run_typed` returns an SDK-validated MaintainerClusterDecision, or raises
     # if the model never submitted — handled below like any agent failure.
     try:
@@ -339,16 +371,20 @@ async def wiki_write():
             for i, d in enumerate(ds, 1)
         )
 
-    # 2. One focused agent call.
+    # 2. One focused agent call. Optional custom-profile shaping: a
+    # `.replace.md` may swap the template (it then owns the `%%...%%` tokens);
+    # `.add.md` fragments are appended after substitution. No active profile ->
+    # both are no-ops and this prompt is byte-identical to the base.
+    _writer_tmpl = custom_profile.replace_or_base(_WRITER_PROMPT, "wiki_writer")
     prompt = (
-        _WRITER_PROMPT
+        _writer_tmpl
         .replace("%%MODE%%", mode)
         .replace("%%CANONICAL%%", canonical)
         .replace("%%WIKI_ID%%", bucket["target_wiki_id"] or "(assigned after write)")
         .replace("%%MEMBERS%%", _members_block(members))
         .replace("%%CURRENT_BODY%%", _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
         .replace("%%DUPLICATES%%", _dupes_block(dupes))
-    )
+    ) + _now_line() + custom_profile.additions("wiki_writer")
     # Capture pre-run revision on the target wiki for `attach` mode so we
     # can detect whether the writer used the section-edit tools (each
     # bumps `wikis_ext.revision` directly). The writer may then submit an
@@ -445,7 +481,7 @@ async def wiki_write():
         release_handoff_slot(handoff_token)
 
     used_section_edits = False
-    if not (res.body or "").strip():
+    if _is_blank_body(res.body):
         # Empty body — only valid in attach mode if section edits bumped
         # the revision during the run. Otherwise the agent did nothing
         # persistable and we fail the jobs.
@@ -519,8 +555,25 @@ async def wiki_write():
     else:
         new_body = res.body
 
-    # 3. Persist (one transaction). No content gate — the LLM's body is
-    #    authoritative; we only snapshot (reversible) and reconcile additively.
+    # Final blank-body backstop. `new_body` is now whatever we are about to
+    # persist — either the LLM's submission or the post-section-edit DB body.
+    # A genuine page always has real characters; only serialization garbage
+    # (`""`, `body=""`, `{}`) reaches here blank. Persisting it would write an
+    # empty page AND bump the revision, which self-perpetuates into a high-rev
+    # empty loop. Reject instead (same release/retry path as the gates above) —
+    # the entity stays a healable orphan and is re-tried next cycle. The legit
+    # no-op (all members already cited) already returned above, so this never
+    # touches it.
+    if _is_blank_body(new_body):
+        with get_conn() as conn:
+            disp = wiki_jobs.release_or_fail_jobs(
+                conn, job_ids,
+                f"blank/garbage body not persisted ({mode}): {new_body[:80]!r}")
+        return {"written": 0, "result": disp, "reason": "blank body"}
+
+    # 3. Persist (one transaction). The LLM's body is authoritative (guarded
+    #    above against blank); we only snapshot (reversible) and reconcile
+    #    additively.
     with get_conn() as conn:
         summary, disambig = wiki_jobs.extract_summary_disambig(new_body)
         kw = wiki_jobs.keywords_from_meta(new_body)

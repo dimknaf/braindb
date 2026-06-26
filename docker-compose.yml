@@ -33,6 +33,10 @@ services:
       # the scheduler): an entity is wiki-eligible only once created_at is
       # older than this many minutes, so still-ingesting subjects settle first.
       WIKI_FRESHNESS_MINUTES: ${WIKI_FRESHNESS_MINUTES:-30}
+      # Optional custom-profile prompt shaping (wiki maintainer/writer). Empty
+      # by default -> the composition helper is a strict no-op and prompts are
+      # the baked-in defaults. Set CUSTOM_PROFILE in .env to activate.
+      CUSTOM_PROFILE: ${CUSTOM_PROFILE:-}
     extra_hosts:
       # Lets self-hosted profiles (e.g. vllm_workstation) reach a server bound
       # to the Docker host's loopback. Docker Desktop sets this implicitly;
@@ -118,6 +122,27 @@ services:
     volumes:
       - .:/app
     command: python -m braindb.wiki_scheduler
+
+  # Generic custom-profile ingestor supervisor — DORMANT unless CUSTOM_PROFILE
+  # is set in .env. For each active profile that ships an `ingestor.py` it runs
+  # that script as an isolated subprocess (restart-on-exit); with no active
+  # profile it sleeps and makes zero calls. This is what lets a single switch
+  # (CUSTOM_PROFILE) bring up prompt-shaping AND a profile's ingestor at once,
+  # while this base file stays profile-agnostic. See custom-profiles/README.md.
+  profile_runner:
+    build: .
+    container_name: braindb_profile_runner
+    restart: unless-stopped
+    depends_on:
+      - api
+    networks:
+      - local-network
+    environment:
+      BRAINDB_API_URL: http://api:${API_PORT:-8000}
+      CUSTOM_PROFILE: ${CUSTOM_PROFILE:-}
+    volumes:
+      - .:/app
+    command: python -m braindb.profile_runner
 
   # Read-only browser UI (frontend/ — plain static files, no build step).
   # Loopback-only on purpose: the UI's API calls go to http://localhost:8000

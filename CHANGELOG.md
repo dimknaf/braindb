@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-06-26
+
+Headline: **custom profiles** — opt-in, self-contained overlays that reshape what BrainDB ingests
+and how its auto-maintained wikis read, with ZERO effect on defaults when inactive. Two ship ready
+to run: a keyless **Hacker News** chronicle that grows company/project/tech pages from the firehose,
+and a **Hermes situational tracker** that asks an external web-search agent about an evolving
+real-world situation and keeps a dated, sourced, dashboard-shaped status page. Also in this release:
+the wiki writer now rejects blank/garbage bodies before persist, and the scheduler write-timeout
+default is raised for slower local models.
+
+### Added
+
+- **Custom profiles framework.** An opt-in composition layer (`braindb/custom_profile.py`,
+  `braindb/profile_runner.py`) that shapes ingestion + wiki output from a single self-contained
+  folder under `custom-profiles/<name>/`, activated by `CUSTOM_PROFILE` — defaults are byte-for-byte
+  unchanged when unset. A profile may carry `wiki_maintainer.add.md` / `wiki_writer.add.md` prompt
+  fragments (appended after the base prompt; a `*.replace.md` swaps it wholesale) and an optional
+  supervised `ingestor.py` (plus its own gitignored `.env`) that feeds a custom source into the
+  existing file-watcher. Profiles compose (comma-separated). Core API, schema, and base prompts are
+  untouched. Ships with an `example/` template and a `gdrive/` source ingestor alongside the two
+  profiles below.
+- **`hackernews` profile — keyless tech chronicle.** Polls the public Hacker News API, drops each new
+  story into `data/sources/`, and shapes the resulting entity pages as tech-entity chronicles
+  (type / homepage / category, a dated `current-developments` feed that ages into `background`, every
+  claim cited). No API key; runs immediately.
+- **`hermes` profile — situational tracker.** On a schedule, asks an external
+  [Hermes Agent](https://github.com/NousResearch/hermes-agent) (web-search, OpenAI-compatible gateway)
+  a dated, stateless question and folds each answer into a central situational wiki shaped as a
+  dashboard — status + confidence + most-credible-source, then `now` / `recent-days` / `recent-weeks`
+  / `forecast` / `history`, every line dated and `[[ref:UUID]]`-cited, conflicts resolved by
+  credibility or flagged low-confidence — while the other entities each report mentions still get
+  their own cross-linked wikis. Dormant by default (no key, so it idles and never calls); a
+  `HERMES_SAMPLE_FILE` dry-run exercises the whole pipeline offline.
+- **Current date in wiki prompts.** The maintainer and writer prompts now carry today's UTC date, so
+  recency / "as of" / dated-bucket reasoning has an anchor.
+
+### Changed
+
+- **Wiki scheduler write-timeout default raised 1200 -> 2400s (20 -> 40 min).** `WIKI_AGENT_TIMEOUT`;
+  smaller/slower quantised local models (e.g. Gemma 12B) can exceed 20 min on a full-body write, so
+  the old default abandoned slow-but-completing writes and forced retries. Client-patience only — the
+  API is not bounded by it and a write past the deadline still commits.
+
+### Fixed
+
+- **Writer rejects blank/garbage bodies before persist.** A weak model sometimes emits serialization
+  junk (`""`, `body=""`, `{}`) instead of a page; the previous whitespace-only gate let it through to
+  be written as content and bump the revision, self-perpetuating into empty, high-revision pages. A
+  single blank-body check now routes such writes to the existing retry path instead of persisting —
+  good pages can't be overwritten by junk, and the entity stays a healable orphan for the next cycle.
+
 ## [0.8.0] — 2026-06-16
 
 Headline: the wiki maintainer now batches related orphan triage into ONE LLM call —

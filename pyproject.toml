@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "braindb"
-version = "0.8.0"
+version = "0.9.0"
 description = "Persistent memory for LLM agents — thoughts, facts, sources, and behavioral rules with fuzzy + semantic search, graph traversal, and an internal agent."
 readme = "README.md"
 license = "Apache-2.0"

@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 app = FastAPI(
     title="BrainDB",
     description="Memory database and REST API for LLM agents",
-    version="0.8.0",
+    version="0.9.0",
 )
 
 app.add_middleware(
