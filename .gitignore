@@ -66,6 +66,9 @@ data_test/
 # holds a .env with the LLM key + provider state; never commit it.
 integrations/hermes/sandbox/hermes-data/
 
+# Vonage voice integration runtime state — per-caller conversation transcripts.
+integrations/vonage/.state/
+
 # Custom profiles — only the contract docs + the example/ profile are public.
 # Every real profile (its prompt fragments, ingestor.py, and .env secret) is
 # local-only: domain-specific content + credentials that must not be committed.
