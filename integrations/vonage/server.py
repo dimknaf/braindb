@@ -255,7 +255,7 @@ def talk(text: str, barge_in: bool = True) -> dict:
             "style": STYLE, "premium": True, "bargeIn": barge_in}
 
 
-def listen(base: str, leg: str, start_timeout: int = 6) -> dict:
+def listen(base: str, leg: str, start_timeout: int = 10) -> dict:
     action = {"action": "input", "type": ["speech"],
               "eventUrl": [f"{base}/webhooks/asr"],
               "speech": {"language": LANG, "endOnSilence": 1.0,
@@ -378,11 +378,13 @@ async def _asr(request: Request) -> JSONResponse:
 
     # Silence, nothing pending.
     st.silence += 1
-    if st.silence >= 3:
+    if st.silence >= 5:
         CALLS.pop(cid, None)
         ENDED.append(cid)
         return ncco(talk("Goodbye for now. Call me any time.", barge_in=False))  # no input => hang up
-    return ncco(talk("Are you still there?"), listen(base, st.leg))
+    if st.silence % 2 == 0:
+        return ncco(talk("I am still here, take your time."), listen(base, st.leg))
+    return ncco(listen(base, st.leg))    # quiet re-listen — don't nag mid-presentation
 
 
 def _finish(st: CallState) -> str:
