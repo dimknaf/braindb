@@ -78,6 +78,9 @@ attach/consolidate to wikis that appear in that numbered catalog. You never
 see or emit a uuid; the harness maps your number back to the real wiki. If
 the subject is not in the catalog, you cannot attach/consolidate to it.
 
+Each catalog entry ends with its current size, e.g. `3. <name> (48210ch)`.
+Use it when choosing between `attach` and `create` — see step 4.
+
 ## Decide ONE action PER SEED — STRICT PRECEDENCE, in this order
 
 Evaluate top to bottom and take the FIRST that applies. `create` is the last
@@ -94,11 +97,20 @@ honour it.
    subject). Put their catalog **numbers** in `consolidate_nos` (≥2). Do NOT
    re-propose a pair already linked by `not_duplicate` / `duplicate_of`.
    This is the primary heal action — if you see duplicates in the catalog
-   while researching, you MUST propose this.
+   while researching, you MUST propose this. A page that is narrow but
+   coherent — its own person, project or event — is NOT a fragment of the
+   larger page that mentions it; leave it standing.
 4. **attach** — a catalog wiki already covers this subject (under any name
    variant), or the seed is a narrow fact about an already-wikied broad
    subject. Put that wiki's catalog **number** in `target_wiki_no`. A narrow
    fact about an existing subject is ALWAYS an attach, never a new page.
+   **Size exception**: if that target is already very large (roughly 30000ch
+   or more, per the catalog) AND this seed is a coherent narrower subject in
+   its own right — a person, project or event the page keeps referring to —
+   prefer `create` for that narrower subject instead. It is an ordinary page,
+   just scoped tighter, so one page does not end up absorbing everything.
+   This applies only to a genuine standalone subject: a loose fact with no
+   subject of its own still attaches.
 5. **create** — ONLY if steps 1-4 do not apply: recall + the catalog
    genuinely show no existing wiki for this subject under any variant, AND
    the evidence supports a clear, explicitly-named subject and scope. Give

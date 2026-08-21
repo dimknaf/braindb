@@ -118,7 +118,10 @@ async def wiki_maintain():
     #    EACH seed's own subject (recall_memory / view_tree / delegate) before
     #    deciding — co-occurrence is not identity. Returns one decision per seed.
     catalog_txt = (
-        "\n".join(f"{i}. {w['canonical_name']}" for i, w in enumerate(cat, 1))
+        "\n".join(
+            f"{i}. {w['canonical_name']} ({w['char_count']}ch)"
+            for i, w in enumerate(cat, 1)
+        )
         or "(no existing wikis yet — attach/consolidate are impossible; "
            "use create/skip/ambiguous)"
     )
@@ -285,6 +288,12 @@ def _members_block(members: list[dict]) -> str:
 # exactly for navigating a body without inlining it.
 _INLINE_BODY_MAX_CHARS = 4000
 
+# Above this character count the page is already long enough that adding more
+# prose costs more than it informs (~10k tokens). The stub gains one paragraph
+# telling the writer to stay dense and name a neighbouring page rather than
+# expand this one. Advisory only — no gate, no rejection.
+_DENSITY_NUDGE_CHARS = 30000
+
 
 def _body_block_or_stub(mode: str, wiki_id: str | None, old_body: str) -> str:
     """For attach mode with a body too large to safely inline, return a
@@ -293,6 +302,16 @@ def _body_block_or_stub(mode: str, wiki_id: str | None, old_body: str) -> str:
     if not old_body:
         return "(none — create mode)"
     if mode == "attach" and wiki_id and len(old_body) > _INLINE_BODY_MAX_CHARS:
+        nudge = ""
+        if len(old_body) > _DENSITY_NUDGE_CHARS:
+            nudge = (
+                f"\n\nThis page is ALREADY LONG ({len(old_body)} chars). Prefer\n"
+                f"density over growth: tighten existing prose rather than append,\n"
+                f"and where a detail belongs to a neighbouring subject, name that\n"
+                f"page in prose instead of restating it here. If no listed page\n"
+                f"fits, leave that detail out — it stays unlinked and comes back\n"
+                f"for its own page later."
+            )
         return (
             f"[BODY OMITTED — {len(old_body)} chars, too large to inline.\n"
             f"Use the section tools to navigate without consuming context:\n"
@@ -301,6 +320,7 @@ def _body_block_or_stub(mode: str, wiki_id: str | None, old_body: str) -> str:
             f"  - edit_wiki_section(...) per section, validate_wiki, then\n"
             f"    final_answer(mode=\"attach\", body=\"\") — router persists via\n"
             f"    section edits and skips the full-body write.]"
+            f"{nudge}"
         )
     return old_body
 
@@ -358,6 +378,25 @@ async def wiki_write():
             wiki = None
             old_body = ""
         batch_id = str(jobs[0].get("batch_id")) if jobs[0].get("batch_id") else None
+        # Neighbouring pages the writer may name in prose instead of expanding
+        # this one. Short and relevant by construction — NOT the full catalog.
+        # Never in consolidate mode: there `member_ids` holds the DUPLICATE
+        # WIKI ids, so this would hand the writer the very pages it must
+        # absorb and invite it to link out to them instead of merging them.
+        related = (
+            []
+            if mode == "consolidate"
+            else wiki_jobs.list_related_wikis(
+                conn, member_ids, bucket.get("target_wiki_id")
+            )
+        )
+
+    def _related_wikis_block(rows: list[dict]) -> str:
+        if not rows:
+            return "(none — no neighbouring pages exist yet)"
+        return "\n".join(
+            f"- {r['canonical_name']} ({r['char_count']}ch)" for r in rows
+        )
 
     def _dupes_block(ds: list[dict]) -> str:
         if not ds:
@@ -383,6 +422,7 @@ async def wiki_write():
         .replace("%%WIKI_ID%%", bucket["target_wiki_id"] or "(assigned after write)")
         .replace("%%MEMBERS%%", _members_block(members))
         .replace("%%CURRENT_BODY%%", _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
+        .replace("%%RELATED_WIKIS%%", _related_wikis_block(related))
         .replace("%%DUPLICATES%%", _dupes_block(dupes))
     ) + _now_line() + custom_profile.additions("wiki_writer")
     # Capture pre-run revision on the target wiki for `attach` mode so we

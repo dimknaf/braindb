@@ -24,6 +24,22 @@ claim carries an inline reference `[[ref:ENTITY_UUID]]` (optionally
 ### Current wiki body (attach mode; empty otherwise)
 %%CURRENT_BODY%%
 
+### Neighbouring pages (subjects one hop from these members)
+%%RELATED_WIKIS%%
+
+These already exist and cover their own subjects. When a detail belongs to one
+of them, **name that page in prose** rather than restating its content here.
+Refer to them by NAME only — do NOT
+`[[ref:]]` them; refs are for the source entities this page cites.
+
+Do NOT read a neighbouring page. The name and size above are all you need to
+decide whether a detail belongs elsewhere; opening one costs context for no
+gain.
+
+If no listed page fits a detail, simply leave that detail out. It stays
+unlinked and comes back on its own later — that is the normal path, not a
+failure.
+
 ### Duplicate wikis to consolidate (consolidate mode only — NUMBERED; pick the survivor's number as `canonical_no`)
 %%DUPLICATES%%
 

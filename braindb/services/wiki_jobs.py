@@ -525,16 +525,57 @@ def fetch_wiki(conn, wiki_id: str) -> dict | None:
 
 
 def list_active_wikis(conn) -> list[dict]:
-    """All non-retired wikis as {id, canonical_name}, deterministically
-    ordered. Plumbing read (mirrors fetch_wiki / export_wikis SQL) — the
-    maintainer is shown this as a NUMBERED catalog so it references wikis by
-    number, never by uuid; the order here IS the numbering."""
+    """All non-retired wikis as {id, canonical_name, char_count},
+    deterministically ordered. Plumbing read (mirrors fetch_wiki /
+    export_wikis SQL) — the maintainer is shown this as a NUMBERED catalog so
+    it references wikis by number, never by uuid; the order here IS the
+    numbering. `char_count` lets the maintainer see that a candidate target is
+    already large and prefer a narrower `create` over piling on another
+    `attach`; without it every page looks equally empty."""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            """SELECT e.id::text AS id, w.canonical_name
+            """SELECT e.id::text AS id, w.canonical_name,
+                      length(e.content) AS char_count
                FROM entities e JOIN wikis_ext w ON w.entity_id = e.id
                WHERE e.entity_type = 'wiki' AND w.retired_at IS NULL
                ORDER BY e.importance DESC, e.created_at"""
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def list_related_wikis(conn, entity_ids: list[str], exclude_wiki_id: str | None,
+                       limit: int = 10) -> list[dict]:
+    """Wikis one hop from the entities being written, as
+    {canonical_name, char_count}, most-cited first.
+
+    The WRITER gets this — deliberately NOT the full catalog. It only needs to
+    know which neighbouring pages already exist so it can name one in prose
+    instead of expanding this page. A short, relevant list keeps that cheap;
+    the whole catalog would be noise and grows without bound.
+
+    "Related" = a wiki that already `summarises` an entity that one of these
+    members is connected to. Reuses the relations the pipeline already
+    maintains; creates nothing."""
+    if not entity_ids:
+        return []
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """SELECT w.canonical_name,
+                      length(e.content) AS char_count, count(*) AS cites
+               FROM relations seed
+               JOIN relations sm ON sm.to_entity_id IN (seed.from_entity_id,
+                                                        seed.to_entity_id)
+                                AND sm.relation_type = 'summarises'
+               JOIN entities e ON e.id = sm.from_entity_id
+               JOIN wikis_ext w ON w.entity_id = e.id
+               WHERE (seed.from_entity_id = ANY(%s::uuid[])
+                      OR seed.to_entity_id = ANY(%s::uuid[]))
+                 AND e.entity_type = 'wiki' AND w.retired_at IS NULL
+                 AND (%s::uuid IS NULL OR e.id <> %s::uuid)
+               GROUP BY e.id, w.canonical_name
+               ORDER BY cites DESC, w.canonical_name
+               LIMIT %s""",
+            (entity_ids, entity_ids, exclude_wiki_id, exclude_wiki_id, limit),
         )
         return [dict(r) for r in cur.fetchall()]
 
