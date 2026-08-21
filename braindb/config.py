@@ -148,6 +148,20 @@ class Settings(BaseSettings):
     agent_max_turns: int = 20
     agent_subagent_max_turns: int = 30
     agent_verbose: bool = False
+    # Per-LLM-call HTTP deadline (seconds), passed through to LiteLLM as
+    # `timeout=`. Without it LiteLLM applies its own 600s fallback: its
+    # `request_timeout` default is the sentinel 6000, and chat `completion()`
+    # maps that sentinel down to `COMPLETION_HTTP_FALLBACK_SECONDS` (600)
+    # whenever the caller sets no explicit timeout. 600s is ample for a
+    # short recall, but a wiki writer regenerating a 50k-char body on a
+    # local 27B can exceed it — the client then abandons a request vLLM is
+    # still completing, so the work is computed and discarded. Set to 4800
+    # (80 min) to cover a full 30-turn writer run at self-hosted latencies.
+    # Hosted providers finish far inside this and are unaffected: the value
+    # is a ceiling, not a delay. NOTE: setting the `REQUEST_TIMEOUT` env var
+    # to exactly 6000 is a no-op (it IS the sentinel); this setting avoids
+    # that trap by passing the value per-call instead.
+    agent_request_timeout: int = 4800
 
     # Runtime "start wrapping up, you have N turns left" nudge (Layer 3 of
     # Stage C). When ≤ this many LLM-call turns remain before `max_turns`

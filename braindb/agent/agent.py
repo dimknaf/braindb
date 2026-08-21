@@ -187,7 +187,16 @@ def _build(
         name=name,
         instructions=SYSTEM_PROMPT,
         model=_model(),
-        model_settings=ModelSettings(),
+        # `extra_args` is forwarded verbatim into the LiteLLM call, so
+        # `timeout` lands as `kwargs["timeout"]` — which LiteLLM resolves
+        # ahead of its 600s fallback. This is a TRANSPORT deadline only: it
+        # never enters the request body and cannot steer the model, unlike
+        # `output_type` / `tool_choice` (see the module docstring — those
+        # stay unset deliberately). Without it a long wiki write is
+        # abandoned client-side at 600s while the server is still working.
+        model_settings=ModelSettings(
+            extra_args={"timeout": settings.agent_request_timeout},
+        ),
         tools=[*_BASE_TOOLS, *extra_tools, submit_tool],
         tool_use_behavior=StopAtTools(
             stop_at_tool_names=["final_answer", *extra_stop_tools],
