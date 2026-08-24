@@ -208,9 +208,14 @@ class Settings(BaseSettings):
     # initial prompt construction long before the handoff can help.
     # Default was 9000 during the Phase-3 dry run; observation showed
     # that fired the handoff on routine consolidates that fit inline
-    # on Qwen, fragmenting work across successors unnecessarily. Set
-    # to 0 to disable the handoff nudge entirely.
-    agent_writer_handoff_token_budget: int = 20000
+    # on Qwen, fragmenting work across successors unnecessarily.
+    # Raised 20000 -> 30000 after a long soak: on pages approaching
+    # 50k chars the writer needs the successor path, and a budget set
+    # too high simply never fires, leaving it to accumulate context
+    # until it hits its turn limit. Keep this well inside the smallest
+    # context window you deploy on — above it, handoff is silently
+    # dead. Set to 0 to disable the handoff nudge entirely.
+    agent_writer_handoff_token_budget: int = 30000
     agent_writer_handoff_max_depth: int = 3
 
     @property
