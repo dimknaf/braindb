@@ -86,6 +86,27 @@ def test_estimate_tokens_object_with_content_attr():
     assert _estimate_tokens(items) == 300
 
 
+def test_estimate_tokens_counts_tool_output_dict():
+    """Tool results are `function_call_output` items: the payload sits
+    under `output`, never `content`. These dominate a writer's context
+    (section reads, recalls), so missing them left the estimate a
+    near-constant and the handoff nudge never fired."""
+    items = [
+        {"role": "user", "content": "x" * 400},
+        {"type": "function_call_output", "call_id": "c1", "output": "y" * 800},
+    ]
+    # 400 + 800 = 1200 chars / 4 = 300 tokens
+    assert _estimate_tokens(items) == 300
+
+
+def test_estimate_tokens_object_with_output_attr():
+    """SDK item objects carrying `.output` (no `.content`) count too."""
+    class FakeToolOutput:
+        output = "z" * 1200
+
+    assert _estimate_tokens([FakeToolOutput()]) == 300
+
+
 def test_estimate_tokens_unknown_shape_contributes_zero():
     """Unknown shapes (no recognisable text) must not raise. Lower-bound
     estimate is the safe side — we'd rather under-count than crash."""

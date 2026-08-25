@@ -48,7 +48,12 @@ def _estimate_tokens(input_items: list) -> int:
     - `{"role": str, "content": str}` (LiteLLM dict form)
     - `{"role": str, "content": [{"type":"text","text":str}, ...]}`
       (some providers send a list of parts)
-    - SDK item objects with a `.content` attribute
+    - `{"type": "function_call_output", "output": str}` — a tool result
+      keeps its payload under `output`, never `content`. These dominate
+      a writer's context (section reads, recalls), so reading only
+      `content` left the estimate a near-constant and the handoff nudge
+      never fired at any budget.
+    - SDK item objects with a `.content` or `.output` attribute
     Unknown shapes contribute 0; the estimate is a lower bound, which
     is the safe side for "is context filling up" decisions (we'd rather
     fire the handoff nudge slightly late than slightly never)."""
@@ -56,9 +61,9 @@ def _estimate_tokens(input_items: list) -> int:
     for item in input_items:
         content: object
         if isinstance(item, dict):
-            content = item.get("content", "")
+            content = item.get("content") or item.get("output", "")
         else:
-            content = getattr(item, "content", "")
+            content = getattr(item, "content", None) or getattr(item, "output", "")
         if isinstance(content, str):
             total_chars += len(content)
         elif isinstance(content, list):
