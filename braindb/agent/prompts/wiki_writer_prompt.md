@@ -197,34 +197,44 @@ can exhaust the context window. Use the section-edit tools instead —
 they let you read the OUTLINE only (cheap) and rewrite one section at
 a time, persisting each change immediately:
 
-- `check_members_cited(wiki_id, entity_ids)` — **call this FIRST, before
-  any reading.** It answers, exactly and in one call, which of your
-  MEMBERS the page already cites. If none are missing, the page already
-  covers this job: go straight to `final_answer(mode="attach", body="")`.
-  Do not read the page to convince yourself — that is what this is for.
+- `check_members_cited(wiki_id, entity_ids)` — **call this FIRST.** It
+  answers, exactly and in one call, which of your MEMBERS the page
+  already cites. If none are missing, the page already covers this job:
+  verify nothing else needs correcting, then finish with
+  `final_answer(mode="attach", body="")`. It answers COVERAGE only — not
+  placement or phrasing. You still read any section you intend to change.
 - `read_wiki_outline(wiki_id)` — section names + char counts + the
   current `revision` token. Call this before any edit.
-- `edit_wiki_section(..., mode="append")` — **the normal way to add.**
-  Adds your text to the end of a section and keeps everything already
-  there, byte for byte. You do NOT need to read the section first, and
-  nothing in it can be lost. Use this for a new `[[ref:UUID]]` bullet or
-  a new claim in a section you are not restructuring.
 - `read_wiki_section(wiki_id, section_name, offset, limit)` — fetch one
-  section + revision. Needed only when you are genuinely REWRITING a
-  section. A section larger than one slice is paged, not cut: follow
-  `content_meta.next_offset` until it is null, so you hold the whole
-  section before replacing it.
-- `edit_wiki_section(..., mode="replace")` — replace a section wholesale
-  (the default). Only after reading it in full. Pass the latest revision
-  you read; on mismatch you get a "stale revision" error and must re-read.
+  section + revision. **Read the section you are about to change** —
+  where new material belongs, and how, is your judgement, and you cannot
+  judge what you have not read. A section larger than one slice is
+  paged, not cut: follow `content_meta.next_offset` until it is null
+  when you need all of it.
+- `edit_wiki_section(...)` — `mode="replace"` (the default) rewrites the
+  section: read it in full first, because anything you do not re-emit is
+  gone. `mode="append"` adds your text at the end and preserves
+  everything already there. **Choose by CONTENT, not by cost:**
+  - The member **corroborates or refines a claim the section already
+    makes** → integrate it: revise that sentence and stack the citation
+    (`[[ref:existing]][[ref:new]]`). Never restate as new what the page
+    already says — a duplicate sentence is worse than a stacked ref.
+  - The member is **genuinely new information** → append it, or place it
+    where it reads naturally via replace if the end is the wrong spot.
+  - The **section's story has changed** (a contradiction resolved, an
+    event superseded — e.g. an application that became an accepted
+    offer) → rewrite the section so it tells one story. That freedom is
+    yours; the automatic snapshot makes every rewrite reversible.
 - `delete_wiki_section(wiki_id, section_name, expect_revision)` — remove
   a section.
 - `validate_wiki(wiki_id)` — check refs resolve and grammar invariants
   hold. Run after a batch of edits to catch any broken `[[ref:UUID]]`.
 
-**Do not rebuild a section you could append to.** Re-deriving a section's
-existing bullets from the body's `[[ref:]]` tokens costs one LLM turn per
-citation and risks corrupting a UUID by retyping it. Append instead.
+**After your edit, the section must read as one coherent narrative.** It
+must never, for example, say the user is applying for a job that a later
+line says they already accepted. When you do rewrite, copy `[[ref:UUID]]`
+tokens exactly — retyping a UUID by hand is how a digit flips and a
+citation dies.
 
 Section-edit grammar invariants when you author `new_content`:
 - Inline citations stay `[[ref:UUID]]` or `[[ref:UUID|display]]`

@@ -35,12 +35,15 @@ FRESHNESS_MINUTES = int(os.getenv("WIKI_FRESHNESS_MINUTES", "30"))
 # of a reaper/cycle, an `assigned` job whose lease expired is simply
 # claimable again at the EXISTING claim step.
 # Raised 20 -> 120. The old value cited "the longest legit run (AGENT_TIMEOUT
-# ~10 min)", but that premise expired three bumps ago: the scheduler's own
-# client patience is now WIKI_AGENT_TIMEOUT=2400s (40 min) and a single LLM
-# call may run to agent_request_timeout=4800s (80 min). At 20 min the lease
-# expired mid-run on essentially every write, so a second writer could claim
-# a job the first was still working. 120 min sits above both ceilings while
-# still recovering a genuinely dead job within about two hours.
+# ~10 min)", but that premise expired three bumps ago. OPERATOR INVARIANT:
+# the lease must exceed YOUR deployment's longest legitimate write — at
+# minimum the scheduler's WIKI_AGENT_TIMEOUT and the per-call
+# agent_request_timeout — or a still-running job gets reclaimed and run
+# twice. The default 120 min covers the shipped defaults (2400s scheduler
+# patience, 4800s per-call ceiling); a deployment that raises those (the
+# bench overlay runs WIKI_AGENT_TIMEOUT=18000s = 300 min) must raise
+# WIKI_ASSIGNED_LEASE_MIN above them too. Read in the API process (this
+# module is imported by the router), so set it on the api service.
 ASSIGNED_LEASE_MIN = int(os.getenv("WIKI_ASSIGNED_LEASE_MIN", "120"))
 
 # Hard ceiling on how many times ONE job may be reclaimed after a lease
@@ -284,6 +287,27 @@ def run_cron(conn) -> dict:
     """
     batch_id = str(uuid.uuid4())
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # Disposition first: an `assigned` job past both the lease AND the
+        # reclaim ceiling is un-claimable (`_claimable()` excludes it) and
+        # nothing else ever closes it — it would wedge forever, and because
+        # `assigned` counts as an ACTIVE job in `_orphan_conditions()`, its
+        # entity would be silently barred from re-triage for good. Flipping
+        # it to `failed` is the status that, by design, returns the entity
+        # to the orphan pool (`failed` is deliberately not excluded there),
+        # so the very scan below can re-enqueue it in this same tick.
+        # Bounded per JOB by the ceiling, self-healing per ENTITY via full
+        # cron cycles — the original contract, minus the reclaim spin.
+        cur.execute(
+            f"""UPDATE wiki_job
+               SET status = 'failed',
+                   last_error = 'reclaim ceiling ({ASSIGNED_MAX_RECLAIMS}) '
+                                'reached; entity returns to the orphan pool'
+               WHERE status = 'assigned'
+                 AND attempts >= {ASSIGNED_MAX_RECLAIMS}
+                 AND assigned_at < now() - make_interval(mins => {ASSIGNED_LEASE_MIN})"""
+        )
+        assigned_expired_failed = cur.rowcount
+
         cur.execute(
             f"""
             WITH orphans AS (
@@ -313,6 +337,7 @@ def run_cron(conn) -> dict:
         "batch_id": batch_id,
         "triage_jobs_enqueued": enqueued,
         "pending_triage_total": pending_triage,
+        "assigned_expired_failed": assigned_expired_failed,
     }
 
 
@@ -540,6 +565,36 @@ def next_write_bucket(conn) -> dict | None:
         jobs = [dict(r) for r in cur.fetchall()]
         return {"mode": "attach", "jobs": jobs,
                 "target_wiki_id": str(seed["target_wiki_id"]), "proposed_name": None}
+
+
+def uncited_members(conn, body: str,
+                    member_ids: list[str]) -> tuple[list[str], list[str]]:
+    """(missing, gone): member ids not cited in `body`, split into those
+    whose entity still exists (real outstanding work) and those with no
+    entity row.
+
+    A member deleted since triage can never be cited, so treating it like
+    ordinary "missing" wedges its job in a fail/retry loop forever — the
+    same premise as `reconcile_summarises_additive`'s dangling-ref skip:
+    absent content must never block bookkeeping.
+
+    This is THE citation predicate. The router's no-op gate and the
+    writer's `check_members_cited` tool both call it, so they can never
+    drift apart.
+    """
+    cited = parse_refs(body)
+    uncited = [m for m in member_ids if m.lower() not in cited]
+    if not uncited:
+        return [], []
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id::text FROM entities WHERE id = ANY(%s::uuid[])",
+            (uncited,),
+        )
+        live = {r[0].lower() for r in cur.fetchall()}
+    missing = [m for m in uncited if m.lower() in live]
+    gone = [m for m in uncited if m.lower() not in live]
+    return missing, gone
 
 
 def fetch_members(conn, entity_ids: list[str]) -> list[dict]:

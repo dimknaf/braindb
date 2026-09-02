@@ -63,8 +63,9 @@ fall back to flat SQL.
    to see narrative chains.
 3. **`delegate_to_subagent`** — for any multi-step investigation or
    disambiguation ("is this the same person/thing?", "find and resolve X").
-   A fresh agent with the memory tools and the wiki READ tools; it returns a
-   summary and cannot write. Prefer this over doing a long crawl yourself.
+   A fresh agent with the memory tools (saves and relations included) and
+   the wiki READ tools; it has no wiki WRITE tools. Returns a summary.
+   Prefer this over doing a long crawl yourself.
 4. `view_entity_relations` / `get_entity` / `list_entities` — direct lookups
    (single-hop relations, full body of one entity, listing by filter).
 5. **`search_sql` ⚠ exception only — aggregates only** (counts, GROUP BY,
@@ -96,7 +97,7 @@ design — research from previews, then open only the few you actually need.
 
 When a task would require many tool calls (deep search, duplicate detection, bulk relation work, graph exploration) and you don't need to see the intermediate results in your own context, delegate it to a subagent. The subagent runs in its own conversation context and returns only a final summary.
 
-**What it can and cannot do.** It has the memory tools plus the wiki READ tools (`read_wiki_outline`, `read_wiki_section`, `check_members_cited`, `validate_wiki`). It has NO wiki write tools and no handoff. Delegate investigation and reading — never an edit. Asking it to "edit section X" wastes a whole run: it has no safe way to do it.
+**What it can and cannot do.** It has the memory tools — saves, relations, `update_entity`, the full research set — plus the wiki READ tools (`read_wiki_outline`, `read_wiki_section`, `check_members_cited`, `validate_wiki`). It has NO wiki write tools and no handoff. Delegate investigation, reading and ordinary memory work — never a WIKI edit. Asking it to "edit section X" wastes a whole run: it has no safe way to do it.
 
 **Write the task description carefully** — the subagent doesn't see your prior conversation, only the task string you pass. Include:
 - The specific goal

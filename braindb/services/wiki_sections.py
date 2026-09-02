@@ -116,16 +116,19 @@ def splice_section(body: str, section_name: str, new_content: str) -> str:
 
 
 def append_to_section(body: str, section_name: str, added_content: str) -> str:
-    """Append text to the END of one named section, keeping everything
-    already in it byte-for-byte.
+    """Append text to the END of one named section, preserving its existing
+    content (whitespace-normalised: trailing blank lines collapse to one,
+    and the rebuild re-emits section markers in canonical form — no claim
+    or citation can be lost, but the guarantee is content-level, not
+    byte-level).
 
-    This is the incremental case the pipeline actually runs on: adding one
-    `[[ref:UUID]]` bullet. `splice_section` requires the caller to supply the
-    section's WHOLE new content, which on a large section forces a
-    read-everything / re-emit-everything cycle — and since the read side is
-    capped (`MAX_OUTPUT_CHARS`), on a section past that cap it cannot be done
-    correctly at all. Resolving the append here, from the body the caller
-    already holds, means the model never has to carry the prior content.
+    The genuinely-additive case: a new `[[ref:UUID]]` bullet or a new claim.
+    `splice_section` requires the caller to supply the section's WHOLE new
+    content; resolving an append here, from the body the caller already
+    holds, means the model never has to carry the prior content just to add
+    to it. When new material relates to what a section already says, a
+    replace that integrates it is the better edit — that judgement belongs
+    to the caller, not this function.
 
     A section that doesn't exist yet is created with `added_content`, matching
     `splice_section`'s append-a-new-section behaviour.

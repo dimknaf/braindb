@@ -14,10 +14,11 @@ The contract being tested:
 - `splice_section` REPLACES an existing section's content, or APPENDS
   a fresh section if the name is new. Bytes outside the targeted
   section are preserved exactly.
-- `append_to_section` ADDS to an existing section, keeping what is
-  already there byte-for-byte without the caller supplying it — the
-  incremental "one more citation" case, safe on a section larger than
-  the tool read cap.
+- `append_to_section` ADDS to an existing section without the caller
+  supplying its prior content — the genuinely-additive "one more
+  citation" case. Existing content is preserved at the content level
+  (trailing blank lines collapse to one; markers re-emit canonically):
+  no claim or citation can be lost.
 - `delete_section` removes a section, raises `KeyError` if missing.
 - `check_grammar` flags: no markers, malformed `[[ref:` tokens, missing
   Summary callout. Tolerates the grouped-refs variant `[[ref:UUID1],

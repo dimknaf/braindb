@@ -510,6 +510,14 @@ async def update_entity(
                 if not row:
                     return _err(f"entity {entity_id} not found")
                 entity_type = row[0]
+        if content == "":
+            # An empty string here is destruction, not an edit — observed
+            # live wiping a thought whose ref was already cited inside a
+            # wiki body. A real rewrite passes real text; removal is
+            # delete_entity's job. Ignored with a warning, never silent.
+            content = None
+            content_dropped = ("empty content ignored — use delete_entity "
+                               "to remove an entity, or notes for commentary")
         if content is not None and entity_type in _CONTENT_READONLY:
             content = None
             content_dropped = _CONTENT_READONLY[entity_type]
@@ -881,11 +889,12 @@ async def delegate_to_subagent(task: str) -> str:
     you want the result without polluting your main context with intermediate
     tool outputs.
 
-    The subagent gets the memory tools plus the wiki READ tools
-    (`read_wiki_outline`, `read_wiki_section`, `check_members_cited`,
-    `validate_wiki`). It CANNOT write: no `edit_wiki_section`, no
-    `delete_wiki_section`, no handoff. Ask it to investigate, read and report
-    — never to perform an edit, because it has no way to make one safely.
+    The subagent gets the memory tools (including the save/relation tools)
+    plus the wiki READ tools (`read_wiki_outline`, `read_wiki_section`,
+    `check_members_cited`, `validate_wiki`). It has NO wiki write tools —
+    no `edit_wiki_section`, no `delete_wiki_section`, no handoff — so ask
+    it to investigate, read and report, never to perform a WIKI edit: it
+    has no safe way to make one.
 
     Its answer comes back to you as ONE string, so ask for a distilled result,
     not a transcript. Write a clear, self-contained task description — the
@@ -989,8 +998,8 @@ async def read_wiki_section(
     `next_offset` until it is null to hold the whole section — do that before
     any `mode="replace"` edit, or you will drop what you never read.
 
-    To ADD to a section you are not restructuring, don't read it at all:
-    `edit_wiki_section(..., mode="append")` keeps the existing content for you.
+    Read the section you are about to change: where new material belongs, and
+    how it should be phrased against what is already there, is your judgement.
 
     Args:
         wiki_id: The wiki's entity UUID.
@@ -1027,11 +1036,11 @@ async def read_wiki_section(
 async def check_members_cited(wiki_id: str, entity_ids: list[str]) -> str:
     """Check which of these entity ids are ALREADY cited in the wiki body.
 
-    One cheap call, exact answer. This is the SAME check the router runs when
-    your run ends, so it tells you directly whether any work is left. If every
-    assigned MEMBER comes back cited, the page already covers them: finish with
-    `final_answer(mode="attach", body="")`. Do not re-read the page to satisfy
-    yourself — that is what this tool is for.
+    One cheap call, exact answer — the SAME check the router runs when your
+    run ends, so it tells you directly whether any citation work is left. It
+    answers COVERAGE only, not placement: you still read any section you
+    intend to change. An id reported `gone` no longer exists in the store
+    and cannot (and need not) be cited.
 
     Args:
         wiki_id: The wiki's entity UUID.
@@ -1040,17 +1049,21 @@ async def check_members_cited(wiki_id: str, entity_ids: list[str]) -> str:
     try:
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
-        if fetched is None:
-            return _err(f"wiki not found: {wiki_id}")
-        body, revision = fetched
-        cited = wj.parse_refs(body)  # lower-cased set
-        present = [e for e in entity_ids if e.lower() in cited]
-        missing = [e for e in entity_ids if e.lower() not in cited]
+            if fetched is None:
+                return _err(f"wiki not found: {wiki_id}")
+            body, revision = fetched
+            # The shared predicate — identical to the router's end-of-run
+            # gate, so the two can never disagree.
+            missing, gone = wj.uncited_members(conn, body, entity_ids)
+        not_cited = set(missing) | set(gone)
+        present = [e for e in entity_ids if e not in not_cited]
         return (
             f"revision: {revision}\n"
             f"cited: {len(present)}/{len(entity_ids)}\n"
             f"already_cited: {', '.join(present) or '(none)'}\n"
-            f"NOT_cited: {', '.join(missing) or '(none)'}"
+            f"NOT_cited: {', '.join(missing) or '(none)'}\n"
+            f"gone (deleted from store, cannot be cited): "
+            f"{', '.join(gone) or '(none)'}"
         )
     except Exception as e:
         return _err(str(e))
@@ -1075,14 +1088,14 @@ async def edit_wiki_section(
             Use lowercase letters, digits, dashes, underscores only.
         new_content: With mode="replace", the FULL new content of the
             section (without the marker line — the tool re-emits it). With
-            mode="append", ONLY the text to add at the end; everything
-            already in the section is kept for you, byte for byte.
+            mode="append", ONLY the text to add at the end; existing
+            content is preserved (trailing blank lines collapse to one).
         expect_revision: Revision token from the last read on this wiki.
-        mode: "replace" (default) or "append". Prefer "append" to add a
-            `[[ref:UUID]]` bullet or a new claim to a section you are not
-            restructuring: you do NOT need to read the section first and
-            nothing already in it can be lost. Use "replace" only when
-            genuinely rewriting a section — and read it in full first.
+        mode: "replace" (default) rewrites the section — read it in full
+            first, because anything you do not re-emit is gone. "append"
+            adds at the end, preserving what is there. Choose by content:
+            integrate/revise when the material relates to existing claims;
+            append when it is genuinely additive.
     """
     if mode not in ("replace", "append"):
         return _err(f"invalid mode '{mode}': use 'replace' or 'append'")
@@ -1118,7 +1131,7 @@ async def edit_wiki_section(
                 "op": "edit_wiki_section",
                 "section": section_name,
                 "mode": mode,
-                "appended": created,
+                "created": created,
                 "revision": new_rev,
             })
         verb = "created" if created else ("appended to" if mode == "append"

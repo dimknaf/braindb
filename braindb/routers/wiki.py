@@ -567,19 +567,24 @@ async def wiki_write():
             # `summarises` relations catch up. If any member is missing
             # from the body, the writer skipped real work — fail it.
             body_now = row[0] or ""
-            cited = wiki_jobs.parse_refs(body_now)  # lower-cased set
-            missing = [m for m in member_ids if m.lower() not in cited]
-            if missing:
-                with get_conn() as conn:
+            with get_conn() as conn:
+                # The shared predicate (`uncited_members`) splits un-cited
+                # members into `missing` (entity exists — real outstanding
+                # work) and `gone` (entity deleted since triage — can never
+                # be cited, and must not wedge the job in a retry loop; the
+                # same premise as reconcile's dangling-ref skip).
+                missing, gone = wiki_jobs.uncited_members(
+                    conn, body_now, member_ids)
+                if missing:
                     disp = wiki_jobs.release_or_fail_jobs(
                         conn, job_ids,
                         f"empty body AND no section edits AND "
                         f"{len(missing)} member(s) not yet cited in body",
                     )
-                return {"written": 0, "result": disp,
-                        "reason": "members un-cited"}
-            # All members cited — close the no-op cleanly and reconcile.
-            with get_conn() as conn:
+                    return {"written": 0, "result": disp,
+                            "reason": "members un-cited"}
+                # Every existing member cited — close the no-op cleanly
+                # and reconcile. `gone` ids are recorded, never silent.
                 rel = wiki_jobs.reconcile_summarises_additive(
                     conn, bucket["target_wiki_id"], body_now)
                 wiki_jobs.finish_jobs(conn, job_ids, "done")
@@ -587,12 +592,13 @@ async def wiki_write():
                              bucket["target_wiki_id"], details={
                                  "mode": mode, "no_op": True,
                                  "revision": pre_revision,
-                                 "members": len(member_ids), **rel,
+                                 "members": len(member_ids),
+                                 "members_gone": gone, **rel,
                              })
             logger.info(
                 "writer no-op accepted: pre_rev=%s, all %d members already "
-                "cited; reconcile=%s",
-                pre_revision, len(member_ids), rel,
+                "cited (%d gone); reconcile=%s",
+                pre_revision, len(member_ids), len(gone), rel,
             )
             return {"written": 0, "wiki_id": bucket["target_wiki_id"],
                     "mode": mode, "revision": pre_revision,
