@@ -144,6 +144,13 @@ async def wiki_maintain():
         with get_conn() as conn:
             wiki_jobs.finish_jobs(conn, [s["job_id"] for s in seeds], "failed",
                                   f"agent error: {e}"[:500])
+            # A crashed run must be visible in the DB audit trail too, not
+            # only in wiki_job.last_error and the container log.
+            log_activity(conn, "wiki_maintain", None, None, details={
+                "result": "failed",
+                "jobs": [s["job_id"] for s in seeds],
+                "error": str(e)[:500],
+            })
         return {"claimed": len(jobs), "result": "failed", "reason": str(e)}
 
     by_id = {d.entity_id: d for d in res.decisions}
@@ -230,7 +237,8 @@ def _apply_decision(conn, *, decision: dict, orphan: dict, job_id: str,
             wiki_jobs.finish_job(conn, job_id, "failed", "create missing proposed_name")
             outcome = {"action": "create", "error": "missing proposed_name"}
         else:
-            key = wiki_jobs.suggestion_dedupe_key("create", None, [orphan_id], [])
+            key = wiki_jobs.suggestion_dedupe_key(
+                "create", None, [orphan_id], [], proposed_name=name)
             sid = wiki_jobs.insert_suggestion(
                 conn, job_type="create", target_wiki_id=None,
                 entity_ids=[orphan_id], dedupe_key=key, rationale=rationale,
@@ -306,11 +314,13 @@ def _body_block_or_stub(mode: str, wiki_id: str | None, old_body: str) -> str:
         if len(old_body) > _DENSITY_NUDGE_CHARS:
             nudge = (
                 f"\n\nThis page is ALREADY LONG ({len(old_body)} chars). Prefer\n"
-                f"density over growth: tighten existing prose rather than append,\n"
-                f"and where a detail belongs to a neighbouring subject, name that\n"
-                f"page in prose instead of restating it here. If no listed page\n"
-                f"fits, leave that detail out — it stays unlinked and comes back\n"
-                f"for its own page later."
+                f"density over growth: integrate into existing prose rather than\n"
+                f"append parallel sentences, and where a NON-member detail you\n"
+                f"turned up belongs to a neighbouring subject, name that page in\n"
+                f"prose instead of restating it here — or leave it out; it stays\n"
+                f"an orphan and comes back for its own page later. This never\n"
+                f"applies to a MEMBER of this job: every member must be cited\n"
+                f"here regardless of length."
             )
         return (
             f"[BODY OMITTED — {len(old_body)} chars, too large to inline.\n"
@@ -362,6 +372,18 @@ async def wiki_write():
                 return {"written": 0, "result": "failed", "reason": "target wiki missing"}
             canonical = wiki["canonical_name"]
             old_body = wiki["content"] or ""
+            # Snapshot at CLAIM, not at persist. The snapshot's CONTENT was
+            # always this claim-time body — only its WRITE used to happen at
+            # persist, which meant a run that died after a section edit left
+            # a committed mutation with no snapshot anywhere. Writing it here
+            # (same transaction as the claim) closes that window; the section
+            # tools' own commits are now always preceded by a durable
+            # "this run started from revision N" record. A run that later
+            # fails or no-ops leaves this row too — truthful, and bounded by
+            # max_attempts.
+            wiki_jobs.snapshot_revision(
+                conn, str(bucket["target_wiki_id"]), old_body,
+                wiki_jobs.parse_refs(old_body), wiki["revision"])
         elif mode == "consolidate":
             members = []
             dupes = wiki_jobs.fetch_wikis_for_merge(conn, bucket["wiki_ids"])
@@ -372,6 +394,14 @@ async def wiki_write():
             canonical = "(decide among duplicates)"
             wiki = None
             old_body = "\n\n".join(d["content"] or "" for d in dupes)
+            # Same claim-time snapshot rule as attach, one per duplicate
+            # (this now precedes the canonical_no validation at persist —
+            # a snapshot of a merge that then failed validation is a
+            # harmless, truthful record).
+            for d in dupes:
+                wiki_jobs.snapshot_revision(
+                    conn, d["id"], d["content"] or "",
+                    wiki_jobs.parse_refs(d["content"] or ""), d["revision"])
         else:  # create
             members = wiki_jobs.fetch_members(conn, member_ids)
             canonical = bucket["proposed_name"] or "Untitled"
@@ -488,13 +518,18 @@ async def wiki_write():
                     f"{handoff_slot.progress_summary}\n\n"
                     "REMAINING WORK:\n"
                     f"{handoff_slot.remaining_work}\n\n"
-                    "Trust the brief — do NOT re-read what it already tells "
-                    "you; that is the whole point of the handoff. Pick up from "
-                    "here and call `final_answer` when done (body=\"\" if you "
-                    "persisted via section-edit tools, or the full body "
-                    "otherwise). If YOUR context also fills up before you "
-                    "finish, call `handoff_to_successor` again with an updated "
-                    "brief — the same successor mechanism will continue."
+                    "Trust the brief for STATE — revisions, decisions made, "
+                    "sections already done — and do not re-derive those. But "
+                    "your fresh context does not hold any section's TEXT: "
+                    "still read any section (or the header) you intend to "
+                    "replace, and choose edits by content, not by cost, "
+                    "exactly as the job instructions above say. Call "
+                    "`final_answer` when done — body=\"\" is for ATTACH mode "
+                    "only (when your section edits persisted the content); "
+                    "create and consolidate must submit the full body. If "
+                    "YOUR context also fills up before you finish, call "
+                    "`handoff_to_successor` again with an updated brief — "
+                    "the same successor mechanism will continue."
                 )
                 handoff_slot.captured = False
                 handoff_slot.progress_summary = ""
@@ -521,17 +556,29 @@ async def wiki_write():
                         f"handoff depth cap {max_depth} exhausted "
                         f"without final_answer",
                     )
+                    log_activity(conn, "wiki_write", "wiki",
+                                 bucket.get("target_wiki_id"), details={
+                                     "result": disp, "mode": mode,
+                                     "jobs": job_ids,
+                                     "error": "handoff depth exhausted",
+                                 })
                 return {"written": 0, "result": disp,
                         "reason": "handoff depth exhausted"}
         except Exception as e:
             logger.exception("writer agent failed")
             with get_conn() as conn:
                 disp = wiki_jobs.release_or_fail_jobs(conn, job_ids, f"agent error: {e}")
+                # Mirror the success-path wiki_write row so a DB-only
+                # auditor sees crashed runs, not a suspiciously clean log.
+                log_activity(conn, "wiki_write", "wiki",
+                             bucket.get("target_wiki_id"), details={
+                                 "result": disp, "mode": mode,
+                                 "jobs": job_ids, "error": str(e)[:500],
+                             })
             return {"written": 0, "result": disp, "reason": str(e)}
     finally:
         release_handoff_slot(handoff_token)
 
-    used_section_edits = False
     if _is_blank_body(res.body):
         # Empty body — only valid in attach mode if section edits bumped
         # the revision during the run. Otherwise the agent did nothing
@@ -604,7 +651,6 @@ async def wiki_write():
                     "mode": mode, "revision": pre_revision,
                     "jobs": job_ids, "no_op": True, **rel}
         new_body = row[0]
-        used_section_edits = True
         logger.info(
             "writer used section-edit path: pre_rev=%s post_rev=%s body=%dch",
             pre_revision, row[1], len(new_body),
@@ -650,10 +696,8 @@ async def wiki_write():
                         "reason": "invalid canonical_no"}
             canonical_id = dupes[no - 1]["id"]
             wiki_id = canonical_id
-            for d in dupes:
-                wiki_jobs.snapshot_revision(
-                    conn, d["id"], d["content"] or "",
-                    wiki_jobs.parse_refs(d["content"] or ""), d["revision"])
+            # Snapshots were written at CLAIM time (see the claim block) —
+            # every duplicate's pre-run body is already durably recorded.
             revision = wiki_jobs.finalize_wiki_write(
                 conn, wiki_id, new_body, summary, disambig, member_ids)
             for d in dupes:
@@ -662,9 +706,7 @@ async def wiki_write():
                     retired.append(d["id"])
         else:  # attach
             wiki_id = bucket["target_wiki_id"]
-            wiki_jobs.snapshot_revision(
-                conn, wiki_id, old_body, wiki_jobs.parse_refs(old_body),
-                wiki["revision"])
+            # Snapshot was written at CLAIM time (see the claim block).
             revision = wiki_jobs.finalize_wiki_write(
                 conn, wiki_id, new_body, summary, disambig, member_ids)
 

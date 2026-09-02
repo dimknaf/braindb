@@ -167,7 +167,7 @@ may leave the run un-cited**.
 ## Recommended structure (consistency, not a hard gate)
 
 ```
-<!-- wiki:meta canonical_name=NAME language=en revision=N keywords=term1;term2 -->
+<!-- wiki:meta canonical_name=NAME language=en keywords=term1;term2 -->
 # NAME
 > **Summary:** one tight line (aim <= 280 chars)
 > **Disambiguation:** what this is / is NOT; distinguish it from similarly
@@ -178,7 +178,9 @@ may leave the run un-cited**.
 <!-- section:sources -->       narrative provenance
 <!-- section:references -->    one bullet per distinct [[ref:UUID]] you cited,
                                with a short note — YOU author this to match
-                               your inline citations
+                               your inline citations, and you may compact or
+                               merge its bullets over time (it is a ledger,
+                               not claims; see the references exception below)
 ```
 
 `keywords=` in the meta line is optional — list the concept terms that best
@@ -224,7 +226,8 @@ a time, persisting each change immediately:
   - The **section's story has changed** (a contradiction resolved, an
     event superseded — e.g. an application that became an accepted
     offer) → rewrite the section so it tells one story. That freedom is
-    yours; the automatic snapshot makes every rewrite reversible.
+    yours; a snapshot taken when your run claimed this job makes the page
+    reversible to this run's starting revision.
 - `delete_wiki_section(wiki_id, section_name, expect_revision)` — remove
   a section.
 - `validate_wiki(wiki_id)` — check refs resolve and grammar invariants
@@ -242,17 +245,26 @@ Section-edit grammar invariants when you author `new_content`:
 - DO NOT include the `<!-- section:NAME -->` marker yourself — the
   tool emits it. Your `new_content` is the section's text only.
 - The HEADER (meta line, `# Title`, `> **Summary:**` /
-  `> **Disambiguation:**`) lives ABOVE the first section marker.
-  Section edits never touch the header — if the summary needs to
-  change, either re-edit the `overview` section to reflect the new
-  scope, or fall back to a full-body rewrite.
+  `> **Disambiguation:**`) lives ABOVE the first section marker and is
+  editable as the reserved section `"header"` — replace-only: read it
+  (`read_wiki_section(wiki_id, "header")`), then re-emit the whole
+  block via `edit_wiki_section(wiki_id, "header", ..., mode="replace")`.
+  Keep the `<!-- wiki:meta ... -->` line (it is where keywords come
+  from), and drop any stale `revision=` token — the database owns the
+  revision. **Update the header whenever the page's story changes**: a
+  Summary asserting what the body now records differently is a
+  coherence defect, and the header is what readers see first.
 - The "Preserve prior work" rule above applies PER SECTION: a
   replaced section's `new_content` must include every still-valid
   prior claim + `[[ref:UUID]]` from that section, plus the new
   material — a superset, not a lossy summary. This is why you must page
-  a large section to the end before replacing it; and it is why
-  `mode="append"` is preferred, since it satisfies the rule by
-  construction.
+  a large section to the end before replacing it (append satisfies the
+  rule by construction, but choose the edit by content, not by cost).
+  **One scoped exception — the `references` section**: it is a
+  bookkeeping ledger, not claims. You may compact it — merge bullets,
+  drop redundant ones — provided every previously-cited UUID keeps at
+  least one inline `[[ref:UUID]]` citation somewhere on the page.
+  Relations are additive, so compaction has no destructive side-effect.
 
 When finished, call `final_answer` with `body=""` (empty string) and
 `mode="attach"`. The router detects that the wiki's revision advanced

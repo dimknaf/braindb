@@ -37,6 +37,7 @@ from braindb.services.wiki_sections import (
     check_grammar,
     delete_section,
     parse_sections,
+    replace_header,
     splice_section,
 )
 
@@ -172,6 +173,61 @@ def test_delete_section_preserves_header():
 
 
 # ====================================================================== #
+# replace_header — the header becomes editable                            #
+# ====================================================================== #
+#
+# Section tools could edit every section but never the block above the
+# first marker, so a page's Summary could permanently contradict its own
+# body (observed live: "is applying" against a recorded acceptance).
+# `replace_header` closes that; these tests pin that it touches ONLY the
+# header.
+
+NEW_HEADER = (
+    "<!-- wiki:meta canonical_name=Test language=en -->\n"
+    "# Test\n"
+    "> **Summary:** updated one line\n"
+    "> **Disambiguation:** what this is, updated\n"
+)
+
+
+def test_replace_header_replaces_only_the_header():
+    out = replace_header(NORMAL_BODY, NEW_HEADER)
+    header, sections = parse_sections(out)
+    assert "> **Summary:** updated one line" in header
+    assert "revision=1" not in header  # the stale token is gone with the old header
+    before = {s.name: s.content for s in parse_sections(NORMAL_BODY)[1]}
+    after = {s.name: s.content for s in sections}
+    assert after == before
+
+
+def test_replace_header_keeps_section_order():
+    out = replace_header(NORMAL_BODY, NEW_HEADER)
+    assert [s.name for s in parse_sections(out)[1]] == [
+        "overview", "timeline", "references"]
+
+
+def test_replace_header_result_is_grammar_clean():
+    assert check_grammar(replace_header(NORMAL_BODY, NEW_HEADER)) == []
+
+
+def test_replace_header_without_trailing_newline():
+    out = replace_header(NORMAL_BODY, NEW_HEADER.rstrip("\n"))
+    header, sections = parse_sections(out)
+    assert header.endswith("\n")  # _rebuild normalises
+    assert len(sections) == 3
+
+
+def test_replace_header_empty_header_drops_it():
+    """Pin current `_rebuild` behaviour: an empty header is omitted, the
+    body then starts at the first marker."""
+    out = replace_header(NORMAL_BODY, "")
+    header, sections = parse_sections(out)
+    assert header == ""
+    assert out.startswith("<!-- section:overview -->")
+    assert len(sections) == 3
+
+
+# ====================================================================== #
 # Round-trip identity                                                     #
 # ====================================================================== #
 
@@ -200,6 +256,19 @@ def test_grammar_flags_missing_markers():
     body = "# Test\n> **Summary:** s\nNo markers here.\n"
     issues = check_grammar(body)
     assert any("no <!-- section:" in i for i in issues)
+
+
+def test_grammar_flags_missing_meta_line():
+    """A header replace that drops the meta line silently zeroes
+    keywords_from_meta — advisory check so validate_wiki surfaces it."""
+    body = (
+        "# Test\n> **Summary:** s\n"
+        "<!-- section:overview -->\nprose\n"
+    )
+    issues = check_grammar(body)
+    assert any("wiki:meta" in i for i in issues)
+    # and only that — Summary and markers are fine here
+    assert not any("Summary" in i for i in issues)
 
 
 def test_grammar_flags_missing_summary():

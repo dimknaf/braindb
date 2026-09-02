@@ -22,6 +22,7 @@ asyncio's per-Task context isolation makes nested/parallel runs safe.
 """
 import json
 import logging
+from uuid import uuid4
 from pathlib import Path
 from typing import TypeVar
 
@@ -31,7 +32,13 @@ from litellm import BadRequestError, ContextWindowExceededError
 from pydantic import BaseModel
 
 from braindb.agent.hooks import CountdownHooks
-from braindb.agent.run_state import install_slot, release_slot
+from braindb.agent.run_state import (
+    get_run_tag,
+    install_slot,
+    release_slot,
+    reset_run_tag,
+    set_run_tag,
+)
 from braindb.agent.schemas import (
     AgentAnswer,
     MaintainerDecision,
@@ -319,6 +326,10 @@ async def run_typed(
     """
     turns = max_turns or settings.agent_max_turns
     slot, token = install_slot()
+    # Short log tag for THIS run, inherited by the SDK's child Tasks so
+    # every TOOL line it emits is attributable (see run_state.set_run_tag).
+    # Set before Runner.run — ContextVars are captured at Task creation.
+    tag_token = set_run_tag(uuid4().hex[:6])
     # Layer-3 nudge: when the run is about to exhaust `max_turns`, the hook
     # appends a synthetic "you have N turns left, finalise via final_answer"
     # user message to the conversation. One nudge per run; disabled when
@@ -335,7 +346,8 @@ async def run_typed(
         handoff_tool_name="handoff_to_successor",
     )
     try:
-        logger.info("Running typed query (%s): %s", agent.name, query[:160])
+        logger.info("Running typed query [%s] (%s): %s",
+                    get_run_tag(), agent.name, query[:160])
         result = await Runner.run(
             starting_agent=agent, input=query, max_turns=turns, hooks=hooks,
         )
@@ -451,6 +463,7 @@ async def run_typed(
             _bad_request_retried=True,
         )
     finally:
+        reset_run_tag(tag_token)
         release_slot(token)
 
 

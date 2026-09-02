@@ -202,3 +202,38 @@ def test_max_depth_still_one():
     """Bounded delegation is deliberate — the fix was the scope of the
     counter, not the limit."""
     assert tools_mod._MAX_DEPTH == 1
+
+
+# ====================================================================== #
+# Run tag — concurrent runs must be separable in the logs               #
+# ====================================================================== #
+
+def test_verbose_tool_lines_carry_the_current_run_tag(monkeypatch, caplog):
+    """Audits of concurrent writer+maintainer+subagent logs previously had
+    to attribute TOOL lines by argument fingerprint. `run_typed` sets a
+    per-run tag; `_verbose` must print it."""
+    import logging as _logging
+    from braindb.agent.run_state import reset_run_tag, set_run_tag
+    from braindb.agent.schemas import SubagentResult
+
+    monkeypatch.setattr(tools_mod.settings, "agent_verbose", True)
+
+    async def fake_run_typed(task, agent, schema, max_turns=None):
+        return SubagentResult(result="ok")
+
+    monkeypatch.setattr(agent_mod, "run_typed", fake_run_typed)
+    monkeypatch.setattr(agent_mod, "get_subagent", lambda: object())
+
+    token = set_run_tag("tag4242")
+    try:
+        with caplog.at_level(_logging.INFO, logger="braindb.agent.tools"):
+            reply = asyncio.run(
+                tools_mod.delegate_to_subagent.on_invoke_tool(
+                    _Ctx(), json.dumps({"task": "probe"})))
+        assert "ok" in reply
+        tool_lines = [r.message for r in caplog.records
+                      if "delegate_to_subagent" in r.getMessage()]
+        assert tool_lines, "no TOOL lines captured"
+        assert any("[tag4242]" in r.getMessage() for r in caplog.records)
+    finally:
+        reset_run_tag(token)

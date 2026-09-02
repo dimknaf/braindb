@@ -60,6 +60,32 @@ def release_slot(token: object) -> None:
     _slot_var.reset(token)  # type: ignore[arg-type]
 
 
+# Run tag — a short id `run_typed` sets for the duration of ONE agent run,
+# read DOWNWARD by tool logging (`_verbose` in tools.py) inside the SDK's
+# child Tasks, so concurrent runs' TOOL lines are separable in `docker
+# logs`. Same read-down pattern as the delegation-depth ContextVar in
+# tools.py: no mutable slot needed, nothing ever writes it back up. A
+# nested run (delegate_to_subagent -> run_typed) sets its own tag; the
+# delegate call itself is logged under the parent's tag, which is the
+# correlation point. (Audits of concurrent writer+maintainer+subagent
+# logs previously had to attribute calls by argument fingerprint.)
+_run_tag_var: ContextVar[str] = ContextVar("braindb_run_tag", default="")
+
+
+def set_run_tag(tag: str) -> object:
+    """Set the current run's log tag; returns the reset token."""
+    return _run_tag_var.set(tag)
+
+
+def reset_run_tag(token: object) -> None:
+    _run_tag_var.reset(token)  # type: ignore[arg-type]
+
+
+def get_run_tag() -> str:
+    """The current run's log tag, or "" outside any run."""
+    return _run_tag_var.get()
+
+
 def record_submit(payload: Any) -> None:
     """Called from inside every `submit_*` tool body. The SDK has already
     validated `payload` against the tool's Pydantic argument schema, so

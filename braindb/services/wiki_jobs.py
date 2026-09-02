@@ -198,6 +198,32 @@ def try_wiki_lock(conn, key: str) -> bool:
         return bool(cur.fetchone()[0])
 
 
+def release_stale_assigned(conn, before) -> int:
+    """Return to `pending` every job still `assigned` from BEFORE `before`
+    (normally the API process's start time — see main.py startup).
+
+    Agent runs execute ONLY inside the API process; the scheduler and the
+    watcher are HTTP clients with no braindb imports. So a row assigned
+    before this process existed belongs to a run that died with the previous
+    process — without this it would sit dark for the full lease (observed:
+    a restart-orphaned consolidate invisible for hours while writers
+    re-derived the identity it would have settled). The lease remains the
+    safety net for deaths the process CANNOT see; this handles the one kind
+    it can. NOTE: keys off PROCESS start — the invariant breaks the day the
+    api runs with multiple workers or replicas.
+
+    `attempts` is preserved: the next claim increments it as usual, and the
+    reclaim ceiling + run_cron disposition still bound repeated wedging.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE wiki_job SET status = 'pending', assigned_at = NULL
+               WHERE status = 'assigned' AND assigned_at < %s""",
+            (before,),
+        )
+        return cur.rowcount
+
+
 def claim_jobs(conn, job_ids: list[str]) -> int:
     """Mark a bucket's pending suggestion jobs as assigned (SKIP LOCKED)."""
     if not job_ids:
@@ -462,12 +488,24 @@ def fetch_entity_brief(conn, entity_id: str) -> dict | None:
 
 
 def suggestion_dedupe_key(action: str, target_wiki_id: str | None,
-                          entity_ids: list[str], consolidate_wiki_ids: list[str]) -> str:
-    """Deterministic, service-computed (never LLM-computed) idempotency key."""
+                          entity_ids: list[str], consolidate_wiki_ids: list[str],
+                          proposed_name: str | None = None) -> str:
+    """Deterministic, service-computed (never LLM-computed) idempotency key.
+
+    `create` keys on the PROPOSED NAME, not the seed ids: two maintainer runs
+    proposing the same page name seconds apart used to mint two pages plus a
+    consolidate to undo it (observed three runs in a row, 65s apart). With
+    the name key the second insert conflicts; its orphan re-enters the pool
+    on the next cron and attaches to the page the first run built. The key
+    only spans ACTIVE jobs (partial index on pending/assigned), so a later
+    create for the same name — after the first completed — still inserts.
+    NOTE: unrelated to the advisory-lock string `create:{job_id}` in the
+    router (`lock_key`); that is a lock name, not a dedupe key.
+    """
     if action == "attach":
         return f"attach:{target_wiki_id}:" + ",".join(sorted(entity_ids))
     if action == "create":
-        return "create:" + ",".join(sorted(entity_ids))
+        return "create:" + (proposed_name or ",".join(sorted(entity_ids))).lower()
     if action == "consolidate":
         return "consolidate:" + ",".join(sorted(consolidate_wiki_ids))
     raise ValueError(f"unknown action {action!r}")
@@ -765,8 +803,9 @@ def _keyword_ids_among(conn, entity_ids: list[str]) -> list[str]:
 
 def finalize_wiki_write(conn, wiki_id: str, new_body: str, summary: str | None,
                         disambiguation: str | None, member_entity_ids: list[str]) -> int:
-    """Apply the gated body to an existing wiki: update content + header
-    fields, union new keyword members, bump revision."""
+    """Apply the LLM-authored body to an existing wiki: update content +
+    header fields, union new keyword members, bump revision. (There is no
+    content gate — the deliberate design; see routers/wiki.py.)"""
     new_kw = _keyword_ids_among(conn, member_entity_ids)
     with conn.cursor() as cur:
         cur.execute("UPDATE entities SET content=%s, summary=%s WHERE id=%s",

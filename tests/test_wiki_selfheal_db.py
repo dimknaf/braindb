@@ -68,16 +68,17 @@ def _invoke(tool, **kwargs) -> str:
 
 
 def _insert_entity(conn, entity_type: str, label: str, *,
-                   age_minutes: int = 0, notes: str | None = None) -> str:
+                   age_minutes: int = 0, notes: str | None = None,
+                   importance: float = 0.5) -> str:
     eid = uuid.uuid4()
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO entities (id, entity_type, content, keywords, source,
                                      importance, notes, created_at)
-               VALUES (%s, %s, %s, %s, 'user-stated', 0.5, %s,
+               VALUES (%s, %s, %s, %s, 'user-stated', %s, %s,
                        now() - make_interval(mins => %s))""",
             (str(eid), entity_type, f"_pytest_selfheal_{label}",
-             [f"_pytest_selfheal_{label}"], notes, age_minutes),
+             [f"_pytest_selfheal_{label}"], importance, notes, age_minutes),
         )
     return str(eid)
 
@@ -107,6 +108,7 @@ def _insert_wiki(conn, label: str, body: str) -> str:
 def _insert_job(conn, *, job_type: str, entity_ids: list[str],
                 status: str = "pending", attempts: int = 0,
                 assigned_age_minutes: int | None = None,
+                created_age_minutes: int = 0,
                 target_wiki_id: str | None = None,
                 dedupe_key: str | None = None) -> str:
     jid = uuid.uuid4()
@@ -115,13 +117,15 @@ def _insert_job(conn, *, job_type: str, entity_ids: list[str],
         cur.execute(
             """INSERT INTO wiki_job
                (id, job_type, status, target_wiki_id, entity_ids, dedupe_key,
-                attempts, assigned_at, rationale)
+                attempts, assigned_at, created_at, rationale)
                VALUES (%s, %s, %s, %s, %s::uuid[], %s, %s,
                        CASE WHEN %s::int IS NULL THEN NULL
                             ELSE now() - make_interval(mins => %s) END,
+                       now() - make_interval(mins => %s),
                        'pytest selfheal')""",
             (str(jid), job_type, status, target_wiki_id, entity_ids, dedupe,
-             attempts, assigned_age_minutes, assigned_age_minutes or 0),
+             attempts, assigned_age_minutes, assigned_age_minutes or 0,
+             created_age_minutes),
         )
     return str(jid)
 
@@ -342,3 +346,235 @@ def test_check_members_cited_tool_reports_gone_distinctly(db):
         assert ghost in gone_line
     finally:
         _cleanup(db, entity_ids=[f_cited, f_uncited, wid])
+
+
+# --------------------------------------------- 5. the header capability --
+
+
+HDR_BODY = (
+    "<!-- wiki:meta canonical_name=HdrTest language=en -->\n"
+    "# HdrTest\n"
+    "> **Summary:** old summary line\n"
+    "> **Disambiguation:** old scope\n"
+    "<!-- section:overview -->\nprose stays untouched\n"
+)
+NEW_HDR = (
+    "<!-- wiki:meta canonical_name=HdrTest language=en -->\n"
+    "# HdrTest\n"
+    "> **Summary:** new summary line\n"
+    "> **Disambiguation:** new scope\n"
+)
+
+
+def test_header_replace_edits_only_the_header_and_bumps_revision(db):
+    from braindb.agent.tools import edit_wiki_section
+    from braindb.services.wiki_jobs import extract_summary_disambig
+    wid = _insert_wiki(db, "hdr", HDR_BODY)
+    try:
+        reply = _invoke(edit_wiki_section, wiki_id=wid, section_name="header",
+                        new_content=NEW_HDR, expect_revision=1)
+        assert reply.startswith("ok"), reply
+        assert "replaced" in reply
+        with db.cursor() as cur:
+            cur.execute("SELECT e.content, w.revision FROM entities e "
+                        "JOIN wikis_ext w ON w.entity_id = e.id WHERE e.id = %s",
+                        (wid,))
+            content, revision = cur.fetchone()
+        assert "new summary line" in content
+        assert "old summary line" not in content
+        assert "prose stays untouched" in content  # sections untouched
+        assert revision == 2
+        # The existing persist path re-extracts from the body — prove the
+        # input it would read now carries the new header values.
+        summary, disambig = extract_summary_disambig(content)
+        assert summary == "new summary line"
+        assert disambig == "new scope"
+    finally:
+        _cleanup(db, entity_ids=[wid])
+
+
+def test_header_append_is_refused(db):
+    from braindb.agent.tools import edit_wiki_section
+    wid = _insert_wiki(db, "hdrapp", HDR_BODY)
+    try:
+        reply = _invoke(edit_wiki_section, wiki_id=wid, section_name="header",
+                        new_content="extra", expect_revision=1, mode="append")
+        assert 'cannot append to "header"' in reply
+    finally:
+        _cleanup(db, entity_ids=[wid])
+
+
+def test_header_delete_is_refused(db):
+    from braindb.agent.tools import delete_wiki_section
+    wid = _insert_wiki(db, "hdrdel", HDR_BODY)
+    try:
+        reply = _invoke(delete_wiki_section, wiki_id=wid,
+                        section_name="header", expect_revision=1)
+        assert "cannot be deleted" in reply
+    finally:
+        _cleanup(db, entity_ids=[wid])
+
+
+def test_header_replace_cas_rejects_stale_revision(db):
+    from braindb.agent.tools import edit_wiki_section
+    wid = _insert_wiki(db, "hdrcas", HDR_BODY)
+    try:
+        reply = _invoke(edit_wiki_section, wiki_id=wid, section_name="header",
+                        new_content=NEW_HDR, expect_revision=99)
+        assert "stale revision" in reply
+    finally:
+        _cleanup(db, entity_ids=[wid])
+
+
+def test_outline_and_read_surface_the_header(db):
+    from braindb.agent.tools import read_wiki_outline, read_wiki_section
+    wid = _insert_wiki(db, "hdrout", HDR_BODY)
+    try:
+        outline = _invoke(read_wiki_outline, wiki_id=wid)
+        assert "header:" in outline and 'section "header"' in outline
+        read = _invoke(read_wiki_section, wiki_id=wid, section_name="header")
+        assert "section: header" in read
+        assert "old summary line" in read
+        assert "prose stays untouched" not in read  # header only
+    finally:
+        _cleanup(db, entity_ids=[wid])
+
+
+def test_wiki_not_found_message_is_uniform_and_actionable(db):
+    """Models will always mistype UUIDs; the general recovery is the same
+    for every tool: copy the id exactly. One message, six tools."""
+    from braindb.agent import tools as t
+    ghost = str(uuid.uuid4())
+    replies = [
+        _invoke(t.read_wiki_outline, wiki_id=ghost),
+        _invoke(t.read_wiki_section, wiki_id=ghost, section_name="overview"),
+        _invoke(t.check_members_cited, wiki_id=ghost, entity_ids=[ghost]),
+        _invoke(t.edit_wiki_section, wiki_id=ghost, section_name="overview",
+                new_content="x", expect_revision=1),
+        _invoke(t.delete_wiki_section, wiki_id=ghost, section_name="overview",
+                expect_revision=1),
+        _invoke(t.validate_wiki, wiki_id=ghost),
+    ]
+    for r in replies:
+        assert "wiki not found" in r, r
+        assert "Copy the wiki id" in r, r
+
+
+# ------------------------------------- 6. restart-orphan release (A2) --
+
+
+def test_release_stale_assigned_releases_only_pre_cutoff(db):
+    from datetime import datetime, timedelta, timezone
+    old = _insert_job(db, job_type="attach", entity_ids=[],
+                      status="assigned", attempts=2, assigned_age_minutes=30)
+    fresh = _insert_job(db, job_type="attach", entity_ids=[],
+                        status="assigned", attempts=1, assigned_age_minutes=1)
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+        released = wiki_jobs.release_stale_assigned(db, cutoff)
+        assert released >= 1
+        old_row, fresh_row = _job_row(db, old), _job_row(db, fresh)
+        assert old_row["status"] == "pending"
+        assert old_row["assigned_at"] is None
+        assert old_row["attempts"] == 2  # preserved; claim increments later
+        assert fresh_row["status"] == "assigned"  # after cutoff: live work
+    finally:
+        _cleanup(db, job_ids=[old, fresh])
+
+
+# --------------------------------------- 7. create dedupe by name (C) --
+
+
+def test_create_dedupe_collapses_same_name_while_active(db):
+    e1 = _insert_entity(db, "fact", "dupname1")
+    e2 = _insert_entity(db, "fact", "dupname2")
+    k1 = wiki_jobs.suggestion_dedupe_key(
+        "create", None, [e1], [], proposed_name="Foo Bar")
+    k2 = wiki_jobs.suggestion_dedupe_key(
+        "create", None, [e2], [], proposed_name="foo bar")
+    assert k1 == k2  # name-keyed, case-folded; seed ids irrelevant
+    try:
+        first = wiki_jobs.insert_suggestion(
+            db, job_type="create", target_wiki_id=None, entity_ids=[e1],
+            dedupe_key=k1, rationale="pytest selfheal",
+            proposed_name="Foo Bar", batch_id=None)
+        assert first is not None
+        second = wiki_jobs.insert_suggestion(
+            db, job_type="create", target_wiki_id=None, entity_ids=[e2],
+            dedupe_key=k2, rationale="pytest selfheal",
+            proposed_name="foo bar", batch_id=None)
+        assert second is None  # collapsed while the first is active
+        # After the first completes, the partial index no longer spans it —
+        # a later create for the same name may insert again.
+        with db.cursor() as cur:
+            cur.execute("UPDATE wiki_job SET status='done' WHERE id = %s",
+                        (first,))
+        third = wiki_jobs.insert_suggestion(
+            db, job_type="create", target_wiki_id=None, entity_ids=[e2],
+            dedupe_key=k2, rationale="pytest selfheal",
+            proposed_name="foo bar", batch_id=None)
+        assert third is not None
+    finally:
+        _cleanup(db, entity_ids=[e1, e2])
+
+
+# ----------------------- 8. router-level: snapshot at claim + fail log --
+
+
+def test_writer_claim_snapshots_before_any_persist_and_failure_is_logged(
+        db, monkeypatch):
+    """THE reversibility test. The agent run is made to die immediately;
+    the pre-run snapshot must already exist (claim-time write), and the
+    crash must leave a visible wiki_write failure row (A3)."""
+    import braindb.routers.wiki as wiki_router
+
+    wid = _insert_wiki(db, "snap", HDR_BODY)
+    jid = _insert_job(db, job_type="attach", entity_ids=[],
+                      target_wiki_id=wid, created_age_minutes=10)
+    try:
+        async def boom(*a, **k):
+            raise RuntimeError("pytest-forced writer crash")
+        monkeypatch.setattr(wiki_router, "run_typed", boom)
+        res = asyncio.run(wiki_router.wiki_write())
+        assert res["written"] == 0
+        assert "pytest-forced" in res["reason"]
+        with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT operation, details FROM activity_log "
+                "WHERE entity_id = %s ORDER BY timestamp", (wid,))
+            rows = cur.fetchall()
+        ops = [r["operation"] for r in rows]
+        assert "wiki_revise" in ops  # snapshot at CLAIM; run died after
+        snap = next(r for r in rows if r["operation"] == "wiki_revise")
+        assert snap["details"]["from_revision"] == 1
+        assert "prose stays untouched" in snap["details"]["prior_content"]
+        fail = next(r for r in rows if r["operation"] == "wiki_write")
+        assert fail["details"]["result"] in ("pending", "requeued", "failed")
+        assert "pytest-forced" in fail["details"]["error"]
+    finally:
+        _cleanup(db, entity_ids=[wid], job_ids=[jid])
+
+
+def test_maintainer_crash_is_logged_and_job_failed(db, monkeypatch):
+    import braindb.routers.wiki as wiki_router
+
+    eid = _insert_entity(db, "fact", "mfail", age_minutes=90, importance=0.99)
+    jid = _insert_job(db, job_type="triage", entity_ids=[eid],
+                      dedupe_key=f"triage:{eid}")
+    try:
+        async def boom(*a, **k):
+            raise RuntimeError("pytest-forced maintainer crash")
+        monkeypatch.setattr(wiki_router, "run_typed", boom)
+        res = asyncio.run(wiki_router.wiki_maintain())
+        assert res["result"] == "failed"
+        assert _job_row(db, jid)["status"] == "failed"
+        with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT details FROM activity_log WHERE operation = "
+                "'wiki_maintain' AND details->>'result' = 'failed' "
+                "AND details->'jobs' @> to_jsonb(%s::text)", (jid,))
+            row = cur.fetchone()
+        assert row is not None, "crashed maintainer left no activity row"
+        assert "pytest-forced" in row["details"]["error"]
+    finally:
+        _cleanup(db, entity_ids=[eid], job_ids=[jid])

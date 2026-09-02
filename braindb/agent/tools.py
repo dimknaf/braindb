@@ -38,7 +38,7 @@ from braindb.services.keyword_service import (
 from braindb.services.search import fuzzy_search, preview, slice_content
 from braindb.services import wiki_sections as ws
 from braindb.services import wiki_jobs as wj
-from braindb.agent.run_state import record_handoff, record_submit
+from braindb.agent.run_state import get_run_tag, record_handoff, record_submit
 from braindb.agent.schemas import (
     AgentAnswer,
     MaintainerClusterDecision,
@@ -50,6 +50,12 @@ from braindb.agent.schemas import (
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 8000
+
+# Cap on the args/result previews `_verbose` writes to the log. 500 proved
+# too small to audit real runs (briefs and returns were unreadable stubs);
+# this is a LOG cap only, unrelated to MAX_OUTPUT_CHARS (the tool-payload
+# cap the model sees).
+VERBOSE_PREVIEW_CHARS = 1500
 
 # Entity types whose BODY is not editable through the generic `update_entity`
 # path, mapped to the redirect the model should follow instead. A wiki body is
@@ -77,6 +83,18 @@ def _err(msg: str) -> str:
     return f"ERROR: {msg}"
 
 
+def _wiki_not_found(wiki_id: str) -> str:
+    """One message for every wiki tool, stating the three possible causes and
+    the general recovery. Models mistype UUIDs (observed: splicing one id's
+    tail onto another's head); a bare "not found" leaves them guessing, while
+    "copy it exactly" is the recovery that works for any typo shape."""
+    return _err(
+        f"wiki not found: {wiki_id} — either no entity has this id, the "
+        f"entity is not a wiki, or it has no wiki record. Copy the wiki id "
+        f"from your job prompt exactly; do not retype UUIDs."
+    )
+
+
 def _verbose(name: str):
     """Decorator that logs tool entry and exit when settings.agent_verbose is True.
     Placed BELOW @function_tool so the SDK still introspects the real signature.
@@ -99,21 +117,24 @@ def _verbose(name: str):
                         bound[param_names[i]] = val
                 bound.update(kwargs)
                 try:
-                    args_preview = json.dumps(bound, default=str)[:500]
+                    args_preview = json.dumps(bound, default=str)[:VERBOSE_PREVIEW_CHARS]
                 except Exception:
-                    args_preview = str(bound)[:500]
-                logger.info("TOOL  %s  args=%s", name, args_preview)
+                    args_preview = str(bound)[:VERBOSE_PREVIEW_CHARS]
+                logger.info("TOOL [%s] %s  args=%s",
+                            get_run_tag() or "-", name, args_preview)
                 t0 = time.perf_counter()
             try:
                 result = await fn(*args, **kwargs)
             except Exception as e:
                 if settings.agent_verbose:
-                    logger.error("TOOL! %s  exception=%s", name, e)
+                    logger.error("TOOL! [%s] %s  exception=%s",
+                                 get_run_tag() or "-", name, e)
                 raise
             if settings.agent_verbose and t0 is not None:
                 elapsed = time.perf_counter() - t0
-                preview = str(result)[:500].replace("\n", " | ")
-                logger.info("TOOL  %s  elapsed=%.2fs  result=%s", name, elapsed, preview)
+                preview = str(result)[:VERBOSE_PREVIEW_CHARS].replace("\n", " | ")
+                logger.info("TOOL [%s] %s  elapsed=%.2fs  result=%s",
+                            get_run_tag() or "-", name, elapsed, preview)
             return result
         return wrapper
     return decorator
@@ -712,6 +733,22 @@ async def search_sql(query: str) -> str:
     this entity" — that's view_tree. If you're using SQL to find or understand
     something, stop and pick the right tool.
 
+    Dialect: PostgreSQL (15+). String search: `position()`, `strpos()`,
+    `regexp_matches`, `regexp_count`, `regexp_instr`, `regexp_substr`,
+    `regexp_like`, `substring()`. Schema:
+      entities(id, entity_type, title, content, summary, keywords TEXT[],
+               importance, notes, metadata, created_at, updated_at,
+               accessed_at, access_count)
+      relations(id, from_entity_id, to_entity_id, relation_type,
+                relevance_score, importance_score, is_bidirectional,
+                description, notes, created_at, updated_at)
+      wiki_job(id, job_type, status, target_wiki_id, entity_ids UUID[],
+               dedupe_key, rationale, proposed_name, batch_id, created_at,
+               assigned_at, completed_at, attempts, last_error)
+      wikis_ext(entity_id, canonical_name, disambiguation, language,
+                member_keyword_ids UUID[], revision, retired_at, redirect_to)
+    Array columns need `= ANY(col)` or `unnest(col)`, never `IN (col)`.
+
     Args:
         query: SQL query — must start with SELECT or WITH.
     """
@@ -967,15 +1004,20 @@ async def read_wiki_outline(wiki_id: str) -> str:
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
         if fetched is None:
-            return _err(f"wiki not found: {wiki_id}")
+            return _wiki_not_found(wiki_id)
         body, revision = fetched
-        _, sections = ws.parse_sections(body)
+        header, sections = ws.parse_sections(body)
         if not sections:
             return _err(
                 f"wiki {wiki_id} body has no <!-- section:X --> markers "
                 f"(strict-markers contract violated; cannot edit)"
             )
-        lines = [f"revision: {revision}", f"sections: {len(sections)}"]
+        lines = [
+            f"revision: {revision}",
+            f'header: {len(header)}ch (meta + title + Summary/Disambiguation'
+            f' — readable and replaceable as section "header")',
+            f"sections: {len(sections)}",
+        ]
         for s in sections:
             lines.append(f"  - {s.name}: {s.char_count}ch")
         return "\n".join(lines)
@@ -1003,7 +1045,9 @@ async def read_wiki_section(
 
     Args:
         wiki_id: The wiki's entity UUID.
-        section_name: Section name as listed by read_wiki_outline.
+        section_name: Section name as listed by read_wiki_outline, or the
+            reserved name "header" for the block above the first marker
+            (meta line, title, Summary/Disambiguation callouts).
         offset: start char of the slice (default 0).
         limit: max chars of this slice (clamped to the server slice max).
     """
@@ -1011,9 +1055,15 @@ async def read_wiki_section(
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
         if fetched is None:
-            return _err(f"wiki not found: {wiki_id}")
+            return _wiki_not_found(wiki_id)
         body, revision = fetched
-        _, sections = ws.parse_sections(body)
+        header, sections = ws.parse_sections(body)
+        if section_name == "header":
+            chunk, meta = slice_content(header, offset, limit)
+            return (
+                f"revision: {revision}\nsection: header\n"
+                f"content_meta: {json.dumps(meta)}\ncontent:\n{chunk}"
+            )
         match = next((s for s in sections if s.name == section_name), None)
         if match is None:
             names = ", ".join(s.name for s in sections) or "(none)"
@@ -1050,7 +1100,7 @@ async def check_members_cited(wiki_id: str, entity_ids: list[str]) -> str:
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
             if fetched is None:
-                return _err(f"wiki not found: {wiki_id}")
+                return _wiki_not_found(wiki_id)
             body, revision = fetched
             # The shared predicate — identical to the router's end-of-run
             # gate, so the two can never disagree.
@@ -1082,10 +1132,17 @@ async def edit_wiki_section(
     section is created at the end. Revision mismatch → returns ERROR:
     re-read first.
 
+    The reserved name "header" edits the block ABOVE the first section
+    marker — the `<!-- wiki:meta ... -->` line, the `# Title`, and the
+    `> **Summary:**` / `> **Disambiguation:**` callouts. Replace-only:
+    read it first, keep the meta line, and update the Summary whenever the
+    page's story has changed — a summary asserting what the body now
+    disputes is a coherence defect.
+
     Args:
         wiki_id: The wiki's entity UUID.
-        section_name: Section to edit (or new section to create).
-            Use lowercase letters, digits, dashes, underscores only.
+        section_name: Section to edit (or new section to create), or
+            "header". Use lowercase letters, digits, dashes, underscores.
         new_content: With mode="replace", the FULL new content of the
             section (without the marker line — the tool re-emits it). With
             mode="append", ONLY the text to add at the end; existing
@@ -1095,11 +1152,19 @@ async def edit_wiki_section(
             first, because anything you do not re-emit is gone. "append"
             adds at the end, preserving what is there. Choose by content:
             integrate/revise when the material relates to existing claims;
-            append when it is genuinely additive.
+            append when it is genuinely additive. The header is
+            replace-only.
     """
     if mode not in ("replace", "append"):
         return _err(f"invalid mode '{mode}': use 'replace' or 'append'")
-    if not _SECTION_NAME_RE.fullmatch(section_name):
+    if section_name == "header":
+        if mode == "append":
+            return _err(
+                'cannot append to "header": it is one block (meta line, '
+                'title, Summary/Disambiguation) — read it, then '
+                'mode="replace" it whole'
+            )
+    elif not _SECTION_NAME_RE.fullmatch(section_name):
         return _err(
             f"invalid section_name '{section_name}': use only letters, "
             f"digits, dashes, underscores"
@@ -1108,7 +1173,7 @@ async def edit_wiki_section(
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
             if fetched is None:
-                return _err(f"wiki not found: {wiki_id}")
+                return _wiki_not_found(wiki_id)
             body, current_rev = fetched
             if current_rev != expect_revision:
                 return _err(
@@ -1121,8 +1186,11 @@ async def edit_wiki_section(
                     f"wiki {wiki_id} body has no <!-- section:X --> markers; "
                     f"strict-markers contract violated"
                 )
-            created = all(s.name != section_name for s in sections)
-            if mode == "append":
+            created = (section_name != "header"
+                       and all(s.name != section_name for s in sections))
+            if section_name == "header":
+                new_body = ws.replace_header(body, new_content)
+            elif mode == "append":
                 new_body = ws.append_to_section(body, section_name, new_content)
             else:
                 new_body = ws.splice_section(body, section_name, new_content)
@@ -1151,17 +1219,30 @@ async def delete_wiki_section(
     expect_revision: int,
 ) -> str:
     """Remove a section. Revision mismatch → ERROR: re-read first.
+    The "header" is not deletable — it is the only place the meta line and
+    the `> **Summary:**` callout can live.
 
     Args:
         wiki_id: The wiki's entity UUID.
-        section_name: Section to remove.
+        section_name: Section to remove ("header" is refused).
         expect_revision: Revision token from the last read on this wiki.
     """
+    if section_name == "header":
+        return _err(
+            'the "header" cannot be deleted — it holds the meta line and '
+            'the Summary/Disambiguation callouts. To change it, use '
+            'edit_wiki_section("header", ..., mode="replace").'
+        )
+    if not _SECTION_NAME_RE.fullmatch(section_name):
+        return _err(
+            f"invalid section_name '{section_name}': use only letters, "
+            f"digits, dashes, underscores"
+        )
     try:
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
             if fetched is None:
-                return _err(f"wiki not found: {wiki_id}")
+                return _wiki_not_found(wiki_id)
             body, current_rev = fetched
             if current_rev != expect_revision:
                 return _err(
@@ -1201,7 +1282,7 @@ async def validate_wiki(wiki_id: str) -> str:
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
         if fetched is None:
-            return _err(f"wiki not found: {wiki_id}")
+            return _wiki_not_found(wiki_id)
         body, revision = fetched
         issues = ws.check_grammar(body)
         if not issues:
