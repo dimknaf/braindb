@@ -470,21 +470,31 @@ async def wiki_write():
             max_depth = settings.agent_writer_handoff_max_depth
             while handoff_slot.captured and depth < max_depth:
                 depth += 1
+                # Appended AFTER the rendered job prompt (see run_typed call
+                # below), so the successor really does have the same prompt:
+                # mode, canonical name, wiki id, MEMBERS, the body stub, the
+                # neighbouring pages and every writer rule. Seeding it with
+                # this brief ALONE — as this loop used to — left it running on
+                # the generic SYSTEM_PROMPT with no members, no preservation
+                # rule and no `body=""` contract, so it re-read from scratch
+                # exactly what the brief had just told it.
                 seed = (
-                    "Continuing from a previous agent run that ended early "
-                    "via `handoff_to_successor` because its context was "
-                    "filling up. You have the SAME prompt, the SAME tools, "
-                    "and a fresh context window. Resume from this state.\n\n"
+                    "---\n\n"
+                    "CONTINUATION. The job above is unchanged. A previous "
+                    "agent run on it ended early via `handoff_to_successor` "
+                    "because its context was filling up. You have its brief "
+                    "below, the same tools, and a fresh context window.\n\n"
                     "PROGRESS SO FAR (from the previous agent):\n"
                     f"{handoff_slot.progress_summary}\n\n"
                     "REMAINING WORK:\n"
                     f"{handoff_slot.remaining_work}\n\n"
-                    "Pick up from here. Call `final_answer` when done "
-                    "(body=\"\" if you persisted via section-edit tools, "
-                    "or the full body otherwise). If YOUR context also "
-                    "fills up before you finish, call `handoff_to_successor` "
-                    "again with an updated brief — the same successor "
-                    "mechanism will continue."
+                    "Trust the brief — do NOT re-read what it already tells "
+                    "you; that is the whole point of the handoff. Pick up from "
+                    "here and call `final_answer` when done (body=\"\" if you "
+                    "persisted via section-edit tools, or the full body "
+                    "otherwise). If YOUR context also fills up before you "
+                    "finish, call `handoff_to_successor` again with an updated "
+                    "brief — the same successor mechanism will continue."
                 )
                 handoff_slot.captured = False
                 handoff_slot.progress_summary = ""
@@ -494,7 +504,8 @@ async def wiki_write():
                     depth, max_depth, mode, job_ids,
                 )
                 res = await run_typed(
-                    seed, get_writer_agent(), WikiWriteResult, max_turns=30,
+                    f"{prompt}\n\n{seed}", get_writer_agent(), WikiWriteResult,
+                    max_turns=30,
                     token_budget=settings.agent_writer_handoff_token_budget,
                 )
             if handoff_slot.captured:

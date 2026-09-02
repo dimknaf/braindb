@@ -115,6 +115,29 @@ def splice_section(body: str, section_name: str, new_content: str) -> str:
     return _rebuild(header, sections)
 
 
+def append_to_section(body: str, section_name: str, added_content: str) -> str:
+    """Append text to the END of one named section, keeping everything
+    already in it byte-for-byte.
+
+    This is the incremental case the pipeline actually runs on: adding one
+    `[[ref:UUID]]` bullet. `splice_section` requires the caller to supply the
+    section's WHOLE new content, which on a large section forces a
+    read-everything / re-emit-everything cycle — and since the read side is
+    capped (`MAX_OUTPUT_CHARS`), on a section past that cap it cannot be done
+    correctly at all. Resolving the append here, from the body the caller
+    already holds, means the model never has to carry the prior content.
+
+    A section that doesn't exist yet is created with `added_content`, matching
+    `splice_section`'s append-a-new-section behaviour.
+    """
+    _, sections = parse_sections(body)
+    existing = next((s for s in sections if s.name == section_name), None)
+    if existing is None:
+        return splice_section(body, section_name, added_content)
+    merged = existing.content.rstrip("\n") + "\n" + added_content.lstrip("\n")
+    return splice_section(body, section_name, merged)
+
+
 def delete_section(body: str, section_name: str) -> str:
     """Remove the named section (and its marker) from the body.
     Raises KeyError if the section isn't present."""

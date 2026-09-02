@@ -33,10 +33,28 @@ FRESHNESS_MINUTES = int(os.getenv("WIKI_FRESHNESS_MINUTES", "30"))
 # only while a worker is actively running it; if that worker never returns
 # (api restart mid-run, agent timeout) the row would wedge forever. Instead
 # of a reaper/cycle, an `assigned` job whose lease expired is simply
-# claimable again at the EXISTING claim step. 20 min is comfortably above
-# the longest legit run (AGENT_TIMEOUT ~10 min), so a still-running job is
-# never reclaimed. `attempts`+max_attempts already bound repeated failures.
-ASSIGNED_LEASE_MIN = int(os.getenv("WIKI_ASSIGNED_LEASE_MIN", "20"))
+# claimable again at the EXISTING claim step.
+# Raised 20 -> 120. The old value cited "the longest legit run (AGENT_TIMEOUT
+# ~10 min)", but that premise expired three bumps ago: the scheduler's own
+# client patience is now WIKI_AGENT_TIMEOUT=2400s (40 min) and a single LLM
+# call may run to agent_request_timeout=4800s (80 min). At 20 min the lease
+# expired mid-run on essentially every write, so a second writer could claim
+# a job the first was still working. 120 min sits above both ceilings while
+# still recovering a genuinely dead job within about two hours.
+ASSIGNED_LEASE_MIN = int(os.getenv("WIKI_ASSIGNED_LEASE_MIN", "120"))
+
+# Hard ceiling on how many times ONE job may be reclaimed after a lease
+# expiry. `release_or_fail_jobs` caps the GRACEFUL failure path at
+# max_attempts, but an ABANDONED run (client timeout, 500, worker death)
+# never reaches it: `_claimable()` re-admits the row and `claim_jobs`
+# increments `attempts` again, with nothing to stop the cycle. Observed live:
+# a perfect staircase, one job at every attempts value 1..30, and 24 jobs
+# with up to 28 attempts and `last_error` NULL — 832 claim cycles on a single
+# wiki whose work was already complete. Past this ceiling the row simply
+# stops being claimable: it stays `assigned` and visible on `GET /jobs` for
+# an operator, instead of consuming the queue forever. Set above the
+# graceful max_attempts (3) so normal failure handling still runs first.
+ASSIGNED_MAX_RECLAIMS = int(os.getenv("WIKI_ASSIGNED_MAX_RECLAIMS", "5"))
 
 # Per-wiki attach grouping — how long to wait before firing a writer on a
 # wiki that just received new attaches. Once the OLDEST pending attach for
@@ -70,11 +88,16 @@ WIKI_TRIAGE_HUB_DEGREE = int(os.getenv("WIKI_TRIAGE_HUB_DEGREE", "9"))
 
 
 def _claimable(alias: str = "") -> str:
-    """SQL predicate: a job is claimable if pending, OR assigned but its
-    lease expired. Reused verbatim at every claim site (DRY). `alias` is the
-    table alias when the query qualifies columns (e.g. 'j')."""
+    """SQL predicate: a job is claimable if pending, OR assigned with its
+    lease expired AND still under `ASSIGNED_MAX_RECLAIMS`. Reused verbatim at
+    every claim site (DRY). `alias` is the table alias when the query
+    qualifies columns (e.g. 'j').
+
+    A `pending` job is always claimable — the ceiling applies only to the
+    reclaim branch, which is the one nothing else bounds."""
     p = f"{alias}." if alias else ""
     return (f"({p}status = 'pending' OR ({p}status = 'assigned' "
+            f"AND {p}attempts < {ASSIGNED_MAX_RECLAIMS} "
             f"AND {p}assigned_at < now() - make_interval(mins => {ASSIGNED_LEASE_MIN})))")
 
 # Inline reference token: [[ref:UUID]] or [[ref:UUID|display text]]
@@ -123,9 +146,19 @@ def reconcile_summarises_additive(conn, wiki_id: str, body: str) -> dict:
     never deletes or re-types a relation behind the LLM. If the LLM wants a
     relation gone it calls `delete_relation` itself. Mirrors LLM-authored
     content into the graph; it does not judge or shape content.
+
+    A cited id with no row in `entities` (deleted since it was cited, or a
+    UUID mistyped while re-emitting a body) is SKIPPED, not inserted: the
+    FK violation would abort the caller's whole transaction, taking
+    `finish_jobs` with it — so the jobs re-queue forever while the section
+    edits already committed during the agent run remain. Bookkeeping must
+    never be blocked by content. Skipped ids are returned (and land in the
+    `wiki_write` activity log via the caller's `**rel` spread) so this is
+    visible, never silent.
     """
     cited = parse_refs(body)
     added = 0
+    skipped: list[str] = []
     with conn.cursor() as cur:
         cur.execute(
             "SELECT to_entity_id::text FROM relations "
@@ -133,7 +166,16 @@ def reconcile_summarises_additive(conn, wiki_id: str, body: str) -> dict:
             (wiki_id,),
         )
         current = {r[0].lower() for r in cur.fetchall()}
-        for e in cited - current:
+        wanted = sorted(cited - current)
+        if wanted:
+            cur.execute(
+                "SELECT id::text FROM entities WHERE id = ANY(%s::uuid[])",
+                (wanted,),
+            )
+            live = {r[0].lower() for r in cur.fetchall()}
+            skipped = [e for e in wanted if e not in live]
+            wanted = [e for e in wanted if e in live]
+        for e in wanted:
             cur.execute(
                 """INSERT INTO relations
                    (from_entity_id, to_entity_id, relation_type, relevance_score, description)
@@ -142,7 +184,8 @@ def reconcile_summarises_additive(conn, wiki_id: str, body: str) -> dict:
                 (wiki_id, e),
             )
             added += 1
-    return {"relations_added": added, "relations_removed": 0}
+    return {"relations_added": added, "relations_removed": 0,
+            "refs_skipped": skipped}
 
 
 def try_wiki_lock(conn, key: str) -> bool:

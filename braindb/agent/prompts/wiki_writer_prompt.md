@@ -36,9 +36,13 @@ Do NOT read a neighbouring page. The name and size above are all you need to
 decide whether a detail belongs elsewhere; opening one costs context for no
 gain.
 
-If no listed page fits a detail, simply leave that detail out. It stays
-unlinked and comes back on its own later — that is the normal path, not a
-failure.
+If no listed page fits a detail you turned up while researching — something
+that is NOT one of this job's MEMBERS — leave it out. It stays an orphan and
+comes back for its own page later; that is the normal path, not a failure.
+
+**This never applies to a MEMBER of this job.** A dropped member is not
+re-queued — the write records it as covered either way — so dropping one loses
+it silently. Every member must be cited; see "Citation is mechanical" below.
 
 ### Duplicate wikis to consolidate (consolidate mode only — NUMBERED; pick the survivor's number as `canonical_no`)
 %%DUPLICATES%%
@@ -193,18 +197,34 @@ can exhaust the context window. Use the section-edit tools instead —
 they let you read the OUTLINE only (cheap) and rewrite one section at
 a time, persisting each change immediately:
 
+- `check_members_cited(wiki_id, entity_ids)` — **call this FIRST, before
+  any reading.** It answers, exactly and in one call, which of your
+  MEMBERS the page already cites. If none are missing, the page already
+  covers this job: go straight to `final_answer(mode="attach", body="")`.
+  Do not read the page to convince yourself — that is what this is for.
 - `read_wiki_outline(wiki_id)` — section names + char counts + the
-  current `revision` token. ALWAYS call this first.
-- `read_wiki_section(wiki_id, section_name)` — fetch one section's
-  content + revision. Read only the section(s) you need to touch.
-- `edit_wiki_section(wiki_id, section_name, new_content, expect_revision)`
-  — replace a section, or append a new one if `section_name` doesn't
-  exist yet. Pass the latest revision you read; on mismatch you get a
-  "stale revision" error and must re-read before retrying.
+  current `revision` token. Call this before any edit.
+- `edit_wiki_section(..., mode="append")` — **the normal way to add.**
+  Adds your text to the end of a section and keeps everything already
+  there, byte for byte. You do NOT need to read the section first, and
+  nothing in it can be lost. Use this for a new `[[ref:UUID]]` bullet or
+  a new claim in a section you are not restructuring.
+- `read_wiki_section(wiki_id, section_name, offset, limit)` — fetch one
+  section + revision. Needed only when you are genuinely REWRITING a
+  section. A section larger than one slice is paged, not cut: follow
+  `content_meta.next_offset` until it is null, so you hold the whole
+  section before replacing it.
+- `edit_wiki_section(..., mode="replace")` — replace a section wholesale
+  (the default). Only after reading it in full. Pass the latest revision
+  you read; on mismatch you get a "stale revision" error and must re-read.
 - `delete_wiki_section(wiki_id, section_name, expect_revision)` — remove
   a section.
 - `validate_wiki(wiki_id)` — check refs resolve and grammar invariants
   hold. Run after a batch of edits to catch any broken `[[ref:UUID]]`.
+
+**Do not rebuild a section you could append to.** Re-deriving a section's
+existing bullets from the body's `[[ref:]]` tokens costs one LLM turn per
+citation and risks corrupting a UUID by retyping it. Append instead.
 
 Section-edit grammar invariants when you author `new_content`:
 - Inline citations stay `[[ref:UUID]]` or `[[ref:UUID|display]]`
@@ -219,7 +239,10 @@ Section-edit grammar invariants when you author `new_content`:
 - The "Preserve prior work" rule above applies PER SECTION: a
   replaced section's `new_content` must include every still-valid
   prior claim + `[[ref:UUID]]` from that section, plus the new
-  material — a superset, not a lossy summary.
+  material — a superset, not a lossy summary. This is why you must page
+  a large section to the end before replacing it; and it is why
+  `mode="append"` is preferred, since it satisfies the rule by
+  construction.
 
 When finished, call `final_answer` with `body=""` (empty string) and
 `mode="attach"`. The router detects that the wiki's revision advanced

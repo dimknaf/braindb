@@ -39,6 +39,7 @@ from braindb.agent.schemas import (
     WikiWriteResult,
 )
 from braindb.agent.tools import (
+    check_members_cited,
     create_relation,
     delegate_to_subagent,
     delete_entity,
@@ -239,12 +240,28 @@ def _cached(
 _WRITER_EXTRA_TOOLS = (
     read_wiki_outline,
     read_wiki_section,
+    check_members_cited,
     edit_wiki_section,
     delete_wiki_section,
     validate_wiki,
     handoff_to_successor,
 )
 _WRITER_EXTRA_STOP_TOOLS = ("handoff_to_successor",)
+
+# Subagent extras: the wiki READ tools, and nothing that writes. A writer
+# routinely delegates "check/read this page" work, and without these the
+# subagent could not do it the safe way — it fell back to paging the raw body
+# and re-emitting it through `update_entity`, which is both enormously
+# expensive and how a cited UUID gets corrupted. Giving it the read tools
+# removes the reason to do that. Edit/delete stay writer-only on purpose:
+# one writer per wiki keeps the revision CAS meaningful, and a subagent
+# cannot hand off, so it has no business holding a revision token.
+_SUBAGENT_EXTRA_TOOLS = (
+    read_wiki_outline,
+    read_wiki_section,
+    check_members_cited,
+    validate_wiki,
+)
 
 
 def get_agent() -> Agent:
@@ -265,7 +282,8 @@ def get_writer_agent() -> Agent:
 
 
 def get_subagent() -> Agent:
-    return _cached("subagent", "BrainDB Subagent", submit_subagent)
+    return _cached("subagent", "BrainDB Subagent", submit_subagent,
+                   extra_tools=_SUBAGENT_EXTRA_TOOLS)
 
 
 def create_braindb_agent() -> Agent:
