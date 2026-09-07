@@ -252,8 +252,35 @@ def test_reasoning_effort_default_is_a_no_op():
     try:
         for factory in (agent_mod.get_agent, agent_mod.get_maintainer_agent,
                         agent_mod.get_writer_agent, agent_mod.get_subagent):
-            assert "reasoning_effort" not in factory().model_settings.extra_args
+            ms = factory().model_settings
+            assert ms.extra_body is None
+            assert "reasoning_effort" not in ms.extra_args
     finally:
+        agent_mod._cache.clear()
+
+
+def test_reasoning_effort_never_travels_as_a_plain_param():
+    """THE regression guard for a live outage. The SDK lifts a top-level
+    `reasoning_effort` out of extra_args/extra_body and promotes it to a
+    kwarg on litellm.acompletion(), where the `openai` provider allow-list
+    rejects it — 59 triage jobs died this way. It must ride nested inside
+    `chat_template_kwargs`, which nothing intercepts or filters."""
+    from braindb.config import settings
+    monkey = settings.agent_wiki_reasoning_effort
+    try:
+        object.__setattr__(settings, "agent_wiki_reasoning_effort", "low")
+    except Exception:
+        settings.agent_wiki_reasoning_effort = "low"
+    agent_mod._cache.clear()
+    try:
+        ms = agent_mod.get_writer_agent().model_settings
+        assert ms.extra_body == {"chat_template_kwargs":
+                                 {"reasoning_effort": "low"}}
+        # the key the SDK intercepts must appear at NEITHER top level
+        assert "reasoning_effort" not in ms.extra_body
+        assert "reasoning_effort" not in ms.extra_args
+    finally:
+        settings.agent_wiki_reasoning_effort = monkey
         agent_mod._cache.clear()
 
 
@@ -268,10 +295,11 @@ def test_reasoning_effort_reaches_wiki_agents_but_not_the_general_agent(monkeypa
     try:
         for factory in (agent_mod.get_maintainer_agent,
                         agent_mod.get_writer_agent, agent_mod.get_subagent):
-            args = factory().model_settings.extra_args
-            assert args.get("reasoning_effort") == "low", factory.__name__
+            ms = factory().model_settings
+            assert ms.extra_body == {"chat_template_kwargs":
+                                     {"reasoning_effort": "low"}}, factory.__name__
             # the transport deadline must survive alongside it
-            assert args.get("timeout") == settings.agent_request_timeout
-        assert "reasoning_effort" not in agent_mod.get_agent().model_settings.extra_args
+            assert ms.extra_args.get("timeout") == settings.agent_request_timeout
+        assert agent_mod.get_agent().model_settings.extra_body is None
     finally:
         agent_mod._cache.clear()

@@ -220,8 +220,10 @@ class Settings(BaseSettings):
 
     # Reasoning effort for the WIKI agents (maintainer / writer / subagent).
     # Blank = send nothing, i.e. the server-side default — no behaviour
-    # change. Sent as `reasoning_effort` in the request body; on an
-    # OpenAI-compatible server that does not understand it, it is ignored.
+    # change. Delivered as `chat_template_kwargs.reasoning_effort` in the
+    # request body (see `agent._build` for why it cannot be sent as a plain
+    # `reasoning_effort` param). SELF-HOSTED vLLM ONLY: a hosted provider may
+    # reject the unknown body key, so leave it blank on those profiles.
     #
     # Why this exists: the Qwen3 chat template resolves
     # `reasoning_effort|default('xhigh')`, so sending nothing runs every

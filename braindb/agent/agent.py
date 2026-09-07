@@ -201,17 +201,32 @@ def _build(
     # body and cannot steer the model, unlike `output_type` / `tool_choice`
     # (see the module docstring — those stay unset deliberately). Without it
     # a long wiki write is abandoned client-side at 600s while the server is
-    # still working. `reasoning_effort`, by contrast, DOES belong in the
-    # body: LiteLLM folds unknown kwargs into `extra_body`, so it reaches an
-    # OpenAI-compatible server and is ignored by one that doesn't know it.
+    # still working.
+    #
+    # `reasoning_effort` belongs in the request BODY, but it cannot travel as
+    # a plain kwarg: the SDK's LitellmModel lifts that exact key out of
+    # `reasoning` / `extra_body` / `extra_args` and promotes it to a top-level
+    # `reasoning_effort=` argument on `litellm.acompletion()`, where LiteLLM
+    # checks it against a PER-PROVIDER allow-list — `openai` (which every
+    # OpenAI-compatible profile resolves to) does not list it, so the call
+    # raises `UnsupportedParamsError` before any request is sent. Nesting it
+    # under `chat_template_kwargs` sidesteps that: the SDK only intercepts the
+    # literal top-level key, so the dict is copied through into LiteLLM's
+    # `extra_body` and forwarded into the JSON body unfiltered, which is where
+    # vLLM reads chat-template variables from. VLLM-SPECIFIC by nature — a
+    # hosted provider may reject the unknown body key, so this stays blank
+    # unless an operator opts in on a self-hosted profile.
     extra_args = {"timeout": settings.agent_request_timeout}
-    if reasoning_effort:
-        extra_args["reasoning_effort"] = reasoning_effort
+    extra_body = (
+        {"chat_template_kwargs": {"reasoning_effort": reasoning_effort}}
+        if reasoning_effort else None
+    )
     agent = Agent(
         name=name,
         instructions=SYSTEM_PROMPT,
         model=_model(),
-        model_settings=ModelSettings(extra_args=extra_args),
+        model_settings=ModelSettings(extra_args=extra_args,
+                                     extra_body=extra_body),
         tools=[*_BASE_TOOLS, *extra_tools, submit_tool],
         tool_use_behavior=StopAtTools(
             stop_at_tool_names=["final_answer", *extra_stop_tools],
