@@ -218,6 +218,29 @@ class Settings(BaseSettings):
     agent_writer_handoff_token_budget: int = 30000
     agent_writer_handoff_max_depth: int = 3
 
+    # Reasoning effort for the WIKI agents (maintainer / writer / subagent).
+    # Blank = send nothing, i.e. the server-side default — no behaviour
+    # change. Sent as `reasoning_effort` in the request body; on an
+    # OpenAI-compatible server that does not understand it, it is ignored.
+    #
+    # Why this exists: the Qwen3 chat template resolves
+    # `reasoning_effort|default('xhigh')`, so sending nothing runs every
+    # request at the MAXIMUM setting and injects a "think carefully,
+    # validate assumptions, consider alternatives" instruction into each
+    # system block. Measured on the bench box: ~2750 output tokens/turn
+    # and ~99% of wall clock is generation, so trimming reasoning trims
+    # latency almost linearly. It costs no cross-turn consistency either:
+    # the SDK only replays reasoning for DeepSeek/Claude models, so on
+    # Qwen every reasoning token is generated, paid for and then dropped
+    # before the next turn.
+    #
+    # Valid values for that template: "low", "medium", "none". NOT
+    # "minimal"/"high" — vLLM's Literal accepts them but the template's
+    # own validator raises. Wiki-scoped on purpose: the general agent
+    # (`get_agent`) is shared with the ingest watcher, whose extraction
+    # runs are the most reasoning-dependent work in the stack.
+    agent_wiki_reasoning_effort: str = ""
+
     @property
     def resolved_agent_model(self) -> str:
         return self.agent_model or _LLM_PROFILES[self.llm_profile]["model"]

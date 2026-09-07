@@ -177,6 +177,7 @@ def _build(
     submit_tool,
     extra_tools: tuple = (),
     extra_stop_tools: tuple[str, ...] = (),
+    reasoning_effort: str = "",
 ) -> Agent:
     """Build an agent. NOTE: no `output_type` — see module docstring. The
     structured contract lives on `submit_tool`'s argument schema, not on
@@ -189,22 +190,28 @@ def _build(
     `extra_stop_tools` adds extra stop-tool names beyond `final_answer`.
     The writer adds `handoff_to_successor` here so the run halts cleanly
     when handoff is called instead of continuing wastefully.
+
+    `reasoning_effort` (blank = send nothing) is passed only by the wiki
+    agents; see `settings.agent_wiki_reasoning_effort`.
     """
     set_tracing_disabled(disabled=True)
+    # `extra_args` is forwarded verbatim into the LiteLLM call. `timeout`
+    # lands as `kwargs["timeout"]` — which LiteLLM resolves ahead of its
+    # 600s fallback; a TRANSPORT deadline only, it never enters the request
+    # body and cannot steer the model, unlike `output_type` / `tool_choice`
+    # (see the module docstring — those stay unset deliberately). Without it
+    # a long wiki write is abandoned client-side at 600s while the server is
+    # still working. `reasoning_effort`, by contrast, DOES belong in the
+    # body: LiteLLM folds unknown kwargs into `extra_body`, so it reaches an
+    # OpenAI-compatible server and is ignored by one that doesn't know it.
+    extra_args = {"timeout": settings.agent_request_timeout}
+    if reasoning_effort:
+        extra_args["reasoning_effort"] = reasoning_effort
     agent = Agent(
         name=name,
         instructions=SYSTEM_PROMPT,
         model=_model(),
-        # `extra_args` is forwarded verbatim into the LiteLLM call, so
-        # `timeout` lands as `kwargs["timeout"]` — which LiteLLM resolves
-        # ahead of its 600s fallback. This is a TRANSPORT deadline only: it
-        # never enters the request body and cannot steer the model, unlike
-        # `output_type` / `tool_choice` (see the module docstring — those
-        # stay unset deliberately). Without it a long wiki write is
-        # abandoned client-side at 600s while the server is still working.
-        model_settings=ModelSettings(
-            extra_args={"timeout": settings.agent_request_timeout},
-        ),
+        model_settings=ModelSettings(extra_args=extra_args),
         tools=[*_BASE_TOOLS, *extra_tools, submit_tool],
         tool_use_behavior=StopAtTools(
             stop_at_tool_names=["final_answer", *extra_stop_tools],
@@ -226,6 +233,7 @@ def _cached(
     submit_tool,
     extra_tools: tuple = (),
     extra_stop_tools: tuple[str, ...] = (),
+    reasoning_effort: str = "",
 ) -> Agent:
     a = _cache.get(key)
     if a is None:
@@ -233,6 +241,7 @@ def _cached(
             name, submit_tool,
             extra_tools=extra_tools,
             extra_stop_tools=extra_stop_tools,
+            reasoning_effort=reasoning_effort,
         )
         _cache[key] = a
     return a
@@ -277,7 +286,8 @@ def get_agent() -> Agent:
 
 
 def get_maintainer_agent() -> Agent:
-    return _cached("maintainer", "BrainDB Wiki Maintainer", submit_maintainer)
+    return _cached("maintainer", "BrainDB Wiki Maintainer", submit_maintainer,
+                   reasoning_effort=settings.agent_wiki_reasoning_effort)
 
 
 def get_writer_agent() -> Agent:
@@ -285,12 +295,17 @@ def get_writer_agent() -> Agent:
         "writer", "BrainDB Wiki Writer", submit_wiki,
         extra_tools=_WRITER_EXTRA_TOOLS,
         extra_stop_tools=_WRITER_EXTRA_STOP_TOOLS,
+        reasoning_effort=settings.agent_wiki_reasoning_effort,
     )
 
 
 def get_subagent() -> Agent:
+    # Shared surface: any agent can delegate, so a subagent spawned from
+    # /agent/query also inherits the wiki effort setting. Accepted because
+    # subagent runs are overwhelmingly wiki work.
     return _cached("subagent", "BrainDB Subagent", submit_subagent,
-                   extra_tools=_SUBAGENT_EXTRA_TOOLS)
+                   extra_tools=_SUBAGENT_EXTRA_TOOLS,
+                   reasoning_effort=settings.agent_wiki_reasoning_effort)
 
 
 def create_braindb_agent() -> Agent:

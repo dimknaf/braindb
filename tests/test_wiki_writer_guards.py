@@ -237,3 +237,41 @@ def test_verbose_tool_lines_carry_the_current_run_tag(monkeypatch, caplog):
         assert any("[tag4242]" in r.getMessage() for r in caplog.records)
     finally:
         reset_run_tag(token)
+
+
+# ====================================================================== #
+# Reasoning effort — wiki-scoped, never the general agent                 #
+# ====================================================================== #
+
+def test_reasoning_effort_default_is_a_no_op():
+    """Blank default must send nothing, so behaviour is unchanged until an
+    operator opts in."""
+    from braindb.config import settings
+    assert settings.agent_wiki_reasoning_effort == ""
+    agent_mod._cache.clear()
+    try:
+        for factory in (agent_mod.get_agent, agent_mod.get_maintainer_agent,
+                        agent_mod.get_writer_agent, agent_mod.get_subagent):
+            assert "reasoning_effort" not in factory().model_settings.extra_args
+    finally:
+        agent_mod._cache.clear()
+
+
+def test_reasoning_effort_reaches_wiki_agents_but_not_the_general_agent(monkeypatch):
+    """THE scoping guarantee. `get_agent()` is shared by /agent/query AND the
+    ingest watcher, whose extraction runs are the most reasoning-dependent
+    work in the stack — it must never inherit the wiki setting. This test
+    fails if anyone later threads it there."""
+    from braindb.config import settings
+    monkeypatch.setattr(settings, "agent_wiki_reasoning_effort", "low")
+    agent_mod._cache.clear()
+    try:
+        for factory in (agent_mod.get_maintainer_agent,
+                        agent_mod.get_writer_agent, agent_mod.get_subagent):
+            args = factory().model_settings.extra_args
+            assert args.get("reasoning_effort") == "low", factory.__name__
+            # the transport deadline must survive alongside it
+            assert args.get("timeout") == settings.agent_request_timeout
+        assert "reasoning_effort" not in agent_mod.get_agent().model_settings.extra_args
+    finally:
+        agent_mod._cache.clear()
