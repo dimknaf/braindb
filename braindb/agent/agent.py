@@ -22,6 +22,7 @@ asyncio's per-Task context isolation makes nested/parallel runs safe.
 """
 import json
 import logging
+from uuid import uuid4
 from pathlib import Path
 from typing import TypeVar
 
@@ -31,7 +32,13 @@ from litellm import BadRequestError, ContextWindowExceededError
 from pydantic import BaseModel
 
 from braindb.agent.hooks import CountdownHooks
-from braindb.agent.run_state import install_slot, release_slot
+from braindb.agent.run_state import (
+    get_run_tag,
+    install_slot,
+    release_slot,
+    reset_run_tag,
+    set_run_tag,
+)
 from braindb.agent.schemas import (
     AgentAnswer,
     MaintainerDecision,
@@ -39,6 +46,7 @@ from braindb.agent.schemas import (
     WikiWriteResult,
 )
 from braindb.agent.tools import (
+    check_members_cited,
     create_relation,
     delegate_to_subagent,
     delete_entity,
@@ -169,6 +177,7 @@ def _build(
     submit_tool,
     extra_tools: tuple = (),
     extra_stop_tools: tuple[str, ...] = (),
+    reasoning_effort: str = "",
 ) -> Agent:
     """Build an agent. NOTE: no `output_type` — see module docstring. The
     structured contract lives on `submit_tool`'s argument schema, not on
@@ -181,13 +190,43 @@ def _build(
     `extra_stop_tools` adds extra stop-tool names beyond `final_answer`.
     The writer adds `handoff_to_successor` here so the run halts cleanly
     when handoff is called instead of continuing wastefully.
+
+    `reasoning_effort` (blank = send nothing) is passed only by the wiki
+    agents; see `settings.agent_wiki_reasoning_effort`.
     """
     set_tracing_disabled(disabled=True)
+    # `extra_args` is forwarded verbatim into the LiteLLM call. `timeout`
+    # lands as `kwargs["timeout"]` — which LiteLLM resolves ahead of its
+    # 600s fallback; a TRANSPORT deadline only, it never enters the request
+    # body and cannot steer the model, unlike `output_type` / `tool_choice`
+    # (see the module docstring — those stay unset deliberately). Without it
+    # a long wiki write is abandoned client-side at 600s while the server is
+    # still working.
+    #
+    # `reasoning_effort` belongs in the request BODY, but it cannot travel as
+    # a plain kwarg: the SDK's LitellmModel lifts that exact key out of
+    # `reasoning` / `extra_body` / `extra_args` and promotes it to a top-level
+    # `reasoning_effort=` argument on `litellm.acompletion()`, where LiteLLM
+    # checks it against a PER-PROVIDER allow-list — `openai` (which every
+    # OpenAI-compatible profile resolves to) does not list it, so the call
+    # raises `UnsupportedParamsError` before any request is sent. Nesting it
+    # under `chat_template_kwargs` sidesteps that: the SDK only intercepts the
+    # literal top-level key, so the dict is copied through into LiteLLM's
+    # `extra_body` and forwarded into the JSON body unfiltered, which is where
+    # vLLM reads chat-template variables from. VLLM-SPECIFIC by nature — a
+    # hosted provider may reject the unknown body key, so this stays blank
+    # unless an operator opts in on a self-hosted profile.
+    extra_args = {"timeout": settings.agent_request_timeout}
+    extra_body = (
+        {"chat_template_kwargs": {"reasoning_effort": reasoning_effort}}
+        if reasoning_effort else None
+    )
     agent = Agent(
         name=name,
         instructions=SYSTEM_PROMPT,
         model=_model(),
-        model_settings=ModelSettings(),
+        model_settings=ModelSettings(extra_args=extra_args,
+                                     extra_body=extra_body),
         tools=[*_BASE_TOOLS, *extra_tools, submit_tool],
         tool_use_behavior=StopAtTools(
             stop_at_tool_names=["final_answer", *extra_stop_tools],
@@ -209,6 +248,7 @@ def _cached(
     submit_tool,
     extra_tools: tuple = (),
     extra_stop_tools: tuple[str, ...] = (),
+    reasoning_effort: str = "",
 ) -> Agent:
     a = _cache.get(key)
     if a is None:
@@ -216,6 +256,7 @@ def _cached(
             name, submit_tool,
             extra_tools=extra_tools,
             extra_stop_tools=extra_stop_tools,
+            reasoning_effort=reasoning_effort,
         )
         _cache[key] = a
     return a
@@ -230,12 +271,28 @@ def _cached(
 _WRITER_EXTRA_TOOLS = (
     read_wiki_outline,
     read_wiki_section,
+    check_members_cited,
     edit_wiki_section,
     delete_wiki_section,
     validate_wiki,
     handoff_to_successor,
 )
 _WRITER_EXTRA_STOP_TOOLS = ("handoff_to_successor",)
+
+# Subagent extras: the wiki READ tools, and nothing that writes. A writer
+# routinely delegates "check/read this page" work, and without these the
+# subagent could not do it the safe way — it fell back to paging the raw body
+# and re-emitting it through `update_entity`, which is both enormously
+# expensive and how a cited UUID gets corrupted. Giving it the read tools
+# removes the reason to do that. Edit/delete stay writer-only on purpose:
+# one writer per wiki keeps the revision CAS meaningful, and a subagent
+# cannot hand off, so it has no business holding a revision token.
+_SUBAGENT_EXTRA_TOOLS = (
+    read_wiki_outline,
+    read_wiki_section,
+    check_members_cited,
+    validate_wiki,
+)
 
 
 def get_agent() -> Agent:
@@ -244,7 +301,8 @@ def get_agent() -> Agent:
 
 
 def get_maintainer_agent() -> Agent:
-    return _cached("maintainer", "BrainDB Wiki Maintainer", submit_maintainer)
+    return _cached("maintainer", "BrainDB Wiki Maintainer", submit_maintainer,
+                   reasoning_effort=settings.agent_wiki_reasoning_effort)
 
 
 def get_writer_agent() -> Agent:
@@ -252,11 +310,17 @@ def get_writer_agent() -> Agent:
         "writer", "BrainDB Wiki Writer", submit_wiki,
         extra_tools=_WRITER_EXTRA_TOOLS,
         extra_stop_tools=_WRITER_EXTRA_STOP_TOOLS,
+        reasoning_effort=settings.agent_wiki_reasoning_effort,
     )
 
 
 def get_subagent() -> Agent:
-    return _cached("subagent", "BrainDB Subagent", submit_subagent)
+    # Shared surface: any agent can delegate, so a subagent spawned from
+    # /agent/query also inherits the wiki effort setting. Accepted because
+    # subagent runs are overwhelmingly wiki work.
+    return _cached("subagent", "BrainDB Subagent", submit_subagent,
+                   extra_tools=_SUBAGENT_EXTRA_TOOLS,
+                   reasoning_effort=settings.agent_wiki_reasoning_effort)
 
 
 def create_braindb_agent() -> Agent:
@@ -292,6 +356,10 @@ async def run_typed(
     """
     turns = max_turns or settings.agent_max_turns
     slot, token = install_slot()
+    # Short log tag for THIS run, inherited by the SDK's child Tasks so
+    # every TOOL line it emits is attributable (see run_state.set_run_tag).
+    # Set before Runner.run — ContextVars are captured at Task creation.
+    tag_token = set_run_tag(uuid4().hex[:6])
     # Layer-3 nudge: when the run is about to exhaust `max_turns`, the hook
     # appends a synthetic "you have N turns left, finalise via final_answer"
     # user message to the conversation. One nudge per run; disabled when
@@ -308,7 +376,8 @@ async def run_typed(
         handoff_tool_name="handoff_to_successor",
     )
     try:
-        logger.info("Running typed query (%s): %s", agent.name, query[:160])
+        logger.info("Running typed query [%s] (%s): %s",
+                    get_run_tag(), agent.name, query[:160])
         result = await Runner.run(
             starting_agent=agent, input=query, max_turns=turns, hooks=hooks,
         )
@@ -424,6 +493,7 @@ async def run_typed(
             _bad_request_retried=True,
         )
     finally:
+        reset_run_tag(tag_token)
         release_slot(token)
 
 

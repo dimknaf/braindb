@@ -24,6 +24,26 @@ claim carries an inline reference `[[ref:ENTITY_UUID]]` (optionally
 ### Current wiki body (attach mode; empty otherwise)
 %%CURRENT_BODY%%
 
+### Neighbouring pages (subjects one hop from these members)
+%%RELATED_WIKIS%%
+
+These already exist and cover their own subjects. When a detail belongs to one
+of them, **name that page in prose** rather than restating its content here.
+Refer to them by NAME only — do NOT
+`[[ref:]]` them; refs are for the source entities this page cites.
+
+Do NOT read a neighbouring page. The name and size above are all you need to
+decide whether a detail belongs elsewhere; opening one costs context for no
+gain.
+
+If no listed page fits a detail you turned up while researching — something
+that is NOT one of this job's MEMBERS — leave it out. It stays an orphan and
+comes back for its own page later; that is the normal path, not a failure.
+
+**This never applies to a MEMBER of this job.** A dropped member is not
+re-queued — the write records it as covered either way — so dropping one loses
+it silently. Every member must be cited; see "Citation is mechanical" below.
+
 ### Duplicate wikis to consolidate (consolidate mode only — NUMBERED; pick the survivor's number as `canonical_no`)
 %%DUPLICATES%%
 
@@ -147,7 +167,7 @@ may leave the run un-cited**.
 ## Recommended structure (consistency, not a hard gate)
 
 ```
-<!-- wiki:meta canonical_name=NAME language=en revision=N keywords=term1;term2 -->
+<!-- wiki:meta canonical_name=NAME language=en keywords=term1;term2 -->
 # NAME
 > **Summary:** one tight line (aim <= 280 chars)
 > **Disambiguation:** what this is / is NOT; distinguish it from similarly
@@ -158,7 +178,9 @@ may leave the run un-cited**.
 <!-- section:sources -->       narrative provenance
 <!-- section:references -->    one bullet per distinct [[ref:UUID]] you cited,
                                with a short note — YOU author this to match
-                               your inline citations
+                               your inline citations, and you may compact or
+                               merge its bullets over time (it is a ledger,
+                               not claims; see the references exception below)
 ```
 
 `keywords=` in the meta line is optional — list the concept terms that best
@@ -177,18 +199,45 @@ can exhaust the context window. Use the section-edit tools instead —
 they let you read the OUTLINE only (cheap) and rewrite one section at
 a time, persisting each change immediately:
 
+- `check_members_cited(wiki_id, entity_ids)` — **call this FIRST.** It
+  answers, exactly and in one call, which of your MEMBERS the page
+  already cites. If none are missing, the page already covers this job:
+  verify nothing else needs correcting, then finish with
+  `final_answer(mode="attach", body="")`. It answers COVERAGE only — not
+  placement or phrasing. You still read any section you intend to change.
 - `read_wiki_outline(wiki_id)` — section names + char counts + the
-  current `revision` token. ALWAYS call this first.
-- `read_wiki_section(wiki_id, section_name)` — fetch one section's
-  content + revision. Read only the section(s) you need to touch.
-- `edit_wiki_section(wiki_id, section_name, new_content, expect_revision)`
-  — replace a section, or append a new one if `section_name` doesn't
-  exist yet. Pass the latest revision you read; on mismatch you get a
-  "stale revision" error and must re-read before retrying.
+  current `revision` token. Call this before any edit.
+- `read_wiki_section(wiki_id, section_name, offset, limit)` — fetch one
+  section + revision. **Read the section you are about to change** —
+  where new material belongs, and how, is your judgement, and you cannot
+  judge what you have not read. A section larger than one slice is
+  paged, not cut: follow `content_meta.next_offset` until it is null
+  when you need all of it.
+- `edit_wiki_section(...)` — `mode="replace"` (the default) rewrites the
+  section: read it in full first, because anything you do not re-emit is
+  gone. `mode="append"` adds your text at the end and preserves
+  everything already there. **Choose by CONTENT, not by cost:**
+  - The member **corroborates or refines a claim the section already
+    makes** → integrate it: revise that sentence and stack the citation
+    (`[[ref:existing]][[ref:new]]`). Never restate as new what the page
+    already says — a duplicate sentence is worse than a stacked ref.
+  - The member is **genuinely new information** → append it, or place it
+    where it reads naturally via replace if the end is the wrong spot.
+  - The **section's story has changed** (a contradiction resolved, an
+    event superseded — e.g. an application that became an accepted
+    offer) → rewrite the section so it tells one story. That freedom is
+    yours; a snapshot taken when your run claimed this job makes the page
+    reversible to this run's starting revision.
 - `delete_wiki_section(wiki_id, section_name, expect_revision)` — remove
   a section.
 - `validate_wiki(wiki_id)` — check refs resolve and grammar invariants
   hold. Run after a batch of edits to catch any broken `[[ref:UUID]]`.
+
+**After your edit, the section must read as one coherent narrative.** It
+must never, for example, say the user is applying for a job that a later
+line says they already accepted. When you do rewrite, copy `[[ref:UUID]]`
+tokens exactly — retyping a UUID by hand is how a digit flips and a
+citation dies.
 
 Section-edit grammar invariants when you author `new_content`:
 - Inline citations stay `[[ref:UUID]]` or `[[ref:UUID|display]]`
@@ -196,14 +245,26 @@ Section-edit grammar invariants when you author `new_content`:
 - DO NOT include the `<!-- section:NAME -->` marker yourself — the
   tool emits it. Your `new_content` is the section's text only.
 - The HEADER (meta line, `# Title`, `> **Summary:**` /
-  `> **Disambiguation:**`) lives ABOVE the first section marker.
-  Section edits never touch the header — if the summary needs to
-  change, either re-edit the `overview` section to reflect the new
-  scope, or fall back to a full-body rewrite.
+  `> **Disambiguation:**`) lives ABOVE the first section marker and is
+  editable as the reserved section `"header"` — replace-only: read it
+  (`read_wiki_section(wiki_id, "header")`), then re-emit the whole
+  block via `edit_wiki_section(wiki_id, "header", ..., mode="replace")`.
+  Keep the `<!-- wiki:meta ... -->` line (it is where keywords come
+  from), and drop any stale `revision=` token — the database owns the
+  revision. **Update the header whenever the page's story changes**: a
+  Summary asserting what the body now records differently is a
+  coherence defect, and the header is what readers see first.
 - The "Preserve prior work" rule above applies PER SECTION: a
   replaced section's `new_content` must include every still-valid
   prior claim + `[[ref:UUID]]` from that section, plus the new
-  material — a superset, not a lossy summary.
+  material — a superset, not a lossy summary. This is why you must page
+  a large section to the end before replacing it (append satisfies the
+  rule by construction, but choose the edit by content, not by cost).
+  **One scoped exception — the `references` section**: it is a
+  bookkeeping ledger, not claims. You may compact it — merge bullets,
+  drop redundant ones — provided every previously-cited UUID keeps at
+  least one inline `[[ref:UUID]]` citation somewhere on the page.
+  Relations are additive, so compaction has no destructive side-effect.
 
 When finished, call `final_answer` with `body=""` (empty string) and
 `mode="attach"`. The router detects that the wiki's revision advanced

@@ -62,6 +62,18 @@ data_bench/
 # Test stack (docker-compose.test.yml): separate host data dir for test ingests
 data_test/
 
+# Integration runtime state — per-caller conversation transcripts and other
+# local state written by integrations at run time. Never belongs in the repo.
+integrations/*/.state/
+
+# Local operational artefacts. DB dumps, logs and editor backups have no place
+# in a public repo and are easy to stage by accident with `git add .`.
+*.log
+*.bak
+*.sql
+!scripts/*.sql
+backups/
+
 # Hermes sandbox (integrations/hermes/sandbox): throwaway agent profile dir —
 # holds a .env with the LLM key + provider state; never commit it.
 integrations/hermes/sandbox/hermes-data/

@@ -29,6 +29,13 @@ services:
       DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY:-}
       VLLM_API_KEY: ${VLLM_API_KEY:-}
       AGENT_VERBOSE: ${AGENT_VERBOSE:-false}
+      # Per-LLM-call HTTP deadline. Default 4800s (80 min) — a ceiling, not a
+      # delay; without it LiteLLM falls back to 600s and abandons long
+      # self-hosted writes the server is still completing.
+      AGENT_REQUEST_TIMEOUT: ${AGENT_REQUEST_TIMEOUT:-4800}
+      # Reasoning effort for the WIKI agents only. Blank = server default.
+      # Self-hosted vLLM only; leave blank on hosted providers.
+      AGENT_WIKI_REASONING_EFFORT: ${AGENT_WIKI_REASONING_EFFORT:-}
       # Orphan freshness gate (the orphan SQL runs in this api process, not in
       # the scheduler): an entity is wiki-eligible only once created_at is
       # older than this many minutes, so still-ingesting subjects settle first.

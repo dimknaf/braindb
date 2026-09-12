@@ -34,10 +34,14 @@ _LLM_PROFILES: dict[str, dict[str, str]] = {
         "api_key_env": "VLLM_API_KEY",
         "base_url": "http://host.docker.internal:8002/v1",
     },
+    # Qwen 3.8 27B (NVFP4) on the workstation vLLM. This is the profile the wiki
+    # pipeline is actually tuned against — the turn budget, request timeout and
+    # handoff budget below all cite it. Select it and no AGENT_MODEL override is
+    # needed.
     "vllm_workstation_qwen": {
-        "model": "openai/cyankiwi/Qwen3.6-27B-AWQ-INT4",
+        "model": "openai/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4",
         "api_key_env": "VLLM_API_KEY",
-        "base_url": "http://host.docker.internal:8010/v1",
+        "base_url": "http://host.docker.internal:8012/v1",
     },
     "vllm_workstation_gemma": {
         "model": "openai/cyankiwi/gemma-4-31B-it-AWQ-4bit",
@@ -148,6 +152,20 @@ class Settings(BaseSettings):
     agent_max_turns: int = 20
     agent_subagent_max_turns: int = 30
     agent_verbose: bool = False
+    # Per-LLM-call HTTP deadline (seconds), passed through to LiteLLM as
+    # `timeout=`. Without it LiteLLM applies its own 600s fallback: its
+    # `request_timeout` default is the sentinel 6000, and chat `completion()`
+    # maps that sentinel down to `COMPLETION_HTTP_FALLBACK_SECONDS` (600)
+    # whenever the caller sets no explicit timeout. 600s is ample for a
+    # short recall, but a wiki writer regenerating a 50k-char body on a
+    # local 27B can exceed it — the client then abandons a request vLLM is
+    # still completing, so the work is computed and discarded. Set to 4800
+    # (80 min) to cover a full 30-turn writer run at self-hosted latencies.
+    # Hosted providers finish far inside this and are unaffected: the value
+    # is a ceiling, not a delay. NOTE: setting the `REQUEST_TIMEOUT` env var
+    # to exactly 6000 is a no-op (it IS the sentinel); this setting avoids
+    # that trap by passing the value per-call instead.
+    agent_request_timeout: int = 4800
 
     # Runtime "start wrapping up, you have N turns left" nudge (Layer 3 of
     # Stage C). When ≤ this many LLM-call turns remain before `max_turns`
@@ -194,10 +212,40 @@ class Settings(BaseSettings):
     # initial prompt construction long before the handoff can help.
     # Default was 9000 during the Phase-3 dry run; observation showed
     # that fired the handoff on routine consolidates that fit inline
-    # on Qwen, fragmenting work across successors unnecessarily. Set
-    # to 0 to disable the handoff nudge entirely.
-    agent_writer_handoff_token_budget: int = 20000
+    # on Qwen, fragmenting work across successors unnecessarily.
+    # Raised 20000 -> 30000 after a long soak: on pages approaching
+    # 50k chars the writer needs the successor path, and a budget set
+    # too high simply never fires, leaving it to accumulate context
+    # until it hits its turn limit. Keep this well inside the smallest
+    # context window you deploy on — above it, handoff is silently
+    # dead. Set to 0 to disable the handoff nudge entirely.
+    agent_writer_handoff_token_budget: int = 30000
     agent_writer_handoff_max_depth: int = 3
+
+    # Reasoning effort for the WIKI agents (maintainer / writer / subagent).
+    # Blank = send nothing, i.e. the server-side default — no behaviour
+    # change. Delivered as `chat_template_kwargs.reasoning_effort` in the
+    # request body (see `agent._build` for why it cannot be sent as a plain
+    # `reasoning_effort` param). SELF-HOSTED vLLM ONLY: a hosted provider may
+    # reject the unknown body key, so leave it blank on those profiles.
+    #
+    # Why this exists: the Qwen3 chat template resolves
+    # `reasoning_effort|default('xhigh')`, so sending nothing runs every
+    # request at the MAXIMUM setting and injects a "think carefully,
+    # validate assumptions, consider alternatives" instruction into each
+    # system block. Measured on the bench box: ~2750 output tokens/turn
+    # and ~99% of wall clock is generation, so trimming reasoning trims
+    # latency almost linearly. It costs no cross-turn consistency either:
+    # the SDK only replays reasoning for DeepSeek/Claude models, so on
+    # Qwen every reasoning token is generated, paid for and then dropped
+    # before the next turn.
+    #
+    # Valid values for that template: "low", "medium", "none". NOT
+    # "minimal"/"high" — vLLM's Literal accepts them but the template's
+    # own validator raises. Wiki-scoped on purpose: the general agent
+    # (`get_agent`) is shared with the ingest watcher, whose extraction
+    # runs are the most reasoning-dependent work in the stack.
+    agent_wiki_reasoning_effort: str = ""
 
     @property
     def resolved_agent_model(self) -> str:

@@ -48,17 +48,33 @@ def _estimate_tokens(input_items: list) -> int:
     - `{"role": str, "content": str}` (LiteLLM dict form)
     - `{"role": str, "content": [{"type":"text","text":str}, ...]}`
       (some providers send a list of parts)
-    - SDK item objects with a `.content` attribute
-    Unknown shapes contribute 0; the estimate is a lower bound, which
-    is the safe side for "is context filling up" decisions (we'd rather
-    fire the handoff nudge slightly late than slightly never)."""
+    - `{"type": "function_call_output", "output": str}` — a tool result
+      keeps its payload under `output`, never `content`. These dominate
+      a writer's context (section reads, recalls), so reading only
+      `content` left the estimate a near-constant and the handoff nudge
+      never fired at any budget.
+    - `{"type": "function_call", "arguments": str}` — an assistant TOOL
+      CALL carries its payload under `arguments`, with neither `content`
+      nor `output`. For a writer this is the single largest term in the
+      conversation (an `edit_wiki_section` call carries a whole section),
+      and it was previously counted as zero.
+    - SDK item objects with a `.content`, `.output` or `.arguments` attr
+    Unknown shapes contribute 0. Deliberately excluded: the system prompt
+    and the tool schemas, which the SDK passes outside `input_items`. Both
+    are CONSTANT across a run, so they shift the threshold but never the
+    growth this watches. The estimate stays a lower bound, which is the
+    safe side for "is context filling up" decisions (we'd rather fire the
+    handoff nudge slightly late than slightly never)."""
     total_chars = 0
     for item in input_items:
         content: object
         if isinstance(item, dict):
-            content = item.get("content", "")
+            content = (item.get("content") or item.get("output")
+                       or item.get("arguments") or "")
         else:
-            content = getattr(item, "content", "")
+            content = (getattr(item, "content", None)
+                       or getattr(item, "output", None)
+                       or getattr(item, "arguments", ""))
         if isinstance(content, str):
             total_chars += len(content)
         elif isinstance(content, list):

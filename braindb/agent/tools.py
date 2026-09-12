@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import time
+from contextvars import ContextVar
 from typing import Optional
 from uuid import UUID
 
@@ -36,7 +37,8 @@ from braindb.services.keyword_service import (
 )
 from braindb.services.search import fuzzy_search, preview, slice_content
 from braindb.services import wiki_sections as ws
-from braindb.agent.run_state import record_handoff, record_submit
+from braindb.services import wiki_jobs as wj
+from braindb.agent.run_state import get_run_tag, record_handoff, record_submit
 from braindb.agent.schemas import (
     AgentAnswer,
     MaintainerClusterDecision,
@@ -49,6 +51,26 @@ logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 8000
 
+# Cap on the args/result previews `_verbose` writes to the log. 500 proved
+# too small to audit real runs (briefs and returns were unreadable stubs);
+# this is a LOG cap only, unrelated to MAX_OUTPUT_CHARS (the tool-payload
+# cap the model sees).
+VERBOSE_PREVIEW_CHARS = 1500
+
+# Entity types whose BODY is not editable through the generic `update_entity`
+# path, mapped to the redirect the model should follow instead. A wiki body is
+# owned by the section tools: they carry the revision CAS, the pre-write
+# snapshot and the `summarises` reconcile, and a bare overwrite here bypasses
+# all three. It is also how a cited UUID loses a digit — retyping a 50k-char
+# body by hand to change one line — after which every later write on that page
+# fails on a dangling reference.
+_CONTENT_READONLY = {
+    "datasource": "datasource bodies are read-only; use notes for analysis",
+    "wiki": 'wiki bodies are owned by the section tools; use '
+            'edit_wiki_section(..., mode="append") to add, or mode="replace" '
+            'to rewrite a section you have read in full',
+}
+
 
 def _truncate(s: str) -> str:
     if len(s) > MAX_OUTPUT_CHARS:
@@ -59,6 +81,18 @@ def _truncate(s: str) -> str:
 def _err(msg: str) -> str:
     logger.warning("Tool error: %s", msg)
     return f"ERROR: {msg}"
+
+
+def _wiki_not_found(wiki_id: str) -> str:
+    """One message for every wiki tool, stating the three possible causes and
+    the general recovery. Models mistype UUIDs (observed: splicing one id's
+    tail onto another's head); a bare "not found" leaves them guessing, while
+    "copy it exactly" is the recovery that works for any typo shape."""
+    return _err(
+        f"wiki not found: {wiki_id} — either no entity has this id, the "
+        f"entity is not a wiki, or it has no wiki record. Copy the wiki id "
+        f"from your job prompt exactly; do not retype UUIDs."
+    )
 
 
 def _verbose(name: str):
@@ -83,21 +117,24 @@ def _verbose(name: str):
                         bound[param_names[i]] = val
                 bound.update(kwargs)
                 try:
-                    args_preview = json.dumps(bound, default=str)[:500]
+                    args_preview = json.dumps(bound, default=str)[:VERBOSE_PREVIEW_CHARS]
                 except Exception:
-                    args_preview = str(bound)[:500]
-                logger.info("TOOL  %s  args=%s", name, args_preview)
+                    args_preview = str(bound)[:VERBOSE_PREVIEW_CHARS]
+                logger.info("TOOL [%s] %s  args=%s",
+                            get_run_tag() or "-", name, args_preview)
                 t0 = time.perf_counter()
             try:
                 result = await fn(*args, **kwargs)
             except Exception as e:
                 if settings.agent_verbose:
-                    logger.error("TOOL! %s  exception=%s", name, e)
+                    logger.error("TOOL! [%s] %s  exception=%s",
+                                 get_run_tag() or "-", name, e)
                 raise
             if settings.agent_verbose and t0 is not None:
                 elapsed = time.perf_counter() - t0
-                preview = str(result)[:500].replace("\n", " | ")
-                logger.info("TOOL  %s  elapsed=%.2fs  result=%s", name, elapsed, preview)
+                preview = str(result)[:VERBOSE_PREVIEW_CHARS].replace("\n", " | ")
+                logger.info("TOOL [%s] %s  elapsed=%.2fs  result=%s",
+                            get_run_tag() or "-", name, elapsed, preview)
             return result
         return wrapper
     return decorator
@@ -472,20 +509,21 @@ async def update_entity(
 ) -> str:
     """Update an entity's mutable fields. Any unspecified field is left unchanged.
 
-    IMPORTANT: `content` on a datasource is the original document body and is
-    read-only via this tool. Any `content` passed for a datasource is dropped
-    and the tool returns a warning. Use the `notes` field for analysis/summary.
+    IMPORTANT: `content` is read-only via this tool for a datasource (it is the
+    original document body — use `notes` for analysis) and for a wiki (its body
+    belongs to the section tools). Any `content` passed for those is dropped and
+    the tool returns a warning; every other field still applies.
 
     Args:
         entity_id: UUID of the entity.
-        content: New content (ignored for datasources).
+        content: New content (ignored for datasources and wikis).
         keywords: New keywords list (replaces current).
         notes: New notes.
         importance: New importance 0-1.
     """
     try:
-        # Datasource guardrail — look up type and strip content if protected.
-        content_dropped = False
+        # Body guardrail — look up type and strip content if protected.
+        content_dropped = ""
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT entity_type FROM entities WHERE id = %s", (entity_id,))
@@ -493,9 +531,17 @@ async def update_entity(
                 if not row:
                     return _err(f"entity {entity_id} not found")
                 entity_type = row[0]
-        if content is not None and entity_type == "datasource":
+        if content == "":
+            # An empty string here is destruction, not an edit — observed
+            # live wiping a thought whose ref was already cited inside a
+            # wiki body. A real rewrite passes real text; removal is
+            # delete_entity's job. Ignored with a warning, never silent.
             content = None
-            content_dropped = True
+            content_dropped = ("empty content ignored — use delete_entity "
+                               "to remove an entity, or notes for commentary")
+        if content is not None and entity_type in _CONTENT_READONLY:
+            content = None
+            content_dropped = _CONTENT_READONLY[entity_type]
 
         fields = {}
         if content is not None:
@@ -508,7 +554,7 @@ async def update_entity(
             fields["importance"] = importance
         if not fields:
             if content_dropped:
-                return "No changes (content ignored: datasource bodies are read-only; use notes for analysis)"
+                return f"No changes (content ignored: {content_dropped})"
             return "No changes."
         sets = ", ".join(f"{k} = %s" for k in fields)
         with get_conn() as conn:
@@ -522,7 +568,7 @@ async def update_entity(
             log_activity(conn, "update", None, entity_id, details={"fields": list(fields.keys())})
         msg = f"Updated entity {entity_id}"
         if content_dropped:
-            msg += " (content ignored: datasource bodies are read-only; use notes for analysis)"
+            msg += f" (content ignored: {content_dropped})"
         return msg
     except Exception as e:
         return _err(str(e))
@@ -687,6 +733,22 @@ async def search_sql(query: str) -> str:
     this entity" — that's view_tree. If you're using SQL to find or understand
     something, stop and pick the right tool.
 
+    Dialect: PostgreSQL (15+). String search: `position()`, `strpos()`,
+    `regexp_matches`, `regexp_count`, `regexp_instr`, `regexp_substr`,
+    `regexp_like`, `substring()`. Schema:
+      entities(id, entity_type, title, content, summary, keywords TEXT[],
+               importance, notes, metadata, created_at, updated_at,
+               accessed_at, access_count)
+      relations(id, from_entity_id, to_entity_id, relation_type,
+                relevance_score, importance_score, is_bidirectional,
+                description, notes, created_at, updated_at)
+      wiki_job(id, job_type, status, target_wiki_id, entity_ids UUID[],
+               dedupe_key, rationale, proposed_name, batch_id, created_at,
+               assigned_at, completed_at, attempts, last_error)
+      wikis_ext(entity_id, canonical_name, disambiguation, language,
+                member_keyword_ids UUID[], revision, retired_at, redirect_to)
+    Array columns need `= ANY(col)` or `unnest(col)`, never `IN (col)`.
+
     Args:
         query: SQL query — must start with SELECT or WITH.
     """
@@ -835,7 +897,24 @@ async def ingest_file(
 # DELEGATION — spawn a subagent for focused work                         #
 # ====================================================================== #
 
-_call_depth = 0
+# Delegation depth, scoped to the current run context — NOT a module global.
+#
+# A plain global counts every delegation in flight across the PROCESS. With
+# WIKI_WRITE_PARALLELISM writers plus a maintainer sharing one event loop,
+# one agent's in-flight delegation made every OTHER agent's next delegation
+# fail with "max delegation depth reached" — bounding BREADTH while trying to
+# bound DEPTH. Observed live: two sibling delegations in a single parallel
+# tool batch 1.8ms apart, the second rejected; 25 such refusals in 70h,
+# including a writer's mandatory identity-resolution step, whose rejection
+# message then told it to do the work inline.
+#
+# A ContextVar is inherited by the child Tasks the SDK runs tool bodies in,
+# so a subagent spawned from here sees depth+1 and is correctly barred from
+# delegating further, while a concurrent sibling run has its own context and
+# is unaffected. Unlike run_state's submit slot this needs no mutable
+# container: the value is only ever read DOWNWARD into nested runs, never
+# written back up to the caller.
+_depth_var: ContextVar[int] = ContextVar("braindb_delegation_depth", default=0)
 _MAX_DEPTH = 1
 
 
@@ -845,18 +924,27 @@ async def delegate_to_subagent(task: str) -> str:
     """Delegate a focused task to a fresh subagent running in its own context.
     Use for deep searches, duplicate-finding, relation work, or any task where
     you want the result without polluting your main context with intermediate
-    tool outputs. The subagent has access to all the same BrainDB tools.
+    tool outputs.
 
-    Write a clear, self-contained task description — the subagent doesn't see
-    your prior context. End by telling it to call final_answer with a summary.
+    The subagent gets the memory tools (including the save/relation tools)
+    plus the wiki READ tools (`read_wiki_outline`, `read_wiki_section`,
+    `check_members_cited`, `validate_wiki`). It has NO wiki write tools —
+    no `edit_wiki_section`, no `delete_wiki_section`, no handoff — so ask
+    it to investigate, read and report, never to perform a WIKI edit: it
+    has no safe way to make one.
+
+    Its answer comes back to you as ONE string, so ask for a distilled result,
+    not a transcript. Write a clear, self-contained task description — the
+    subagent doesn't see your prior context. End by telling it to call
+    final_answer with a summary.
 
     Args:
         task: A self-contained task description for the subagent.
     """
-    global _call_depth
-    if _call_depth >= _MAX_DEPTH:
+    depth = _depth_var.get()
+    if depth >= _MAX_DEPTH:
         return "ERROR: max delegation depth reached. Do the task yourself."
-    _call_depth += 1
+    token = _depth_var.set(depth + 1)
     try:
         # Local imports to avoid circular dependency on agent.py
         from braindb.agent.agent import get_subagent, run_typed
@@ -878,7 +966,7 @@ async def delegate_to_subagent(task: str) -> str:
         logger.exception("Subagent failed")
         return _err(f"subagent failed: {e}")
     finally:
-        _call_depth -= 1
+        _depth_var.reset(token)
 
 
 # ====================================================================== #
@@ -916,15 +1004,20 @@ async def read_wiki_outline(wiki_id: str) -> str:
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
         if fetched is None:
-            return _err(f"wiki not found: {wiki_id}")
+            return _wiki_not_found(wiki_id)
         body, revision = fetched
-        _, sections = ws.parse_sections(body)
+        header, sections = ws.parse_sections(body)
         if not sections:
             return _err(
                 f"wiki {wiki_id} body has no <!-- section:X --> markers "
                 f"(strict-markers contract violated; cannot edit)"
             )
-        lines = [f"revision: {revision}", f"sections: {len(sections)}"]
+        lines = [
+            f"revision: {revision}",
+            f'header: {len(header)}ch (meta + title + Summary/Disambiguation'
+            f' — readable and replaceable as section "header")',
+            f"sections: {len(sections)}",
+        ]
         for s in sections:
             lines.append(f"  - {s.name}: {s.char_count}ch")
         return "\n".join(lines)
@@ -934,27 +1027,93 @@ async def read_wiki_outline(wiki_id: str) -> str:
 
 @function_tool
 @_verbose("read_wiki_section")
-async def read_wiki_section(wiki_id: str, section_name: str) -> str:
+async def read_wiki_section(
+    wiki_id: str,
+    section_name: str,
+    offset: int = 0,
+    limit: Optional[int] = None,
+) -> str:
     """Read one section's content + the wiki's current revision token.
+
+    A section bigger than one slice is PAGED, never silently cut: the reply
+    carries `content_meta` {total_chars, offset, returned, next_offset}. Loop
+    `next_offset` until it is null to hold the whole section — do that before
+    any `mode="replace"` edit, or you will drop what you never read.
+
+    Read the section you are about to change: where new material belongs, and
+    how it should be phrased against what is already there, is your judgement.
 
     Args:
         wiki_id: The wiki's entity UUID.
-        section_name: Section name as listed by read_wiki_outline.
+        section_name: Section name as listed by read_wiki_outline, or the
+            reserved name "header" for the block above the first marker
+            (meta line, title, Summary/Disambiguation callouts).
+        offset: start char of the slice (default 0).
+        limit: max chars of this slice (clamped to the server slice max).
     """
     try:
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
         if fetched is None:
-            return _err(f"wiki not found: {wiki_id}")
+            return _wiki_not_found(wiki_id)
         body, revision = fetched
-        _, sections = ws.parse_sections(body)
+        header, sections = ws.parse_sections(body)
+        if section_name == "header":
+            chunk, meta = slice_content(header, offset, limit)
+            return (
+                f"revision: {revision}\nsection: header\n"
+                f"content_meta: {json.dumps(meta)}\ncontent:\n{chunk}"
+            )
         match = next((s for s in sections if s.name == section_name), None)
         if match is None:
             names = ", ".join(s.name for s in sections) or "(none)"
             return _err(f"section '{section_name}' not found. Existing: {names}")
-        return _truncate(
+        # Sliced, NOT _truncate'd: the slice is already bounded by SLICE_MAX,
+        # and a bare truncation here would hide from the model that content
+        # exists past the cap — which is precisely how a "preserve every prior
+        # claim" replace turns into silent data loss on a large section.
+        chunk, meta = slice_content(match.content, offset, limit)
+        return (
             f"revision: {revision}\nsection: {match.name}\n"
-            f"content:\n{match.content}"
+            f"content_meta: {json.dumps(meta)}\ncontent:\n{chunk}"
+        )
+    except Exception as e:
+        return _err(str(e))
+
+
+@function_tool
+@_verbose("check_members_cited")
+async def check_members_cited(wiki_id: str, entity_ids: list[str]) -> str:
+    """Check which of these entity ids are ALREADY cited in the wiki body.
+
+    One cheap call, exact answer — the SAME check the router runs when your
+    run ends, so it tells you directly whether any citation work is left. It
+    answers COVERAGE only, not placement: you still read any section you
+    intend to change. An id reported `gone` no longer exists in the store
+    and cannot (and need not) be cited.
+
+    Args:
+        wiki_id: The wiki's entity UUID.
+        entity_ids: The ids to check — normally the MEMBERS of your job.
+    """
+    try:
+        with get_conn() as conn:
+            fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
+            if fetched is None:
+                return _wiki_not_found(wiki_id)
+            body, revision = fetched
+            # The shared predicate — identical to the router's end-of-run
+            # gate, so the two can never disagree.
+            missing, gone = wj.uncited_members(conn, body, entity_ids)
+        not_cited = set(missing) | set(gone)
+        present = [e for e in entity_ids if e not in not_cited]
+        return (
+            f"revision: {revision}\n"
+            f"cited: {len(present)}/{len(entity_ids)}\n"
+            f"already_cited: {', '.join(present) or '(none)'}\n"
+            f"NOT_cited: {', '.join(missing) or '(none)'}\n"
+            f"gone (deleted from store, cannot be cited): "
+            f"{', '.join(gone) or '(none)'}"
         )
     except Exception as e:
         return _err(str(e))
@@ -967,20 +1126,45 @@ async def edit_wiki_section(
     section_name: str,
     new_content: str,
     expect_revision: int,
+    mode: str = "replace",
 ) -> str:
-    """Replace one section's content. If section_name is new, appends a
-    fresh section at the end. Revision mismatch → returns ERROR: re-read
-    first.
+    """Replace a section, or append to it. If section_name is new, a fresh
+    section is created at the end. Revision mismatch → returns ERROR:
+    re-read first.
+
+    The reserved name "header" edits the block ABOVE the first section
+    marker — the `<!-- wiki:meta ... -->` line, the `# Title`, and the
+    `> **Summary:**` / `> **Disambiguation:**` callouts. Replace-only:
+    read it first, keep the meta line, and update the Summary whenever the
+    page's story has changed — a summary asserting what the body now
+    disputes is a coherence defect.
 
     Args:
         wiki_id: The wiki's entity UUID.
-        section_name: Section to replace (or new section to append).
-            Use lowercase letters, digits, dashes, underscores only.
-        new_content: Full new content of the section (without the marker
-            line — the tool re-emits it).
+        section_name: Section to edit (or new section to create), or
+            "header". Use lowercase letters, digits, dashes, underscores.
+        new_content: With mode="replace", the FULL new content of the
+            section (without the marker line — the tool re-emits it). With
+            mode="append", ONLY the text to add at the end; existing
+            content is preserved (trailing blank lines collapse to one).
         expect_revision: Revision token from the last read on this wiki.
+        mode: "replace" (default) rewrites the section — read it in full
+            first, because anything you do not re-emit is gone. "append"
+            adds at the end, preserving what is there. Choose by content:
+            integrate/revise when the material relates to existing claims;
+            append when it is genuinely additive. The header is
+            replace-only.
     """
-    if not _SECTION_NAME_RE.fullmatch(section_name):
+    if mode not in ("replace", "append"):
+        return _err(f"invalid mode '{mode}': use 'replace' or 'append'")
+    if section_name == "header":
+        if mode == "append":
+            return _err(
+                'cannot append to "header": it is one block (meta line, '
+                'title, Summary/Disambiguation) — read it, then '
+                'mode="replace" it whole'
+            )
+    elif not _SECTION_NAME_RE.fullmatch(section_name):
         return _err(
             f"invalid section_name '{section_name}': use only letters, "
             f"digits, dashes, underscores"
@@ -989,7 +1173,7 @@ async def edit_wiki_section(
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
             if fetched is None:
-                return _err(f"wiki not found: {wiki_id}")
+                return _wiki_not_found(wiki_id)
             body, current_rev = fetched
             if current_rev != expect_revision:
                 return _err(
@@ -1002,16 +1186,24 @@ async def edit_wiki_section(
                     f"wiki {wiki_id} body has no <!-- section:X --> markers; "
                     f"strict-markers contract violated"
                 )
-            appended = all(s.name != section_name for s in sections)
-            new_body = ws.splice_section(body, section_name, new_content)
+            created = (section_name != "header"
+                       and all(s.name != section_name for s in sections))
+            if section_name == "header":
+                new_body = ws.replace_header(body, new_content)
+            elif mode == "append":
+                new_body = ws.append_to_section(body, section_name, new_content)
+            else:
+                new_body = ws.splice_section(body, section_name, new_content)
             new_rev = ws.apply_section_write(conn, wiki_id, new_body, expect_revision)
             log_activity(conn, "update", "wiki", wiki_id, details={
                 "op": "edit_wiki_section",
                 "section": section_name,
-                "appended": appended,
+                "mode": mode,
+                "created": created,
                 "revision": new_rev,
             })
-        verb = "appended" if appended else "replaced"
+        verb = "created" if created else ("appended to" if mode == "append"
+                                          else "replaced")
         return f"ok — section '{section_name}' {verb}. new revision: {new_rev}"
     except ws.StaleRevisionError as e:
         return _err(str(e))
@@ -1027,17 +1219,30 @@ async def delete_wiki_section(
     expect_revision: int,
 ) -> str:
     """Remove a section. Revision mismatch → ERROR: re-read first.
+    The "header" is not deletable — it is the only place the meta line and
+    the `> **Summary:**` callout can live.
 
     Args:
         wiki_id: The wiki's entity UUID.
-        section_name: Section to remove.
+        section_name: Section to remove ("header" is refused).
         expect_revision: Revision token from the last read on this wiki.
     """
+    if section_name == "header":
+        return _err(
+            'the "header" cannot be deleted — it holds the meta line and '
+            'the Summary/Disambiguation callouts. To change it, use '
+            'edit_wiki_section("header", ..., mode="replace").'
+        )
+    if not _SECTION_NAME_RE.fullmatch(section_name):
+        return _err(
+            f"invalid section_name '{section_name}': use only letters, "
+            f"digits, dashes, underscores"
+        )
     try:
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
             if fetched is None:
-                return _err(f"wiki not found: {wiki_id}")
+                return _wiki_not_found(wiki_id)
             body, current_rev = fetched
             if current_rev != expect_revision:
                 return _err(
@@ -1077,7 +1282,7 @@ async def validate_wiki(wiki_id: str) -> str:
         with get_conn() as conn:
             fetched = ws.fetch_wiki_for_section_op(conn, wiki_id)
         if fetched is None:
-            return _err(f"wiki not found: {wiki_id}")
+            return _wiki_not_found(wiki_id)
         body, revision = fetched
         issues = ws.check_grammar(body)
         if not issues:

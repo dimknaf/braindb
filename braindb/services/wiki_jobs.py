@@ -33,10 +33,31 @@ FRESHNESS_MINUTES = int(os.getenv("WIKI_FRESHNESS_MINUTES", "30"))
 # only while a worker is actively running it; if that worker never returns
 # (api restart mid-run, agent timeout) the row would wedge forever. Instead
 # of a reaper/cycle, an `assigned` job whose lease expired is simply
-# claimable again at the EXISTING claim step. 20 min is comfortably above
-# the longest legit run (AGENT_TIMEOUT ~10 min), so a still-running job is
-# never reclaimed. `attempts`+max_attempts already bound repeated failures.
-ASSIGNED_LEASE_MIN = int(os.getenv("WIKI_ASSIGNED_LEASE_MIN", "20"))
+# claimable again at the EXISTING claim step.
+# Raised 20 -> 120. The old value cited "the longest legit run (AGENT_TIMEOUT
+# ~10 min)", but that premise expired three bumps ago. OPERATOR INVARIANT:
+# the lease must exceed YOUR deployment's longest legitimate write — at
+# minimum the scheduler's WIKI_AGENT_TIMEOUT and the per-call
+# agent_request_timeout — or a still-running job gets reclaimed and run
+# twice. The default 120 min covers the shipped defaults (2400s scheduler
+# patience, 4800s per-call ceiling); a deployment that raises those (the
+# bench overlay runs WIKI_AGENT_TIMEOUT=18000s = 300 min) must raise
+# WIKI_ASSIGNED_LEASE_MIN above them too. Read in the API process (this
+# module is imported by the router), so set it on the api service.
+ASSIGNED_LEASE_MIN = int(os.getenv("WIKI_ASSIGNED_LEASE_MIN", "120"))
+
+# Hard ceiling on how many times ONE job may be reclaimed after a lease
+# expiry. `release_or_fail_jobs` caps the GRACEFUL failure path at
+# max_attempts, but an ABANDONED run (client timeout, 500, worker death)
+# never reaches it: `_claimable()` re-admits the row and `claim_jobs`
+# increments `attempts` again, with nothing to stop the cycle. Observed live:
+# a perfect staircase, one job at every attempts value 1..30, and 24 jobs
+# with up to 28 attempts and `last_error` NULL — 832 claim cycles on a single
+# wiki whose work was already complete. Past this ceiling the row simply
+# stops being claimable: it stays `assigned` and visible on `GET /jobs` for
+# an operator, instead of consuming the queue forever. Set above the
+# graceful max_attempts (3) so normal failure handling still runs first.
+ASSIGNED_MAX_RECLAIMS = int(os.getenv("WIKI_ASSIGNED_MAX_RECLAIMS", "5"))
 
 # Per-wiki attach grouping — how long to wait before firing a writer on a
 # wiki that just received new attaches. Once the OLDEST pending attach for
@@ -70,11 +91,16 @@ WIKI_TRIAGE_HUB_DEGREE = int(os.getenv("WIKI_TRIAGE_HUB_DEGREE", "9"))
 
 
 def _claimable(alias: str = "") -> str:
-    """SQL predicate: a job is claimable if pending, OR assigned but its
-    lease expired. Reused verbatim at every claim site (DRY). `alias` is the
-    table alias when the query qualifies columns (e.g. 'j')."""
+    """SQL predicate: a job is claimable if pending, OR assigned with its
+    lease expired AND still under `ASSIGNED_MAX_RECLAIMS`. Reused verbatim at
+    every claim site (DRY). `alias` is the table alias when the query
+    qualifies columns (e.g. 'j').
+
+    A `pending` job is always claimable — the ceiling applies only to the
+    reclaim branch, which is the one nothing else bounds."""
     p = f"{alias}." if alias else ""
     return (f"({p}status = 'pending' OR ({p}status = 'assigned' "
+            f"AND {p}attempts < {ASSIGNED_MAX_RECLAIMS} "
             f"AND {p}assigned_at < now() - make_interval(mins => {ASSIGNED_LEASE_MIN})))")
 
 # Inline reference token: [[ref:UUID]] or [[ref:UUID|display text]]
@@ -123,9 +149,19 @@ def reconcile_summarises_additive(conn, wiki_id: str, body: str) -> dict:
     never deletes or re-types a relation behind the LLM. If the LLM wants a
     relation gone it calls `delete_relation` itself. Mirrors LLM-authored
     content into the graph; it does not judge or shape content.
+
+    A cited id with no row in `entities` (deleted since it was cited, or a
+    UUID mistyped while re-emitting a body) is SKIPPED, not inserted: the
+    FK violation would abort the caller's whole transaction, taking
+    `finish_jobs` with it — so the jobs re-queue forever while the section
+    edits already committed during the agent run remain. Bookkeeping must
+    never be blocked by content. Skipped ids are returned (and land in the
+    `wiki_write` activity log via the caller's `**rel` spread) so this is
+    visible, never silent.
     """
     cited = parse_refs(body)
     added = 0
+    skipped: list[str] = []
     with conn.cursor() as cur:
         cur.execute(
             "SELECT to_entity_id::text FROM relations "
@@ -133,7 +169,16 @@ def reconcile_summarises_additive(conn, wiki_id: str, body: str) -> dict:
             (wiki_id,),
         )
         current = {r[0].lower() for r in cur.fetchall()}
-        for e in cited - current:
+        wanted = sorted(cited - current)
+        if wanted:
+            cur.execute(
+                "SELECT id::text FROM entities WHERE id = ANY(%s::uuid[])",
+                (wanted,),
+            )
+            live = {r[0].lower() for r in cur.fetchall()}
+            skipped = [e for e in wanted if e not in live]
+            wanted = [e for e in wanted if e in live]
+        for e in wanted:
             cur.execute(
                 """INSERT INTO relations
                    (from_entity_id, to_entity_id, relation_type, relevance_score, description)
@@ -142,7 +187,8 @@ def reconcile_summarises_additive(conn, wiki_id: str, body: str) -> dict:
                 (wiki_id, e),
             )
             added += 1
-    return {"relations_added": added, "relations_removed": 0}
+    return {"relations_added": added, "relations_removed": 0,
+            "refs_skipped": skipped}
 
 
 def try_wiki_lock(conn, key: str) -> bool:
@@ -150,6 +196,32 @@ def try_wiki_lock(conn, key: str) -> bool:
     with conn.cursor() as cur:
         cur.execute("SELECT pg_try_advisory_xact_lock(hashtext(%s))", (f"wiki:{key}",))
         return bool(cur.fetchone()[0])
+
+
+def release_stale_assigned(conn, before) -> int:
+    """Return to `pending` every job still `assigned` from BEFORE `before`
+    (normally the API process's start time — see main.py startup).
+
+    Agent runs execute ONLY inside the API process; the scheduler and the
+    watcher are HTTP clients with no braindb imports. So a row assigned
+    before this process existed belongs to a run that died with the previous
+    process — without this it would sit dark for the full lease (observed:
+    a restart-orphaned consolidate invisible for hours while writers
+    re-derived the identity it would have settled). The lease remains the
+    safety net for deaths the process CANNOT see; this handles the one kind
+    it can. NOTE: keys off PROCESS start — the invariant breaks the day the
+    api runs with multiple workers or replicas.
+
+    `attempts` is preserved: the next claim increments it as usual, and the
+    reclaim ceiling + run_cron disposition still bound repeated wedging.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE wiki_job SET status = 'pending', assigned_at = NULL
+               WHERE status = 'assigned' AND assigned_at < %s""",
+            (before,),
+        )
+        return cur.rowcount
 
 
 def claim_jobs(conn, job_ids: list[str]) -> int:
@@ -241,6 +313,27 @@ def run_cron(conn) -> dict:
     """
     batch_id = str(uuid.uuid4())
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # Disposition first: an `assigned` job past both the lease AND the
+        # reclaim ceiling is un-claimable (`_claimable()` excludes it) and
+        # nothing else ever closes it — it would wedge forever, and because
+        # `assigned` counts as an ACTIVE job in `_orphan_conditions()`, its
+        # entity would be silently barred from re-triage for good. Flipping
+        # it to `failed` is the status that, by design, returns the entity
+        # to the orphan pool (`failed` is deliberately not excluded there),
+        # so the very scan below can re-enqueue it in this same tick.
+        # Bounded per JOB by the ceiling, self-healing per ENTITY via full
+        # cron cycles — the original contract, minus the reclaim spin.
+        cur.execute(
+            f"""UPDATE wiki_job
+               SET status = 'failed',
+                   last_error = 'reclaim ceiling ({ASSIGNED_MAX_RECLAIMS}) '
+                                'reached; entity returns to the orphan pool'
+               WHERE status = 'assigned'
+                 AND attempts >= {ASSIGNED_MAX_RECLAIMS}
+                 AND assigned_at < now() - make_interval(mins => {ASSIGNED_LEASE_MIN})"""
+        )
+        assigned_expired_failed = cur.rowcount
+
         cur.execute(
             f"""
             WITH orphans AS (
@@ -270,6 +363,7 @@ def run_cron(conn) -> dict:
         "batch_id": batch_id,
         "triage_jobs_enqueued": enqueued,
         "pending_triage_total": pending_triage,
+        "assigned_expired_failed": assigned_expired_failed,
     }
 
 
@@ -394,12 +488,24 @@ def fetch_entity_brief(conn, entity_id: str) -> dict | None:
 
 
 def suggestion_dedupe_key(action: str, target_wiki_id: str | None,
-                          entity_ids: list[str], consolidate_wiki_ids: list[str]) -> str:
-    """Deterministic, service-computed (never LLM-computed) idempotency key."""
+                          entity_ids: list[str], consolidate_wiki_ids: list[str],
+                          proposed_name: str | None = None) -> str:
+    """Deterministic, service-computed (never LLM-computed) idempotency key.
+
+    `create` keys on the PROPOSED NAME, not the seed ids: two maintainer runs
+    proposing the same page name seconds apart used to mint two pages plus a
+    consolidate to undo it (observed three runs in a row, 65s apart). With
+    the name key the second insert conflicts; its orphan re-enters the pool
+    on the next cron and attaches to the page the first run built. The key
+    only spans ACTIVE jobs (partial index on pending/assigned), so a later
+    create for the same name — after the first completed — still inserts.
+    NOTE: unrelated to the advisory-lock string `create:{job_id}` in the
+    router (`lock_key`); that is a lock name, not a dedupe key.
+    """
     if action == "attach":
         return f"attach:{target_wiki_id}:" + ",".join(sorted(entity_ids))
     if action == "create":
-        return "create:" + ",".join(sorted(entity_ids))
+        return "create:" + (proposed_name or ",".join(sorted(entity_ids))).lower()
     if action == "consolidate":
         return "consolidate:" + ",".join(sorted(consolidate_wiki_ids))
     raise ValueError(f"unknown action {action!r}")
@@ -499,6 +605,36 @@ def next_write_bucket(conn) -> dict | None:
                 "target_wiki_id": str(seed["target_wiki_id"]), "proposed_name": None}
 
 
+def uncited_members(conn, body: str,
+                    member_ids: list[str]) -> tuple[list[str], list[str]]:
+    """(missing, gone): member ids not cited in `body`, split into those
+    whose entity still exists (real outstanding work) and those with no
+    entity row.
+
+    A member deleted since triage can never be cited, so treating it like
+    ordinary "missing" wedges its job in a fail/retry loop forever — the
+    same premise as `reconcile_summarises_additive`'s dangling-ref skip:
+    absent content must never block bookkeeping.
+
+    This is THE citation predicate. The router's no-op gate and the
+    writer's `check_members_cited` tool both call it, so they can never
+    drift apart.
+    """
+    cited = parse_refs(body)
+    uncited = [m for m in member_ids if m.lower() not in cited]
+    if not uncited:
+        return [], []
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id::text FROM entities WHERE id = ANY(%s::uuid[])",
+            (uncited,),
+        )
+        live = {r[0].lower() for r in cur.fetchall()}
+    missing = [m for m in uncited if m.lower() in live]
+    gone = [m for m in uncited if m.lower() not in live]
+    return missing, gone
+
+
 def fetch_members(conn, entity_ids: list[str]) -> list[dict]:
     if not entity_ids:
         return []
@@ -525,16 +661,57 @@ def fetch_wiki(conn, wiki_id: str) -> dict | None:
 
 
 def list_active_wikis(conn) -> list[dict]:
-    """All non-retired wikis as {id, canonical_name}, deterministically
-    ordered. Plumbing read (mirrors fetch_wiki / export_wikis SQL) — the
-    maintainer is shown this as a NUMBERED catalog so it references wikis by
-    number, never by uuid; the order here IS the numbering."""
+    """All non-retired wikis as {id, canonical_name, char_count},
+    deterministically ordered. Plumbing read (mirrors fetch_wiki /
+    export_wikis SQL) — the maintainer is shown this as a NUMBERED catalog so
+    it references wikis by number, never by uuid; the order here IS the
+    numbering. `char_count` lets the maintainer see that a candidate target is
+    already large and prefer a narrower `create` over piling on another
+    `attach`; without it every page looks equally empty."""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            """SELECT e.id::text AS id, w.canonical_name
+            """SELECT e.id::text AS id, w.canonical_name,
+                      length(e.content) AS char_count
                FROM entities e JOIN wikis_ext w ON w.entity_id = e.id
                WHERE e.entity_type = 'wiki' AND w.retired_at IS NULL
                ORDER BY e.importance DESC, e.created_at"""
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def list_related_wikis(conn, entity_ids: list[str], exclude_wiki_id: str | None,
+                       limit: int = 10) -> list[dict]:
+    """Wikis one hop from the entities being written, as
+    {canonical_name, char_count}, most-cited first.
+
+    The WRITER gets this — deliberately NOT the full catalog. It only needs to
+    know which neighbouring pages already exist so it can name one in prose
+    instead of expanding this page. A short, relevant list keeps that cheap;
+    the whole catalog would be noise and grows without bound.
+
+    "Related" = a wiki that already `summarises` an entity that one of these
+    members is connected to. Reuses the relations the pipeline already
+    maintains; creates nothing."""
+    if not entity_ids:
+        return []
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """SELECT w.canonical_name,
+                      length(e.content) AS char_count, count(*) AS cites
+               FROM relations seed
+               JOIN relations sm ON sm.to_entity_id IN (seed.from_entity_id,
+                                                        seed.to_entity_id)
+                                AND sm.relation_type = 'summarises'
+               JOIN entities e ON e.id = sm.from_entity_id
+               JOIN wikis_ext w ON w.entity_id = e.id
+               WHERE (seed.from_entity_id = ANY(%s::uuid[])
+                      OR seed.to_entity_id = ANY(%s::uuid[]))
+                 AND e.entity_type = 'wiki' AND w.retired_at IS NULL
+                 AND (%s::uuid IS NULL OR e.id <> %s::uuid)
+               GROUP BY e.id, w.canonical_name
+               ORDER BY cites DESC, w.canonical_name
+               LIMIT %s""",
+            (entity_ids, entity_ids, exclude_wiki_id, exclude_wiki_id, limit),
         )
         return [dict(r) for r in cur.fetchall()]
 
@@ -626,8 +803,9 @@ def _keyword_ids_among(conn, entity_ids: list[str]) -> list[str]:
 
 def finalize_wiki_write(conn, wiki_id: str, new_body: str, summary: str | None,
                         disambiguation: str | None, member_entity_ids: list[str]) -> int:
-    """Apply the gated body to an existing wiki: update content + header
-    fields, union new keyword members, bump revision."""
+    """Apply the LLM-authored body to an existing wiki: update content +
+    header fields, union new keyword members, bump revision. (There is no
+    content gate — the deliberate design; see routers/wiki.py.)"""
     new_kw = _keyword_ids_among(conn, member_entity_ids)
     with conn.cursor() as cur:
         cur.execute("UPDATE entities SET content=%s, summary=%s WHERE id=%s",

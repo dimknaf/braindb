@@ -2,9 +2,9 @@
 splicing layer behind the writer's section-edit tools.
 
 These tests cover the DB-free functions only (`parse_sections`,
-`splice_section`, `delete_section`, `check_grammar`). The DB helpers
-(`fetch_wiki_for_section_op`, `apply_section_write`) are covered by
-the end-to-end smoke test inside `braindb_api` (see plan Phase 1).
+`splice_section`, `append_to_section`, `delete_section`, `check_grammar`).
+The DB helpers (`fetch_wiki_for_section_op`, `apply_section_write`) are
+covered by the end-to-end smoke test inside `braindb_api` (see plan Phase 1).
 
 The contract being tested:
 
@@ -14,6 +14,11 @@ The contract being tested:
 - `splice_section` REPLACES an existing section's content, or APPENDS
   a fresh section if the name is new. Bytes outside the targeted
   section are preserved exactly.
+- `append_to_section` ADDS to an existing section without the caller
+  supplying its prior content — the genuinely-additive "one more
+  citation" case. Existing content is preserved at the content level
+  (trailing blank lines collapse to one; markers re-emit canonically):
+  no claim or citation can be lost.
 - `delete_section` removes a section, raises `KeyError` if missing.
 - `check_grammar` flags: no markers, malformed `[[ref:` tokens, missing
   Summary callout. Tolerates the grouped-refs variant `[[ref:UUID1],
@@ -28,9 +33,11 @@ import pytest
 from braindb.services.wiki_sections import (
     Section,
     StaleRevisionError,
+    append_to_section,
     check_grammar,
     delete_section,
     parse_sections,
+    replace_header,
     splice_section,
 )
 
@@ -166,6 +173,61 @@ def test_delete_section_preserves_header():
 
 
 # ====================================================================== #
+# replace_header — the header becomes editable                            #
+# ====================================================================== #
+#
+# Section tools could edit every section but never the block above the
+# first marker, so a page's Summary could permanently contradict its own
+# body (observed live: "is applying" against a recorded acceptance).
+# `replace_header` closes that; these tests pin that it touches ONLY the
+# header.
+
+NEW_HEADER = (
+    "<!-- wiki:meta canonical_name=Test language=en -->\n"
+    "# Test\n"
+    "> **Summary:** updated one line\n"
+    "> **Disambiguation:** what this is, updated\n"
+)
+
+
+def test_replace_header_replaces_only_the_header():
+    out = replace_header(NORMAL_BODY, NEW_HEADER)
+    header, sections = parse_sections(out)
+    assert "> **Summary:** updated one line" in header
+    assert "revision=1" not in header  # the stale token is gone with the old header
+    before = {s.name: s.content for s in parse_sections(NORMAL_BODY)[1]}
+    after = {s.name: s.content for s in sections}
+    assert after == before
+
+
+def test_replace_header_keeps_section_order():
+    out = replace_header(NORMAL_BODY, NEW_HEADER)
+    assert [s.name for s in parse_sections(out)[1]] == [
+        "overview", "timeline", "references"]
+
+
+def test_replace_header_result_is_grammar_clean():
+    assert check_grammar(replace_header(NORMAL_BODY, NEW_HEADER)) == []
+
+
+def test_replace_header_without_trailing_newline():
+    out = replace_header(NORMAL_BODY, NEW_HEADER.rstrip("\n"))
+    header, sections = parse_sections(out)
+    assert header.endswith("\n")  # _rebuild normalises
+    assert len(sections) == 3
+
+
+def test_replace_header_empty_header_drops_it():
+    """Pin current `_rebuild` behaviour: an empty header is omitted, the
+    body then starts at the first marker."""
+    out = replace_header(NORMAL_BODY, "")
+    header, sections = parse_sections(out)
+    assert header == ""
+    assert out.startswith("<!-- section:overview -->")
+    assert len(sections) == 3
+
+
+# ====================================================================== #
 # Round-trip identity                                                     #
 # ====================================================================== #
 
@@ -194,6 +256,19 @@ def test_grammar_flags_missing_markers():
     body = "# Test\n> **Summary:** s\nNo markers here.\n"
     issues = check_grammar(body)
     assert any("no <!-- section:" in i for i in issues)
+
+
+def test_grammar_flags_missing_meta_line():
+    """A header replace that drops the meta line silently zeroes
+    keywords_from_meta — advisory check so validate_wiki surfaces it."""
+    body = (
+        "# Test\n> **Summary:** s\n"
+        "<!-- section:overview -->\nprose\n"
+    )
+    issues = check_grammar(body)
+    assert any("wiki:meta" in i for i in issues)
+    # and only that — Summary and markers are fine here
+    assert not any("Summary" in i for i in issues)
 
 
 def test_grammar_flags_missing_summary():
@@ -262,3 +337,79 @@ def test_section_is_frozen_dataclass():
 def test_section_char_count_property():
     s = Section(name="x", content="abcdef")
     assert s.char_count == 6
+
+
+# ====================================================================== #
+# append_to_section — the incremental add                                 #
+# ====================================================================== #
+#
+# The pipeline's real unit of work is "add one [[ref:UUID]] bullet". Doing
+# that through `splice_section` requires the caller to re-emit the section's
+# WHOLE content, which on a section past the read cap cannot be done
+# correctly at all. These tests pin the property that makes appending safe:
+# whatever was already in the section survives byte-for-byte, without the
+# caller ever having to hold it.
+
+def test_append_preserves_existing_content_byte_for_byte():
+    before = next(s for s in parse_sections(NORMAL_BODY)[1]
+                  if s.name == "references")
+    out = append_to_section(NORMAL_BODY, "references", "- [[ref:%s]] — source C" % UUID_A)
+    after = next(s for s in parse_sections(out)[1] if s.name == "references")
+    # every original line is still present, in order, unmodified
+    original_lines = [ln for ln in before.content.splitlines() if ln.strip()]
+    after_lines = [ln for ln in after.content.splitlines() if ln.strip()]
+    assert after_lines[:len(original_lines)] == original_lines
+
+
+def test_append_adds_the_new_text_at_the_end():
+    out = append_to_section(NORMAL_BODY, "references", "- new tail line")
+    section = next(s for s in parse_sections(out)[1] if s.name == "references")
+    assert section.content.rstrip("\n").endswith("- new tail line")
+
+
+def test_append_does_not_touch_other_sections_or_header():
+    out = append_to_section(NORMAL_BODY, "references", "- new tail line")
+    hdr_before, secs_before = parse_sections(NORMAL_BODY)
+    hdr_after, secs_after = parse_sections(out)
+    assert hdr_after == hdr_before
+    untouched_before = {s.name: s.content for s in secs_before if s.name != "references"}
+    untouched_after = {s.name: s.content for s in secs_after if s.name != "references"}
+    assert untouched_after == untouched_before
+
+
+def test_append_keeps_section_order():
+    out = append_to_section(NORMAL_BODY, "overview", "more prose")
+    assert [s.name for s in parse_sections(out)[1]] == [
+        "overview", "timeline", "references"]
+
+
+def test_append_to_missing_section_creates_it_like_splice():
+    out = append_to_section(NORMAL_BODY, "sources", "narrative provenance")
+    names = [s.name for s in parse_sections(out)[1]]
+    assert names == ["overview", "timeline", "references", "sources"]
+    created = next(s for s in parse_sections(out)[1] if s.name == "sources")
+    assert "narrative provenance" in created.content
+
+
+def test_append_result_is_reparseable_normal_form():
+    out = append_to_section(NORMAL_BODY, "references", "- another")
+    # a second append must behave identically on the result of the first
+    out2 = append_to_section(out, "references", "- and another")
+    section = next(s for s in parse_sections(out2)[1] if s.name == "references")
+    assert "- another" in section.content
+    assert "- and another" in section.content
+    assert check_grammar(out2) == []
+
+
+def test_append_never_loses_refs_on_a_large_section():
+    """The regression this exists for: a section far bigger than the tool
+    read cap (8000) must survive an append intact, because the caller never
+    supplies its prior content."""
+    big = "\n".join(f"- [[ref:{UUID_A}]] — line {i}" for i in range(1200))
+    body = splice_section(NORMAL_BODY, "references", big)
+    assert len(next(s for s in parse_sections(body)[1]
+                    if s.name == "references").content) > 8000
+    out = append_to_section(body, "references", f"- [[ref:{UUID_B}]] — new")
+    after = next(s for s in parse_sections(out)[1] if s.name == "references")
+    assert after.content.count("[[ref:") == 1201
+    assert "line 0" in after.content and "line 1199" in after.content

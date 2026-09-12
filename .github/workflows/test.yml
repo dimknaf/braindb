@@ -67,11 +67,19 @@ jobs:
       - name: Install pytest into the api container
         run: docker exec braindb_api pip install pytest pytest-asyncio --quiet
 
-      - name: Run validator + handoff unit tests
+      - name: Run validator + handoff + wiki-writer guard tests
+        # The wiki files below are the revert-detectors for the writer-loop
+        # fixes: sections/guards are DB-free; selfheal + reconcile_dangling
+        # use the workflow's Postgres service via the container's
+        # DATABASE_URL (schema comes from the api's alembic upgrade).
         run: |
           docker exec braindb_api python -m pytest \
             tests/test_final_answer_rename.py \
             tests/test_handoff_hooks.py \
+            tests/test_wiki_sections.py \
+            tests/test_wiki_writer_guards.py \
+            tests/test_wiki_reconcile_dangling.py \
+            tests/test_wiki_selfheal_db.py \
             -v
 
       - name: Dump api logs on failure

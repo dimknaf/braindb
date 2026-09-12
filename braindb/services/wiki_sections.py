@@ -19,7 +19,8 @@ revision back as `expect_revision`. A mismatch raises
 silently stomping on a concurrent edit.
 
 Pure parsing functions (`parse_sections`, `splice_section`,
-`delete_section`, `check_grammar`) are DB-free and unit-testable.
+`append_to_section`, `replace_header`, `delete_section`, `check_grammar`)
+are DB-free and unit-testable.
 The two DB helpers at the bottom (`fetch_wiki_for_section_op`,
 `apply_section_write`) are the only stateful surface.
 """
@@ -115,6 +116,46 @@ def splice_section(body: str, section_name: str, new_content: str) -> str:
     return _rebuild(header, sections)
 
 
+def append_to_section(body: str, section_name: str, added_content: str) -> str:
+    """Append text to the END of one named section, preserving its existing
+    content (whitespace-normalised: trailing blank lines collapse to one,
+    and the rebuild re-emits section markers in canonical form — no claim
+    or citation can be lost, but the guarantee is content-level, not
+    byte-level).
+
+    The genuinely-additive case: a new `[[ref:UUID]]` bullet or a new claim.
+    `splice_section` requires the caller to supply the section's WHOLE new
+    content; resolving an append here, from the body the caller already
+    holds, means the model never has to carry the prior content just to add
+    to it. When new material relates to what a section already says, a
+    replace that integrates it is the better edit — that judgement belongs
+    to the caller, not this function.
+
+    A section that doesn't exist yet is created with `added_content`, matching
+    `splice_section`'s append-a-new-section behaviour.
+    """
+    _, sections = parse_sections(body)
+    existing = next((s for s in sections if s.name == section_name), None)
+    if existing is None:
+        return splice_section(body, section_name, added_content)
+    merged = existing.content.rstrip("\n") + "\n" + added_content.lstrip("\n")
+    return splice_section(body, section_name, merged)
+
+
+def replace_header(body: str, new_header: str) -> str:
+    """Replace the HEADER — everything above the first section marker: the
+    `<!-- wiki:meta ... -->` line, the `# Title`, and the `> **Summary:**` /
+    `> **Disambiguation:**` callouts. Every section is preserved untouched.
+
+    This is the fix for header freeze: section tools could edit every
+    section but never the block readers see first, so a page's summary
+    could permanently contradict its own body. Exposed to the writer as
+    the reserved section name "header" (replace-only).
+    """
+    _, sections = parse_sections(body)
+    return _rebuild(new_header, sections)
+
+
 def delete_section(body: str, section_name: str) -> str:
     """Remove the named section (and its marker) from the body.
     Raises KeyError if the section isn't present."""
@@ -157,6 +198,10 @@ def check_grammar(body: str) -> list[str]:
             issues.append(f"malformed [[ref: token at char offset {m.start()}")
     if "> **Summary:**" not in header:
         issues.append("missing > **Summary:** callout in header")
+    if "<!-- wiki:meta" not in header:
+        # Advisory like everything here — but a header replace that drops
+        # the meta line silently zeroes keywords_from_meta, so surface it.
+        issues.append("missing <!-- wiki:meta ... --> line in header")
     return issues
 
 
