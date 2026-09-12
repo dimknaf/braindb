@@ -193,7 +193,7 @@ When debugging the agent: set `AGENT_VERBOSE=true` in `.env` and watch `docker l
 
 ## Important Notes
 
-- `.env` contains real DB credentials and provider API keys (`DEEPINFRA_API_KEY`, `NVIDIA_NIM_API_KEY`, etc.) — **never commit it**, it is in `.gitignore`. Active provider is picked by `LLM_PROFILE` (see `braindb/config.py::_LLM_PROFILES`). `LLM_PROFILE=deepinfra` (model `google/gemma-4-31B-it`) is the recommended starting point — fast, cheap, validated end-to-end; the `vllm_*` profiles are for advanced/offline use and need a workstation GPU + SSH tunnel.
+- `.env` contains real DB credentials and provider API keys (`DEEPINFRA_API_KEY`, `NVIDIA_NIM_API_KEY`, etc.) — **never commit it**, it is in `.gitignore`. Active provider is picked by `LLM_PROFILE` (see `braindb/config.py::_LLM_PROFILES`). `LLM_PROFILE=deepinfra` (model `google/gemma-4-31B-it`) is the recommended starting point — fast, cheap, validated end-to-end; the `vllm_*` profiles need a GPU serving an OpenAI-compatible endpoint reachable from the docker network. Note the wiki pipeline's tuning constants (turn budget, request timeout, writer handoff budget, `AGENT_WIKI_REASONING_EFFORT`) were measured against self-hosted Qwen on vLLM — `vllm_workstation_qwen` is that profile.
 - Always-on rules (priority 100, `always_on: true`) are returned on every `/memory/context` call
 - `notes` field on any entity or relation is for running commentary — append observations over time
 - Keywords are stored as both a `TEXT[]` column on the entity AND as separate keyword entities linked via `tagged_with` relations (the keyword entities carry the embeddings for semantic search)

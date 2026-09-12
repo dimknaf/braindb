@@ -19,7 +19,7 @@ _PROCESS_START = datetime.now(timezone.utc)
 app = FastAPI(
     title="BrainDB",
     description="Memory database and REST API for LLM agents",
-    version="0.9.0",
+    version="0.10.0",
 )
 
 app.add_middleware(

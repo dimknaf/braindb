@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-09-12
+
+Headline: **the wiki pipeline is now dependable under long, unattended runs.** The writer loop
+always terminates, crashed and restarted jobs recover on their own, and the page header is editable
+instead of frozen after the first write. Also in this release: a reasoning-effort knob for the wiki
+agents that cuts latency several-fold on self-hosted models, a per-call LLM timeout so slow local
+writes are no longer abandoned mid-flight, and both agents can now see how big a page is before
+deciding what to do with it.
+
+### Added
+
+- **Append mode and paging for the wiki section tools.** `edit_wiki_section` gains `mode="append"`,
+  and `read_wiki_section` takes `offset`/`limit`. Reads were capped well below the uncapped write
+  size, so a writer could be asked to preserve a section it was only ever shown part of — an
+  append-shaped job forced through a replace-shaped tool. The model now picks the edit that fits the
+  content rather than the one the tool allows.
+- **`check_members_cited`.** One shared predicate answering "is this member cited yet?", used by
+  both the writer's tool and the router's gate, so the two cannot disagree. Three copies of that
+  logic previously existed and had drifted.
+- **The page header is an editable section.** Meta line, title, Summary and Disambiguation were
+  effectively frozen once a page grew past the inline-body limit. They are now readable and
+  replaceable through the existing section tools, so a page whose story changes can have its opening
+  changed too.
+- **`AGENT_WIKI_REASONING_EFFORT`.** Wiki agents only, blank by default. Some chat templates default
+  reasoning to their maximum when no value is sent, and the SDK discards that reasoning between
+  turns on most model families — so it is generated, paid for, and dropped. Self-hosted vLLM only;
+  leave blank on hosted providers.
+- **`AGENT_REQUEST_TIMEOUT`.** The per-call transport deadline, default 4800s.
+- **Size awareness for both agents.** The maintainer sees each page's size in its catalog; the
+  writer sees neighbouring page names and sizes. Neither could previously tell a large page from an
+  empty one, so every candidate target looked equally reasonable.
+
+### Changed
+
+- **Writer handoff budget raised 20000 -> 30000.** A budget set where it cannot fire silently
+  disables the successor path, leaving long writes to grow until they hit the turn limit instead of
+  handing off to a fresh successor.
+- **Job lease raised 20 -> 120 min, with a bounded reclaim ceiling.** A long write is no longer
+  mistaken for an abandoned one.
+- **`vllm_workstation_qwen` profile** now points at the Qwen model and port the wiki pipeline is
+  actually tuned against, so selecting it needs no `AGENT_MODEL` override. `deepinfra` remains the
+  default profile.
+
+### Fixed
+
+- **The writer loop now terminates.** A long unattended run spent most of its time on a single page
+  whose work was already complete — every member was already cited, yet the job kept being re-run.
+  Cause was the tool mismatch above plus a reconcile step that raised on a stale reference instead
+  of skipping it, aborting the very transaction that would have closed the job.
+- **Self-healing restored.** Jobs past their lease and reclaim ceiling now fail and re-enter triage
+  in the same sweep instead of wedging indefinitely. An entity can no longer be silently lost.
+- **Crashes and restarts are recoverable.** The pre-write snapshot is taken when the job is claimed
+  rather than after the model runs, so an interrupted run is always reversible; jobs orphaned by a
+  restart are returned to the queue on startup.
+- **Token estimate counts tool results.** It read only message content, missing the tool-result
+  payloads that dominate a writer's context — so the handoff nudge never fired at any budget.
+- **Per-call LLM timeout.** LiteLLM's own 600s client fallback was abandoning self-hosted writes the
+  server was still completing, so the work was computed and discarded. Hosted providers finish well
+  inside the new ceiling and are unaffected — it is a ceiling, not a delay.
+- **Duplicate page creation.** Two create jobs for the same proposed name within the same window now
+  collapse to one.
+- **`update_entity` no longer overwrites wiki bodies**, and a blank body is a warned no-op rather
+  than a silent wipe. Subagents gained the wiki READ tools so they no longer fall back to retyping a
+  body they can only partly see.
+
+### Upgrading from v0.9.0
+
+No DB migration and no required env changes. Both new knobs default to the previous behaviour.
+
 ## [0.9.0] — 2026-06-26
 
 Headline: **custom profiles** — opt-in, self-contained overlays that reshape what BrainDB ingests

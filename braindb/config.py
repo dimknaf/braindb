@@ -34,10 +34,14 @@ _LLM_PROFILES: dict[str, dict[str, str]] = {
         "api_key_env": "VLLM_API_KEY",
         "base_url": "http://host.docker.internal:8002/v1",
     },
+    # Qwen 3.8 27B (NVFP4) on the workstation vLLM. This is the profile the wiki
+    # pipeline is actually tuned against — the turn budget, request timeout and
+    # handoff budget below all cite it. Select it and no AGENT_MODEL override is
+    # needed.
     "vllm_workstation_qwen": {
-        "model": "openai/cyankiwi/Qwen3.6-27B-AWQ-INT4",
+        "model": "openai/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4",
         "api_key_env": "VLLM_API_KEY",
-        "base_url": "http://host.docker.internal:8010/v1",
+        "base_url": "http://host.docker.internal:8012/v1",
     },
     "vllm_workstation_gemma": {
         "model": "openai/cyankiwi/gemma-4-31B-it-AWQ-4bit",
