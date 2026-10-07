@@ -35,7 +35,9 @@ from braindb.agent.hooks import CountdownHooks
 from braindb.agent.run_state import (
     get_run_tag,
     install_slot,
+    install_usage,
     release_slot,
+    release_usage,
     reset_run_tag,
     set_run_tag,
 )
@@ -360,6 +362,11 @@ async def run_typed(
     # every TOOL line it emits is attributable (see run_state.set_run_tag).
     # Set before Runner.run — ContextVars are captured at Task creation.
     tag_token = set_run_tag(uuid4().hex[:6])
+    # Token usage of this run goes into the request's usage ledger (the
+    # hooks below add each LLM call). A nested run (subagent, retry) adds
+    # into the ledger its caller installed; only the outermost one reports.
+    usage, usage_token = install_usage()
+    usage.add_tag(get_run_tag())
     # Layer-3 nudge: when the run is about to exhaust `max_turns`, the hook
     # appends a synthetic "you have N turns left, finalise via final_answer"
     # user message to the conversation. One nudge per run; disabled when
@@ -493,6 +500,9 @@ async def run_typed(
             _bad_request_retried=True,
         )
     finally:
+        if usage_token is not None:
+            logger.info("Usage [%s] (%s): %s", get_run_tag(), agent.name, usage.line())
+        release_usage(usage_token)
         reset_run_tag(tag_token)
         release_slot(token)
 

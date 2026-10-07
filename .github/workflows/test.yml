@@ -80,6 +80,7 @@ jobs:
             tests/test_wiki_writer_guards.py \
             tests/test_wiki_reconcile_dangling.py \
             tests/test_wiki_selfheal_db.py \
+            tests/test_usage_ledger.py \
             -v
 
       - name: Dump api logs on failure

@@ -26,6 +26,7 @@ object reference. The standard `set(slot) + reset(token)` lifecycle in
 `run_typed` keeps nested runs (parent → `delegate_to_subagent` →
 subagent) isolated: each level uses its own `_Slot`.
 """
+import threading
 from contextvars import ContextVar
 from typing import Any
 
@@ -148,3 +149,101 @@ def record_handoff(progress_summary: str, remaining_work: str) -> None:
         slot.captured = True
         slot.progress_summary = progress_summary
         slot.remaining_work = remaining_work
+
+
+# ====================================================================== #
+# Usage ledger — what one request cost, in tokens and tool calls          #
+# ====================================================================== #
+#
+# Nothing recorded token usage before this: cost questions ("how many
+# uncached tokens and output tokens did that answer take?") could only be
+# guessed. The ledger is installed ONCE per top-level request (the
+# /agent/query router, or `run_typed` for wiki runs); nested runs
+# (subagents, the final_answer retry, the BadRequest retry) find the
+# installed ledger and add into it, so a request's cost includes every run
+# it spawned. Same discipline as the slots above: a mutable object in a
+# ContextVar, mutated in place. It carries a lock because, unlike a submit
+# slot, it is written concurrently — parallel tool calls run as separate
+# Tasks, and work offloaded with `asyncio.to_thread` runs on other threads.
+#
+# `weighted` = uncached input + 4 x output: cached input costs ~nothing on a
+# self-hosted server, and output tokens dominate both time and cost.
+
+
+class _Usage:
+    """Token and tool counters for one top-level request."""
+    __slots__ = ("lock", "agent", "jev", "tools", "tags")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.agent = {"requests": 0, "input": 0, "cached": 0, "output": 0, "reasoning": 0}
+        self.jev = {"calls": 0, "requests": 0, "input": 0, "cached": 0, "output": 0,
+                    "failopen": 0, "unjudged": 0}
+        self.tools: dict[str, int] = {}
+        self.tags: list[str] = []
+
+    def add(self, kind: str, **counts: int) -> None:
+        with self.lock:
+            bucket = getattr(self, kind)
+            for k, v in counts.items():
+                bucket[k] = bucket.get(k, 0) + int(v or 0)
+
+    def note_tool(self, name: str) -> None:
+        with self.lock:
+            self.tools[name] = self.tools.get(name, 0) + 1
+
+    def add_tag(self, tag: str) -> None:
+        """Record a run tag, so log lines of every run this request spawned
+        (subagents included) can be found from the request's ledger."""
+        with self.lock:
+            self.tags.append(tag)
+
+    def as_dict(self) -> dict:
+        with self.lock:
+            return {"agent": dict(self.agent), "jev": dict(self.jev),
+                    "tools": dict(self.tools), "tags": list(self.tags)}
+
+    def line(self) -> str:
+        """One log line: the agent's LLM usage, JEV's, and tool calls."""
+        d = self.as_dict()
+        a, j = d["agent"], d["jev"]
+        w_agent = a["input"] - a["cached"] + 4 * a["output"]
+        w_jev = j["input"] - j["cached"] + 4 * j["output"]
+        tools = ",".join(f"{k}={v}" for k, v in sorted(d["tools"].items())) or "-"
+        return (f"agent req={a['requests']} in={a['input']} cached={a['cached']} "
+                f"out={a['output']} reasoning={a['reasoning']} weighted={w_agent} | "
+                f"jev calls={j['calls']} req={j['requests']} in={j['input']} "
+                f"cached={j['cached']} out={j['output']} failopen={j['failopen']} "
+                f"weighted={w_jev} | tools {tools}")
+
+
+_usage_var: ContextVar["_Usage | None"] = ContextVar("braindb_usage", default=None)
+
+
+def install_usage() -> tuple[_Usage, object | None]:
+    """Start counting for a top-level request. Returns `(ledger, token)`;
+    when a ledger is already installed (a nested run), returns THAT ledger
+    and `None`, so the outermost caller alone reports and releases it."""
+    existing = _usage_var.get()
+    if existing is not None:
+        return existing, None
+    ledger = _Usage()
+    return ledger, _usage_var.set(ledger)
+
+
+def release_usage(token: object | None) -> None:
+    if token is not None:
+        _usage_var.reset(token)  # type: ignore[arg-type]
+
+
+def add_usage(kind: str, **counts: int) -> None:
+    """Add counts to the current request's ledger; a no-op outside one."""
+    ledger = _usage_var.get()
+    if ledger is not None:
+        ledger.add(kind, **counts)
+
+
+def note_tool(name: str) -> None:
+    ledger = _usage_var.get()
+    if ledger is not None:
+        ledger.note_tool(name)

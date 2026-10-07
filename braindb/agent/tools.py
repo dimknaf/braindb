@@ -38,7 +38,7 @@ from braindb.services.keyword_service import (
 from braindb.services.search import fuzzy_search, preview, slice_content
 from braindb.services import wiki_sections as ws
 from braindb.services import wiki_jobs as wj
-from braindb.agent.run_state import get_run_tag, record_handoff, record_submit
+from braindb.agent.run_state import get_run_tag, note_tool, record_handoff, record_submit
 from braindb.agent.schemas import (
     AgentAnswer,
     MaintainerClusterDecision,
@@ -108,6 +108,7 @@ def _verbose(name: str):
 
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
+            note_tool(name)  # per-request tool counts (usage ledger), verbose or not
             t0 = None
             if settings.agent_verbose:
                 # Bind positional args to param names for readable logging

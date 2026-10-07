@@ -38,6 +38,8 @@ from typing import Any
 
 from agents.lifecycle import RunHooks
 
+from braindb.agent.run_state import add_usage
+
 logger = logging.getLogger(__name__)
 
 
@@ -111,6 +113,8 @@ class CountdownHooks(RunHooks):
           `estimated_tokens(input_items) > token_budget` AND
           `_fired_tokens` is False, appends the handoff nudge.
       - each nudge fires at most once per run.
+      - `on_llm_end` fires after each LLM call and adds that call's token
+        usage to the request's usage ledger (it never alters the run).
 
     Disabled paths:
       - `threshold <= 0` disables the turn nudge (existing safety hatch).
@@ -166,6 +170,25 @@ class CountdownHooks(RunHooks):
                 "CountdownHooks.on_llm_start swallowed an internal error "
                 "(turns=%d, fired=%s): %r", self._turns, self._fired, e,
             )
+
+    # Usage capture rides on the same per-run hooks object: `on_llm_end`
+    # gets each call's `ModelResponse.usage`, which the SDK fills from the
+    # provider's own counters (prompt, cached, completion, reasoning). It
+    # only ADDS to the request's usage ledger (run_state.py) and never
+    # touches the conversation. Same defensive rule as `on_llm_start`.
+    async def on_llm_end(self, context: Any, agent: Any, response: Any) -> None:
+        try:
+            u = response.usage
+            add_usage(
+                "agent",
+                requests=getattr(u, "requests", 1) or 1,
+                input=u.input_tokens,
+                cached=getattr(u.input_tokens_details, "cached_tokens", 0),
+                output=u.output_tokens,
+                reasoning=getattr(u.output_tokens_details, "reasoning_tokens", 0),
+            )
+        except Exception as e:  # noqa: BLE001 — defensive: never kill the run
+            logger.warning("CountdownHooks.on_llm_end could not read usage: %r", e)
 
     def _maybe_inject(self, input_items: list) -> None:
         """Pure logic: decide whether to append a nudge now. Two

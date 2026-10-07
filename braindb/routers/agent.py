@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from braindb.agent.agent import run_agent_query
+from braindb.agent.run_state import install_usage, release_usage
 from braindb.db import get_conn
 from braindb.services.activity_log import log_activity
 
@@ -38,14 +39,32 @@ async def agent_query(body: AgentQueryRequest):
     When AGENT_VERBOSE=true is set in the server environment, every tool call
     is logged to stdout and visible via `docker logs braindb_api`.
     """
+    # One usage ledger per request: every run it spawns (subagents, retries)
+    # adds into it. Recorded with the activity row — on failure too, or a
+    # failing request would look free — and never in the response, whose
+    # shape stays {"answer", "max_turns"}.
+    usage, usage_token = install_usage()
     try:
         result = await run_agent_query(body.query, max_turns=body.max_turns)
         with get_conn() as conn:
             log_activity(conn, "agent_query", details={
                 "query": body.query[:500],
                 "max_turns": result.get("max_turns"),
+                "usage": usage.as_dict(),
             })
         return result
     except Exception as e:
         logger.exception("Agent query failed")
+        try:
+            with get_conn() as conn:
+                log_activity(conn, "agent_query", details={
+                    "query": body.query[:500],
+                    "error": type(e).__name__,
+                    "usage": usage.as_dict(),
+                })
+        except Exception:  # noqa: BLE001 — never mask the original failure
+            logger.warning("could not record the failed agent query's usage")
         raise HTTPException(500, f"Agent failed: {e}")
+    finally:
+        logger.info("Usage (agent_query): %s", usage.line())
+        release_usage(usage_token)
