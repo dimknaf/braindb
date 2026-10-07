@@ -87,6 +87,28 @@ def get_run_tag() -> str:
     return _run_tag_var.get()
 
 
+# Need — what the caller of `/agent/query` is trying to find out, when its
+# request says so (the optional `need`). Read DOWNWARD by `recall_memory`,
+# which then has JEV keep only the recalled items useful for it; subagents
+# inherit it like the run tag. Nothing else sets it: the ingest watcher and
+# the wiki runs never state a need, so their recalls are unchanged.
+_need_var: ContextVar[str] = ContextVar("braindb_need", default="")
+
+
+def set_need(need: str) -> object:
+    """Set the current request's need; returns the reset token."""
+    return _need_var.set(need)
+
+
+def reset_need(token: object) -> None:
+    _need_var.reset(token)  # type: ignore[arg-type]
+
+
+def get_need() -> str:
+    """The current request's need, or "" when none was stated."""
+    return _need_var.get()
+
+
 def record_submit(payload: Any) -> None:
     """Called from inside every `submit_*` tool body. The SDK has already
     validated `payload` against the tool's Pydantic argument schema, so

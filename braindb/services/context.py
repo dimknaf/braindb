@@ -9,6 +9,8 @@ Context assembly:
      importance, despite the short field name; 1.0 at the seed.)
   5. Fetch always-on rules
   6. Increment access_count / accessed_at for all returned entities
+  Optional: given the caller's need, JEV keeps only the selected items the
+  model judges useful for it (services/jev.py), before steps 5-6.
 """
 import math
 from datetime import UTC, datetime, timezone
@@ -18,6 +20,7 @@ import psycopg2.extras
 
 from braindb.config import settings
 from braindb.schemas.search import ContextRequest, ContextResponse, SearchResultItem
+from braindb.services import jev
 from braindb.services.embedding_service import get_embedding_service
 from braindb.services.graph import graph_expand
 from braindb.services.keyword_service import (
@@ -256,7 +259,7 @@ def _apply_two_level_quota(
 # Main context assembly                                               #
 # ------------------------------------------------------------------ #
 
-def assemble_context(conn, req: ContextRequest) -> ContextResponse:
+def assemble_context(conn, req: ContextRequest, need: str | None = None) -> ContextResponse:
     # Normalize to list of queries
     query_list = req.queries if req.queries else [req.query]
 
@@ -583,6 +586,20 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
     # by reservation phase and a weak reserved item can sit above the
     # strongest match in the whole result.
     items.sort(key=lambda it: it.final_rank, reverse=True)
+
+    # JEV: when the caller stated what it needs, the model judges each
+    # selected item from its own text (a closed yes/no read from one token)
+    # and only the useful ones are returned and access-tracked. Order stays
+    # by final_rank; with JEV off, or on any failure, nothing changes.
+    if need:
+        raw = {str(k): r for k, r in seen.items()}
+        probs = jev.judge(need, [
+            jev.judge_text(it.entity_type, raw[str(it.id)].get("content"), it.title,
+                           it.summary, it.ext.get("disambiguation"))
+            for it in items])
+        if probs is not None:
+            items = [it for it, p in zip(items, probs)
+                     if p is None or p >= settings.jev_strictness]
 
     # Explain post-pass: keep entries only for entities that made the final
     # result, resolve winning-keyword ids to their text, attach quota phase.

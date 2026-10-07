@@ -9,10 +9,15 @@ pin the contract every caller relies on:
   logprobs) keeps it off, and every failure fails OPEN (None);
 - a refused or late item stays unjudged rather than failing the call;
 - the judge reads stored text as data: capped, special tokens neutralised;
-- logs never carry the key or the endpoint.
+- logs never carry the key or the endpoint;
+- an /agent/query `need` reaches the recalls of that request only, and only
+  while JEV is enabled.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import logging
 import math
 import time
@@ -20,7 +25,10 @@ import time
 import pytest
 import requests
 
-from braindb.agent.run_state import install_usage, release_usage
+import braindb.agent.tools as tools_mod
+import braindb.routers.agent as agent_router
+from braindb.agent.run_state import get_need, install_usage, release_usage, reset_need, set_need
+from braindb.schemas.search import ContextResponse
 from braindb.services import jev
 
 # A tiny fake tokenizer: one id per character, the two turn markers as single
@@ -196,3 +204,61 @@ def test_judge_text_is_capped_neutralised_and_reads_a_wiki_by_its_own_words():
     assert "Runs a trial" in wiki
     assert not any(s in wiki for s in ("[[ref", "section:", "wiki:meta", "**Summary"))
 
+
+# ====================================================================== #
+# The need: from the /agent/query request to its recalls                 #
+# ====================================================================== #
+
+@contextlib.contextmanager
+def _no_db():
+    yield object()
+
+
+class _RecallCtx:
+    tool_name = "recall_memory"
+
+
+def test_agent_query_carries_its_need_to_the_run_and_clears_it(monkeypatch):
+    seen = []
+
+    async def fake_query(query, max_turns=None):
+        seen.append(get_need())
+        return {"answer": "a", "max_turns": 20}
+
+    monkeypatch.setattr(agent_router, "run_agent_query", fake_query)
+    monkeypatch.setattr(agent_router, "get_conn", _no_db)
+    monkeypatch.setattr(agent_router, "log_activity", lambda *a, **k: None)
+
+    async def two_requests():
+        await agent_router.agent_query(agent_router.AgentQueryRequest(query="q", need="  what X said "))
+        between = get_need()
+        await agent_router.agent_query(agent_router.AgentQueryRequest(query="q"))
+        return between
+
+    assert asyncio.run(two_requests()) == ""
+    assert seen == ["what X said", ""]
+
+
+def test_recall_memory_passes_the_need_only_while_jev_is_enabled(monkeypatch):
+    got = []
+
+    def fake_assemble(conn, req, need=None):
+        got.append(need)
+        return ContextResponse(query="x", items=[], total_found=0)
+
+    monkeypatch.setattr(tools_mod, "assemble_context", fake_assemble)
+    monkeypatch.setattr(tools_mod, "get_conn", _no_db)
+
+    async def recall_with_need():
+        token = set_need("what X said")
+        try:
+            return await tools_mod.recall_memory.on_invoke_tool(
+                _RecallCtx(), json.dumps({"queries": ["x"]}))
+        finally:
+            reset_need(token)
+
+    monkeypatch.setattr(tools_mod.settings, "jev_enabled", False)
+    asyncio.run(recall_with_need())
+    monkeypatch.setattr(tools_mod.settings, "jev_enabled", True)
+    asyncio.run(recall_with_need())
+    assert got == ["", "what X said"]

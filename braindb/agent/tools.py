@@ -12,6 +12,7 @@ These logs go to stdout and are visible via `docker logs braindb_api`.
 
 Follows the pattern in fa-automation/tasks/linkedin_research/tools.py.
 """
+import asyncio
 import functools
 import json
 import logging
@@ -38,7 +39,7 @@ from braindb.services.keyword_service import (
 from braindb.services.search import fuzzy_search, preview, slice_content
 from braindb.services import wiki_sections as ws
 from braindb.services import wiki_jobs as wj
-from braindb.agent.run_state import get_run_tag, note_tool, record_handoff, record_submit
+from braindb.agent.run_state import get_need, get_run_tag, note_tool, record_handoff, record_submit
 from braindb.agent.schemas import (
     AgentAnswer,
     MaintainerClusterDecision,
@@ -186,8 +187,16 @@ async def recall_memory(
     """
     try:
         req = ContextRequest(queries=queries, max_results=max_results)
-        with get_conn() as conn:
-            result = assemble_context(conn, req)
+        need = get_need() if settings.jev_enabled else ""
+
+        def _recall():
+            with get_conn() as conn:
+                return assemble_context(conn, req, need=need)
+
+        # With a need (and JEV on), JEV judges the items over HTTP for a few
+        # seconds: off the event loop, so concurrent runs keep going.
+        # Otherwise the recall runs inline exactly as before.
+        result = await asyncio.to_thread(_recall) if need else _recall()
         # EVERY item must survive into the rendered output — the per-query
         # quota guarantees membership, and a blind tail-truncate would undo
         # that guarantee for low-ranked reserved items (items are sorted by

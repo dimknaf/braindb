@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from braindb.agent.agent import run_agent_query
-from braindb.agent.run_state import install_usage, release_usage
+from braindb.agent.run_state import install_usage, release_usage, reset_need, set_need
 from braindb.db import get_conn
 from braindb.services.activity_log import log_activity
 
@@ -30,6 +30,10 @@ class AgentQueryRequest(BaseModel):
     # ~35-turn tool-call iteration leaves ~30% of the window for output.
     query: str = Field(..., min_length=1, max_length=40000)
     max_turns: int | None = Field(default=None, ge=1, le=60)
+    # Optional: what the caller is trying to find out, in a sentence. With
+    # JEV enabled on a self-hosted vLLM, the agent's recalls then keep only
+    # the items the model judges useful for it. Ignored otherwise.
+    need: str | None = Field(default=None, max_length=2000)
 
 
 @router.post("/query")
@@ -44,6 +48,7 @@ async def agent_query(body: AgentQueryRequest):
     # failing request would look free — and never in the response, whose
     # shape stays {"answer", "max_turns"}.
     usage, usage_token = install_usage()
+    need_token = set_need((body.need or "").strip())
     try:
         result = await run_agent_query(body.query, max_turns=body.max_turns)
         with get_conn() as conn:
@@ -68,3 +73,4 @@ async def agent_query(body: AgentQueryRequest):
     finally:
         logger.info("Usage (agent_query): %s", usage.line())
         release_usage(usage_token)
+        reset_need(need_token)

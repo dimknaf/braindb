@@ -82,6 +82,7 @@ jobs:
             tests/test_wiki_selfheal_db.py \
             tests/test_usage_ledger.py \
             tests/test_jev.py \
+            tests/test_context_jev_db.py \
             -v
 
       - name: Dump api logs on failure
