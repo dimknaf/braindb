@@ -6,7 +6,7 @@ allowed-tools: Bash Read
 
 ## BrainDB Memory Agent
 
-BrainDB has its own internal agent (LiteLLM with pluggable provider via `LLM_PROFILE`; defaults to `deepinfra/google/gemma-4-31B-it`) that handles all memory operations. You don't call individual endpoints — you ask the agent in plain English via one endpoint: `POST http://localhost:8000/api/v1/agent/query`.
+BrainDB has its own internal agent (OpenAI Agents SDK with pluggable provider via `LLM_PROFILE`; defaults to DeepInfra's `google/gemma-4-31B-it`) that handles all memory operations. You don't call individual endpoints — you ask the agent in plain English via one endpoint: `POST http://localhost:8000/api/v1/agent/query`.
 
 ### Health check:
 !`curl -sf http://localhost:8000/health > /dev/null 2>&1 && echo "OK" || echo "BRAINDB_DOWN"`

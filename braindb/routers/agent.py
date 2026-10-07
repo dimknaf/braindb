@@ -2,8 +2,8 @@
 Agent endpoint — POST /api/v1/agent/query
 
 External callers (Claude Code, other tools) send a natural language query;
-the BrainDB agent (LiteLLM + NVIDIA NIM) handles recall/save/relate via
-its internal tools and returns a summary.
+the BrainDB agent (OpenAI Agents SDK, provider per LLM_PROFILE) handles
+recall/save/relate via its internal tools and returns a summary.
 """
 import logging
 

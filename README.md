@@ -8,7 +8,7 @@
 
 A memory database and REST API for LLM agents. Store and retrieve thoughts, facts, sources, documents, and behavioral rules — with fuzzy + semantic keyword search, graph traversal up to 3 hops, temporal decay, and always-on rule injection. Built to be driven externally by an LLM via HTTP calls.
 
-It also ships with **its own internal agent** (OpenAI Agents SDK + LiteLLM with pluggable providers — **DeepInfra is the recommended default**, with NIM / local vLLM / others available via config) so external callers can talk to BrainDB in plain English via a single endpoint instead of orchestrating individual API calls.
+It also ships with **its own internal agent** (OpenAI Agents SDK with pluggable OpenAI-compatible providers — **DeepInfra is the recommended default**, with NIM / local vLLM / others available via config) so external callers can talk to BrainDB in plain English via a single endpoint instead of orchestrating individual API calls.
 
 ---
 
@@ -92,7 +92,7 @@ External databases need the `pg_trgm` and `pgvector` extensions; the connecting 
 
 ### 4. Pick an LLM provider (for the internal agent)
 
-The agent talks to any LiteLLM-supported backend. **Recommended for new users: `deepinfra` with `google/gemma-4-31B-it`** — fast (5–30s per agent call), cheap, validated end-to-end on the wiki/maintainer/writer pipeline. `nim` is a free-tier fallback (occasionally flaky). `openai_compatible` points the agent at any OpenAI-compatible `/v1` endpoint (Ollama, LM Studio, copilot-api, a remote vLLM). The `vllm_*` profiles run a local model on your own GPU workstation — useful for offline / cost-free experiments, but require a running vLLM server reachable from the docker network (typically via SSH tunnel).
+The agent talks to any OpenAI-compatible Chat Completions backend. **Recommended for new users: `deepinfra` with `google/gemma-4-31B-it`** — fast (5–30s per agent call), cheap, validated end-to-end on the wiki/maintainer/writer pipeline. `nim` is a free-tier fallback (occasionally flaky). `openai_compatible` points the agent at any OpenAI-compatible `/v1` endpoint (Ollama, LM Studio, copilot-api, a remote vLLM). The `vllm_*` profiles run a local model on your own GPU workstation — useful for offline / cost-free experiments, but require a running vLLM server reachable from the docker network (typically via SSH tunnel).
 
 In `.env`:
 ```
@@ -104,14 +104,14 @@ NVIDIA_NIM_API_KEY=...        # if profile=nim       — get from https://build.
 For a generic OpenAI-compatible endpoint (e.g. Ollama):
 ```
 LLM_PROFILE=openai_compatible
-AGENT_MODEL=openai/llama3.2:3b              # your served model, openai/ prefix
+AGENT_MODEL=llama3.2:3b                     # your served model id
 OPENAI_BASE_URL=http://host.docker.internal:11434/v1
 OPENAI_API_KEY=                            # blank for local servers without auth
 ```
 
 Only the key matching your chosen profile needs to be filled. Leave the others blank or absent.
 
-Adding a third provider (Together, OpenAI, local vLLM, whatever) is a two-line entry in [`braindb/config.py::_LLM_PROFILES`](braindb/config.py) + an env var — no other code changes. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the recipe.
+Adding a third provider (Together, OpenAI, local vLLM, whatever) is an entry in [`braindb/config.py::_LLM_PROFILES`](braindb/config.py) (model id, key env var, base URL) + an env var — no other code changes. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the recipe.
 
 ### 5. Create the Docker network, then bring the stack up
 
@@ -194,7 +194,7 @@ Single `query` (string) still works for backward compatibility.
 
 ## The BrainDB Agent
 
-Instead of orchestrating individual API calls, you can talk to BrainDB in plain English via `POST /api/v1/agent/query`. The agent (built on the OpenAI Agents SDK + LiteLLM) decides which tools to call and returns a summary.
+Instead of orchestrating individual API calls, you can talk to BrainDB in plain English via `POST /api/v1/agent/query`. The agent (built on the OpenAI Agents SDK) decides which tools to call and returns a summary.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/agent/query \
@@ -212,10 +212,10 @@ The agent has 21 tools — every single BrainDB endpoint plus `delegate_to_subag
 
 - **`deepinfra` — recommended default.** Model `google/gemma-4-31B-it`. Fast (5–30s per agent call), cheap, validated end-to-end.
 - `nim` — NVIDIA NIM, model `google/gemma-4-31b-it`. Free tier, occasionally flaky.
-- `openai_compatible` — any OpenAI-compatible `/v1` endpoint (Ollama, LM Studio, copilot-api, remote vLLM). Set `AGENT_MODEL=openai/<model-id>` (required — no default) and `OPENAI_BASE_URL`; `OPENAI_API_KEY` is optional for local servers without auth.
+- `openai_compatible` — any OpenAI-compatible `/v1` endpoint (Ollama, LM Studio, copilot-api, remote vLLM). Set `AGENT_MODEL=<model-id>` (required — no default) and `OPENAI_BASE_URL`; `OPENAI_API_KEY` is optional for local servers without auth.
 - `vllm_workstation` / `vllm_workstation_qwen` / `vllm_workstation_gemma` — local vLLM running on your own GPU (advanced / offline; needs the server reachable from the docker network, usually via SSH tunnel).
 
-Each profile is a model-prefix + env-var pair; adding a new one is a dict entry.
+Each profile is a model id, a key env var and an OpenAI-compatible base URL; adding a new one is a dict entry.
 
 ```
 LLM_PROFILE=deepinfra         # or nim / openai_compatible / vllm_workstation
@@ -382,5 +382,5 @@ Prefer no extra container? Any static file server over `frontend/` works too, e.
 - PostgreSQL 16 with `pg_trgm` and `pgvector`
 - Alembic migrations
 - `sentence-transformers` + `Qwen/Qwen3-Embedding-0.6B` for keyword embeddings
-- `openai-agents[litellm]` + LiteLLM for the internal agent (DeepInfra / NIM / others pluggable via `LLM_PROFILE`)
+- `openai-agents` (OpenAI Agents SDK) for the internal agent (DeepInfra / NIM / any OpenAI-compatible server pluggable via `LLM_PROFILE`)
 - Docker Compose — `api` + `watcher` + `wiki_scheduler` + `frontend` services, with a bundled Postgres (default) or your own

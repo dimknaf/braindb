@@ -24,6 +24,7 @@ import time
 
 import pytest
 import requests
+from agents.tool_context import ToolContext
 
 import braindb.agent.tools as tools_mod
 import braindb.routers.agent as agent_router
@@ -120,7 +121,7 @@ def server(monkeypatch):
     monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(jev.settings, "agent_model", "")
     monkeypatch.setenv("VLLM_API_KEY", "test-secret-key")
-    fake = _FakeVLLM(model=jev.settings.resolved_agent_model.partition("/")[2])
+    fake = _FakeVLLM(model=jev.settings.resolved_agent_model)
     monkeypatch.setattr(jev, "_session", fake)
     monkeypatch.setattr(jev, "_judge", None)
     monkeypatch.setattr(jev, "_off_until", 0.0)
@@ -139,7 +140,7 @@ def test_off_unless_enabled_on_a_self_hosted_endpoint(server, ledger, monkeypatc
     assert jev.judge("need", ["[fact] GOOD"]) is None
     assert ledger.jev["calls"] == 0                     # off = not in play at all
     monkeypatch.setattr(jev.settings, "jev_enabled", True)
-    monkeypatch.setattr(jev.settings, "llm_profile", "deepinfra")  # hosted: no base URL
+    monkeypatch.setattr(jev.settings, "llm_profile", "deepinfra")  # a hosted gateway
     assert jev.judge("need", ["[fact] GOOD"]) is None
     assert ledger.jev["failopen"] == 1                  # an ON run that fell back is visible
     assert server.calls == 0
@@ -214,8 +215,11 @@ def _no_db():
     yield object()
 
 
-class _RecallCtx:
-    tool_name = "recall_memory"
+def _recall_ctx(arguments: str) -> ToolContext:
+    """A real ToolContext, as the SDK builds one for every tool call — its
+    invocation path reads more than the tool name."""
+    return ToolContext(context=None, tool_name="recall_memory",
+                       tool_call_id="call_test", tool_arguments=arguments)
 
 
 def test_agent_query_carries_its_need_to_the_run_and_clears_it(monkeypatch):
@@ -252,8 +256,8 @@ def test_recall_memory_passes_the_need_only_while_jev_is_enabled(monkeypatch):
     async def recall_with_need():
         token = set_need("what X said")
         try:
-            return await tools_mod.recall_memory.on_invoke_tool(
-                _RecallCtx(), json.dumps({"queries": ["x"]}))
+            args = json.dumps({"queries": ["x"]})
+            return await tools_mod.recall_memory.on_invoke_tool(_recall_ctx(args), args)
         finally:
             reset_need(token)
 

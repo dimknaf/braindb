@@ -22,7 +22,7 @@ keywords = [
     "pgvector",
     "embeddings",
     "fastapi",
-    "litellm",
+    "openai-agents",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -44,7 +44,8 @@ dependencies = [
     "python-dotenv==1.2.2",
     "sentence-transformers==5.5.0",
     "numpy==2.4.5",
-    "openai-agents[litellm]==0.17.2",
+    "openai-agents==0.23.1",
+    "openai==3.26.0",
     "requests==2.34.2",
 ]
 

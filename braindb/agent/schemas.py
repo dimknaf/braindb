@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # parses to anything else (list / int / null), we let Pydantic raise its
 # usual "valid dictionary" error so the LLM sees a clear correction. Dict
 # inputs are passed through untouched — well-behaved providers (deepinfra,
-# OpenAI, Anthropic via LiteLLM) see exactly the same behaviour as today.
+# OpenAI-compatible servers) see exactly the same behaviour as today.
 #
 # This is the SAME pattern as the nullable-field coercion above, just at the
 # whole-model level rather than per-field. The LLM-visible schema is

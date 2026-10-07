@@ -142,10 +142,7 @@ class _Server:
         self.base = settings.resolved_base_url.rstrip("/")
         self.root = self.base.removesuffix("/v1")  # /tokenize lives beside /v1
         self.headers = {"Authorization": f"Bearer {settings.resolved_api_key}"}
-        # LiteLLM routes on a provider prefix the server itself never sees.
-        provider, _, name = settings.resolved_agent_model.partition("/")
-        self.model = name if provider in ("openai", "hosted_vllm") and name \
-            else settings.resolved_agent_model
+        self.model = settings.resolved_agent_model
 
     def _send(self, method: str, url: str, body: dict | None) -> dict:
         for attempt in (1, 2):  # one retry on a dropped connection or a 5xx
@@ -293,7 +290,7 @@ def available(wait: float = 0.0) -> bool:
     server costs a bounded delay, never a stuck request. A failed probe logs
     one warning and keeps JEV off for REPROBE_S."""
     global _probing
-    if not settings.jev_enabled or not settings.resolved_base_url:
+    if not settings.jev_enabled or not settings.self_hosted:
         return False
     if _judge is not None:
         return True

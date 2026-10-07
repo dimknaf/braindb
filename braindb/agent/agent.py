@@ -26,9 +26,15 @@ from uuid import uuid4
 from pathlib import Path
 from typing import TypeVar
 
-from agents import Agent, ModelSettings, Runner, StopAtTools, set_tracing_disabled
-from agents.extensions.models.litellm_model import LitellmModel
-from litellm import BadRequestError, ContextWindowExceededError
+from agents import (
+    Agent,
+    ModelSettings,
+    OpenAIChatCompletionsModel,
+    Runner,
+    StopAtTools,
+    set_tracing_disabled,
+)
+from openai import AsyncOpenAI, BadRequestError, UnprocessableEntityError
 from pydantic import BaseModel
 
 from braindb.agent.hooks import CountdownHooks
@@ -166,12 +172,37 @@ def _expected_shape_hint(expected_cls: type[BaseModel]) -> str:
     return json.dumps({"payload": example_payload})
 
 
-def _model() -> LitellmModel:
-    return LitellmModel(
+_OPENAI_URL = "https://api.openai.com/v1"
+
+
+def _endpoint() -> str:
+    # No base URL configured (openai_compatible without OPENAI_BASE_URL)
+    # means OpenAI's own endpoint, named explicitly: the client would
+    # otherwise take an empty OPENAI_BASE_URL from the environment.
+    return settings.resolved_base_url or _OPENAI_URL
+
+
+def _model() -> OpenAIChatCompletionsModel:
+    # Every profile speaks the OpenAI Chat Completions protocol (hosted
+    # gateways, vLLM, Ollama, LM Studio), so the SDK's own model over the
+    # OpenAI client serves them all. A provider with its own non-OpenAI API
+    # would need a different model class here — this is the one place.
+    # The client refuses an empty key when it is built; a missing key must
+    # fail at the provider on the first request instead, as it always did.
+    return OpenAIChatCompletionsModel(
         model=settings.resolved_agent_model,
-        api_key=settings.resolved_api_key,
-        base_url=settings.resolved_base_url,
+        openai_client=AsyncOpenAI(base_url=_endpoint(),
+                                  api_key=settings.resolved_api_key or "missing-api-key"),
     )
+
+
+def _is_context_window(e: Exception) -> bool:
+    """The request is over the model's context window: vLLM and the hosted
+    gateways answer 400 with a 'maximum context length' / 'maximum model
+    length' message, OpenAI with the `context_length_exceeded` code."""
+    message = str(e).lower()
+    return (getattr(e, "code", None) == "context_length_exceeded"
+            or "context length" in message or "maximum model length" in message)
 
 
 def _build(
@@ -197,38 +228,37 @@ def _build(
     agents; see `settings.agent_wiki_reasoning_effort`.
     """
     set_tracing_disabled(disabled=True)
-    # `extra_args` is forwarded verbatim into the LiteLLM call. `timeout`
-    # lands as `kwargs["timeout"]` — which LiteLLM resolves ahead of its
-    # 600s fallback; a TRANSPORT deadline only, it never enters the request
-    # body and cannot steer the model, unlike `output_type` / `tool_choice`
-    # (see the module docstring — those stay unset deliberately). Without it
-    # a long wiki write is abandoned client-side at 600s while the server is
-    # still working.
+    # `extra_args` is forwarded verbatim into the client call. `timeout` is
+    # the OpenAI client's per-request deadline, replacing its 600s default;
+    # a TRANSPORT deadline only, it never enters the request body and cannot
+    # steer the model, unlike `output_type` / `tool_choice` (see the module
+    # docstring — those stay unset deliberately). Without it a long wiki
+    # write is abandoned client-side at 600s while the server is still
+    # working.
     #
-    # `reasoning_effort` belongs in the request BODY, but it cannot travel as
-    # a plain kwarg: the SDK's LitellmModel lifts that exact key out of
-    # `reasoning` / `extra_body` / `extra_args` and promotes it to a top-level
-    # `reasoning_effort=` argument on `litellm.acompletion()`, where LiteLLM
-    # checks it against a PER-PROVIDER allow-list — `openai` (which every
-    # OpenAI-compatible profile resolves to) does not list it, so the call
-    # raises `UnsupportedParamsError` before any request is sent. Nesting it
-    # under `chat_template_kwargs` sidesteps that: the SDK only intercepts the
-    # literal top-level key, so the dict is copied through into LiteLLM's
-    # `extra_body` and forwarded into the JSON body unfiltered, which is where
-    # vLLM reads chat-template variables from. VLLM-SPECIFIC by nature — a
-    # hosted provider may reject the unknown body key, so this stays blank
-    # unless an operator opts in on a self-hosted profile.
+    # `reasoning_effort` travels nested under `chat_template_kwargs` in the
+    # request BODY, which is where vLLM reads chat-template variables from;
+    # a top-level `reasoning_effort` is a different, provider-checked
+    # parameter (under LiteLLM it once killed every wiki job before a
+    # request was sent). VLLM-SPECIFIC by nature — a hosted provider may
+    # reject the unknown body key, so this stays blank unless an operator
+    # opts in on a self-hosted profile.
     extra_args = {"timeout": settings.agent_request_timeout}
     extra_body = (
         {"chat_template_kwargs": {"reasoning_effort": reasoning_effort}}
         if reasoning_effort else None
     )
+    # OpenAI's own endpoint keeps chat completions by default (`store`);
+    # recalled memories must not be kept there. Other endpoints get no
+    # `store` at all — a strict server could reject it.
+    store = False if _endpoint().startswith(_OPENAI_URL) else None
     agent = Agent(
         name=name,
         instructions=SYSTEM_PROMPT,
         model=_model(),
         model_settings=ModelSettings(extra_args=extra_args,
-                                     extra_body=extra_body),
+                                     extra_body=extra_body,
+                                     store=store),
         tools=[*_BASE_TOOLS, *extra_tools, submit_tool],
         tool_use_behavior=StopAtTools(
             stop_at_tool_names=["final_answer", *extra_stop_tools],
@@ -472,23 +502,22 @@ async def run_typed(
             f"The run terminated without the typed final tool firing — "
             f"the model likely ended with plain prose."
         )
-    except ContextWindowExceededError:
-        # The conversation is already over the model's window. A retry
-        # without input truncation would just hit the same wall, so we
-        # re-raise and let the router fail the job cleanly. Real fix is
-        # upstream: keep prompts/tool-results small enough that the
-        # handoff threshold catches us first. See routers/wiki.py's
-        # `_body_block_or_stub` for the prompt-side mitigation.
-        raise
-    except BadRequestError as e:
-        # Quantised models (Qwen AWQ-INT4) occasionally emit malformed
-        # JSON in tool-call args; the OpenAI client raises BadRequestError
-        # before the tool body runs. One fresh attempt usually recovers.
-        # Bounded to depth 1 via the `_bad_request_retried` flag —
-        # recursion uses run_typed itself rather than duplicating the
-        # setup. The current slot is released by `finally`; the recursive
-        # call installs its own.
-        if _bad_request_retried:
+    except (BadRequestError, UnprocessableEntityError) as e:
+        # Over the model's window: a retry without input truncation would
+        # just hit the same wall, so we re-raise and let the router fail the
+        # job cleanly. Real fix is upstream: keep prompts/tool-results small
+        # enough that the handoff threshold catches us first. See
+        # routers/wiki.py's `_body_block_or_stub` for the prompt-side
+        # mitigation.
+        #
+        # Otherwise: quantised models (Qwen AWQ-INT4) occasionally emit
+        # malformed JSON in tool-call args; the OpenAI client raises
+        # BadRequestError before the tool body runs. One fresh attempt
+        # usually recovers. Bounded to depth 1 via the
+        # `_bad_request_retried` flag — recursion uses run_typed itself
+        # rather than duplicating the setup. The current slot is released by
+        # `finally`; the recursive call installs its own.
+        if _is_context_window(e) or _bad_request_retried:
             raise
         logger.warning(
             "%s: BadRequestError on first attempt (%s); "

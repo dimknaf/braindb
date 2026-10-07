@@ -1,7 +1,7 @@
 """
 Agent endpoint smoke tests.
 
-The agent goes through LiteLLM → an external LLM provider (DeepInfra / NIM).
+The agent goes through the OpenAI client → an external LLM provider (DeepInfra / NIM).
 External calls are flaky and slow. So the assertions here are intentionally
 loose: the endpoint returns a well-formed response for a trivial prompt,
 without asserting anything about the content of the answer.

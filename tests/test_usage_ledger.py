@@ -19,6 +19,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from agents.tool_context import ToolContext
 from fastapi import HTTPException
 
 import braindb.agent.agent as agent_mod
@@ -103,8 +104,11 @@ def test_weighted_is_uncached_input_plus_four_times_output():
 # Tool calls are counted, verbose or not                                  #
 # ====================================================================== #
 
-class _Ctx:
-    tool_name = "delegate_to_subagent"
+def _ctx(arguments: str) -> ToolContext:
+    """A real ToolContext, as the SDK builds one for every tool call — its
+    invocation path reads more than the tool name."""
+    return ToolContext(context=None, tool_name="delegate_to_subagent",
+                       tool_call_id="call_test", tool_arguments=arguments)
 
 
 def test_tool_calls_are_counted_even_when_not_verbose(monkeypatch):
@@ -118,8 +122,8 @@ def test_tool_calls_are_counted_even_when_not_verbose(monkeypatch):
     monkeypatch.setattr(tools_mod.settings, "agent_verbose", False)
     ledger, token = install_usage()
     try:
-        asyncio.run(tools_mod.delegate_to_subagent.on_invoke_tool(
-            _Ctx(), json.dumps({"task": "probe"})))
+        args = json.dumps({"task": "probe"})
+        asyncio.run(tools_mod.delegate_to_subagent.on_invoke_tool(_ctx(args), args))
         assert ledger.tools == {"delegate_to_subagent": 1}
     finally:
         release_usage(token)

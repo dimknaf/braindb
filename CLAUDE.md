@@ -76,7 +76,7 @@ braindb/
 │   ├── schemas/                       # Pydantic models (entities, relations, search)
 │   ├── services/                      # search.py, graph.py, context.py, embedding_service.py,
 │   │                                  # keyword_service.py, activity_log.py
-│   └── agent/                         # Internal agent (LiteLLM + pluggable provider via LLM_PROFILE)
+│   └── agent/                         # Internal agent (OpenAI Agents SDK + pluggable provider via LLM_PROFILE)
 │       ├── agent.py                   # builder + runner (singleton)
 │       ├── tools.py                   # 21 @function_tool wrappers
 │       └── prompts/system_prompt.md   # baked-in skill content (agent-voiced)
@@ -164,7 +164,7 @@ curl -s -X DELETE http://localhost:8000/api/v1/entities/<UUID>
 
 **Direct API** (what's shown above) — call individual endpoints yourself. Full control, more verbose context. Good when you want to be precise about what's saved or recalled.
 
-**Agent endpoint** — `POST /api/v1/agent/query` — send a natural language request and let BrainDB's internal agent handle it. The agent (LiteLLM with pluggable provider via `LLM_PROFILE` — default `deepinfra/google/gemma-4-31B-it`, NIM also supported) has all 21 BrainDB operations as tools. Cleaner conversation context, but slower (5-30 seconds for a query).
+**Agent endpoint** — `POST /api/v1/agent/query` — send a natural language request and let BrainDB's internal agent handle it. The agent (OpenAI Agents SDK with pluggable provider via `LLM_PROFILE` — default DeepInfra's `google/gemma-4-31B-it`, NIM also supported) has all 21 BrainDB operations as tools. Cleaner conversation context, but slower (5-30 seconds for a query).
 
 ```bash
 # Recall via the agent

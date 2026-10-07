@@ -27,6 +27,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+from agents.tool_context import ToolContext
+
 import braindb.agent.agent as agent_mod
 import braindb.agent.tools as tools_mod
 from braindb.services.wiki_jobs import (
@@ -143,10 +145,11 @@ def test_delegate_docstring_no_longer_promises_the_full_toolset():
 # Delegation depth — per run-context, behaviourally                       #
 # ====================================================================== #
 
-class _Ctx:
-    """Minimal ToolContext stub — the SDK invocation path reads only
-    `tool_name`."""
-    tool_name = "delegate_to_subagent"
+def _ctx(arguments: str) -> ToolContext:
+    """A real ToolContext, as the SDK builds one for every tool call — its
+    invocation path reads more than the tool name."""
+    return ToolContext(context=None, tool_name="delegate_to_subagent",
+                       tool_call_id="call_test", tool_arguments=arguments)
 
 
 def test_concurrent_delegations_proceed_and_nested_is_refused(monkeypatch):
@@ -165,8 +168,8 @@ def test_concurrent_delegations_proceed_and_nested_is_refused(monkeypatch):
     state = {"active": 0, "max_active": 0, "nested_reply": None}
 
     async def call_delegate(task: str) -> str:
-        return await tools_mod.delegate_to_subagent.on_invoke_tool(
-            _Ctx(), json.dumps({"task": task}))
+        args = json.dumps({"task": task})
+        return await tools_mod.delegate_to_subagent.on_invoke_tool(_ctx(args), args)
 
     async def fake_run_typed(task, agent, schema, max_turns=None):
         state["active"] += 1
@@ -229,7 +232,7 @@ def test_verbose_tool_lines_carry_the_current_run_tag(monkeypatch, caplog):
         with caplog.at_level(_logging.INFO, logger="braindb.agent.tools"):
             reply = asyncio.run(
                 tools_mod.delegate_to_subagent.on_invoke_tool(
-                    _Ctx(), json.dumps({"task": "probe"})))
+                    _ctx('{"task": "probe"}'), '{"task": "probe"}'))
         assert "ok" in reply
         tool_lines = [r.message for r in caplog.records
                       if "delegate_to_subagent" in r.getMessage()]
@@ -259,12 +262,53 @@ def test_reasoning_effort_default_is_a_no_op():
         agent_mod._cache.clear()
 
 
+def test_context_window_errors_are_recognised_whatever_the_provider():
+    """run_typed re-raises an over-the-window request at once (a retry would
+    hit the same wall) and retries any other 400 once. The classifier must
+    see vLLM's and the gateways' 'maximum context length' / 'maximum model
+    length' messages and OpenAI's `context_length_exceeded` code."""
+    from openai import BadRequestError
+
+    class _Response:  # what the client's error reads from an HTTP response
+        status_code, headers, request = 400, {}, None
+
+    def err(message, code=None):
+        return BadRequestError(message, response=_Response(), body={"code": code} if code else None)
+
+    assert agent_mod._is_context_window(
+        err("This model's maximum context length is 40960 tokens. However, you requested 51000 tokens."))
+    assert agent_mod._is_context_window(err("request too large", code="context_length_exceeded"))
+    assert agent_mod._is_context_window(
+        err("The decoder prompt (length 51000) is longer than the maximum model length of 40960."))
+    assert not agent_mod._is_context_window(err("Invalid JSON in tool call arguments"))
+
+
+def test_agents_build_without_a_key_and_are_never_stored_on_openai(monkeypatch):
+    """The OpenAI client refuses an empty key when it is built: a missing key
+    must fail at the provider on the first request (as it always did), not
+    break agent construction. OpenAI's own endpoint keeps chat completions by
+    default, so it gets `store=False`; every other endpoint gets no `store`."""
+    from braindb.config import settings
+    monkeypatch.setattr(settings, "llm_profile", "deepinfra")
+    monkeypatch.delenv("DEEPINFRA_API_KEY", raising=False)
+    agent_mod._cache.clear()
+    try:
+        assert agent_mod.get_agent().model_settings.store is None
+        monkeypatch.setattr(settings, "llm_profile", "openai_compatible")
+        monkeypatch.setattr(settings, "openai_base_url", "")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        agent_mod._cache.clear()
+        assert agent_mod.get_agent().model_settings.store is False
+    finally:
+        agent_mod._cache.clear()
+
+
 def test_reasoning_effort_never_travels_as_a_plain_param():
-    """THE regression guard for a live outage. The SDK lifts a top-level
-    `reasoning_effort` out of extra_args/extra_body and promotes it to a
-    kwarg on litellm.acompletion(), where the `openai` provider allow-list
-    rejects it — 59 triage jobs died this way. It must ride nested inside
-    `chat_template_kwargs`, which nothing intercepts or filters."""
+    """THE regression guard for a live outage. Under LiteLLM a top-level
+    `reasoning_effort` was lifted out of extra_args/extra_body and rejected by
+    a provider allow-list — 59 triage jobs died this way. It must ride
+    nested inside `chat_template_kwargs`, where vLLM reads template
+    variables and nothing intercepts or filters it."""
     from braindb.config import settings
     monkey = settings.agent_wiki_reasoning_effort
     try:
@@ -276,7 +320,7 @@ def test_reasoning_effort_never_travels_as_a_plain_param():
         ms = agent_mod.get_writer_agent().model_settings
         assert ms.extra_body == {"chat_template_kwargs":
                                  {"reasoning_effort": "low"}}
-        # the key the SDK intercepts must appear at NEITHER top level
+        # a top-level reasoning_effort is a provider-checked parameter: NEITHER top level
         assert "reasoning_effort" not in ms.extra_body
         assert "reasoning_effort" not in ms.extra_args
     finally:

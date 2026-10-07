@@ -30,8 +30,8 @@ services:
       VLLM_API_KEY: ${VLLM_API_KEY:-}
       AGENT_VERBOSE: ${AGENT_VERBOSE:-false}
       # Per-LLM-call HTTP deadline. Default 4800s (80 min) — a ceiling, not a
-      # delay; without it LiteLLM falls back to 600s and abandons long
-      # self-hosted writes the server is still completing.
+      # delay; without it the OpenAI client falls back to 600s and abandons
+      # long self-hosted writes the server is still completing.
       AGENT_REQUEST_TIMEOUT: ${AGENT_REQUEST_TIMEOUT:-4800}
       # Reasoning effort for the WIKI agents only. Blank = server default.
       # Self-hosted vLLM only; leave blank on hosted providers.

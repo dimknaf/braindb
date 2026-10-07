@@ -47,7 +47,7 @@ def _estimate_tokens(input_items: list) -> int:
     """Cheap (no-tokenizer) prompt-token estimate: sum the text-content
     character counts and divide by 4. Defensive across the shapes the
     SDK puts into `input_items`:
-    - `{"role": str, "content": str}` (LiteLLM dict form)
+    - `{"role": str, "content": str}` (chat dict form)
     - `{"role": str, "content": [{"type":"text","text":str}, ...]}`
       (some providers send a list of parts)
     - `{"type": "function_call_output", "output": str}` — a tool result

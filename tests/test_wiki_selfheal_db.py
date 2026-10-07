@@ -38,6 +38,7 @@ import os
 import uuid
 from typing import Iterator
 
+from agents.tool_context import ToolContext
 import psycopg2
 import psycopg2.extras
 import pytest
@@ -53,15 +54,14 @@ DB_URL = os.getenv(
 )
 
 
-class _Ctx:
-    """Minimal ToolContext stub: the SDK's invocation path reads only
-    `tool_name` (agents/tool.py `_on_invoke_tool_impl`)."""
-    tool_name = "test"
-
-
 def _invoke(tool, **kwargs) -> str:
-    """Run a FunctionTool the way the SDK would, returning its string reply."""
-    return asyncio.run(tool.on_invoke_tool(_Ctx(), json.dumps(kwargs)))
+    """Run a FunctionTool the way the SDK would — with a real ToolContext,
+    since its invocation path reads more than the tool name — returning the
+    tool's string reply."""
+    args = json.dumps(kwargs)
+    ctx = ToolContext(context=None, tool_name=tool.name, tool_call_id="call_test",
+                      tool_arguments=args)
+    return asyncio.run(tool.on_invoke_tool(ctx, args))
 
 
 # ---------------------------------------------------------------- helpers --
