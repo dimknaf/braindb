@@ -1,6 +1,7 @@
 import functools
 import logging
 import os
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -274,14 +275,23 @@ class Settings(BaseSettings):
     # probability (services/jev.py). SELF-HOSTED vLLM ONLY: it needs vLLM's
     # token-id prompts, /tokenize and logprob_token_ids, and on any other
     # endpoint its first-use probe keeps it off. Off by default, and with it
-    # off nothing changes. On, a recall made while answering an /agent/query
-    # request that states a `need` keeps only the items the model judges
-    # useful for that need.
+    # off nothing changes. On, the recalls made while answering an
+    # /agent/query request that states a `need` are judged against that
+    # need, as `jev_mode` says.
     jev_enabled: bool = False
     # Minimum P(useful) an item needs to be kept. Chosen on dev needs over a
     # news memory: every threshold from 0.01 to 0.4 kept the same essential
     # items (none scored inside that band), so 0.1 sits safely inside it.
     jev_strictness: float = 0.1
+    # How JEV serves a request that states a need. "filter": a separate
+    # judge drops the recalled items it finds not useful (services/jev.py).
+    # "sheet": recall keeps every item, and the agent's own model marks the
+    # useful ones inside the agent's own conversation, from one short
+    # constrained answer per recall that is the first call of its turn
+    # (agent/jev_loop.py); a recall whose sheet does not run is unchanged.
+    # "render": the sheet's rendering (labelled items, items an earlier
+    # turn's recall showed collapsed to one line) without the model call.
+    jev_mode: Literal["filter", "sheet", "render"] = "filter"
 
     @property
     def resolved_agent_model(self) -> str:

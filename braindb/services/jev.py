@@ -16,11 +16,18 @@ worked examples in `jev_examples.json`), padded to whole cache blocks, so
 the server computes G once and reuses it. A judgement then costs only its
 short uncached tail (need + item + answer header) and ONE output token.
 
-SELF-HOSTED vLLM ONLY: it relies on vLLM's token-id prompts, `/tokenize`
-and `logprob_token_ids`. Hosted gateways answer 200 and silently drop
-`logprob_token_ids`, so `available()` proves every capability on first use
-and keeps JEV off otherwise. Every failure fails OPEN: the caller keeps
-exactly what it would have had without JEV.
+The in-loop sheet (`sheet`, used by agent/jev_loop.py) asks the same closed
+question inside the agent's own conversation instead: the request is the
+agent's next turn up to a recall's output, so the server reuses the agent's
+cached prefix and the agent's next turn reuses the request's; one short
+constrained JSON answer then says yes or no for every labelled item of the
+recall, and each answer token's probability is read back.
+
+SELF-HOSTED vLLM ONLY: it relies on vLLM's token-id prompts, `/tokenize`,
+`logprob_token_ids` and `continue_final_message`. Hosted gateways answer 200
+and silently drop `logprob_token_ids`, so `available()` proves every
+capability on first use and keeps JEV off otherwise. Every failure fails
+OPEN: the caller keeps exactly what it would have had without JEV.
 
 Plain sync functions (requests + a small thread pool); async callers wrap
 them in `asyncio.to_thread`.
@@ -67,8 +74,8 @@ ITEM_CHARS = 1024
 BLOCK = 784
 
 # Measured on that server: 30 items took 6.2 s with 4 workers and 3.7 s
-# with 8. The pool is module-wide, so concurrent recalls together never put
-# more than 8 JEV requests on a server that other work shares.
+# with 8. The pool is module-wide, so concurrent filter-mode recalls together
+# never put more than 8 JEV requests on a server that other work shares.
 WORKERS = 8
 # Past the deadline, judged items keep their scores and the rest are kept
 # unjudged, so a busy server can only cost latency, never items.
@@ -79,6 +86,19 @@ REPROBE_S = 600
 
 # Item kinds as the judge's guide names them.
 _TAG = {"datasource": "document", "thought": "note"}
+
+# The in-loop sheet's question. It is asked in an answer turn the request
+# opens after the agent's conversation, starting with an empty think block
+# so the model answers at once instead of reasoning (written the way
+# Qwen3-family templates write one; the probe proves the served model takes
+# it). Measured on held-out news needs: stating the need in the opened turn
+# lifted the sheet's AUROC (useful vs not useful items) from 0.93 to 0.98.
+SHEET_LEAD = "Relevance check of the items above (yes = useful) for:"
+_NO_THINK = "<think>\n\n</think>\n\n"
+# A sheet prefills the recall's output and writes ~4 tokens per item. A busy
+# server costs latency up to this, then the recall goes out unjudged (a
+# process's first sheet may also wait up to DEADLINE_S for the probe).
+SHEET_TIMEOUT_S = 30
 
 # A clear-cut pair the model must get right before JEV is trusted.
 _PROBE_NEED = "When did Kel Aster open the Rowan bakery?"
@@ -144,16 +164,17 @@ class _Server:
         self.headers = {"Authorization": f"Bearer {settings.resolved_api_key}"}
         self.model = settings.resolved_agent_model
 
-    def _send(self, method: str, url: str, body: dict | None) -> dict:
-        for attempt in (1, 2):  # one retry on a dropped connection or a 5xx
+    def _send(self, method: str, url: str, body: dict | None, *,
+              timeout: float | None = None, attempts: int = 2) -> dict:
+        for attempt in range(1, attempts + 1):  # by default one retry on a dropped connection or a 5xx
             try:
                 r = _session.request(method, url, json=body, headers=self.headers,
-                                     timeout=REQUEST_TIMEOUT_S)
+                                     timeout=REQUEST_TIMEOUT_S if timeout is None else timeout)
             except (requests.ConnectionError, requests.Timeout):
-                if attempt == 2:
+                if attempt == attempts:
                     raise
                 continue
-            if r.status_code >= 500 and attempt == 1:
+            if r.status_code >= 500 and attempt < attempts:
                 continue
             if r.status_code in (401, 403, 404):
                 raise _Unavailable(f"HTTP {r.status_code}")
@@ -210,10 +231,97 @@ class _Judge:
         return (mass["yes"] / total if total > 0 else None), total, usage
 
 
-def _probe() -> _Judge:
+class _Sheet:
+    """What the sheet probe proved: the server answers a constrained yes/no
+    sheet over labelled items, with each answer's probabilities."""
+
+    def __init__(self, server: _Server) -> None:
+        self.server = server
+
+    def ask(self, messages: list[dict], tools: list[dict] | None, labels: list[str],
+            need: str, options: dict | None = None,
+            attempts: int = 1) -> tuple[dict[str, float], float, dict]:
+        """P(yes) per label, the lowest yes+no mass among the answers, and the
+        usage. `messages` end with items labelled [A], [B], ...; the request
+        opens an answer turn with the question, and a JSON schema forces one
+        "yes" or "no" per label, in label order. A label missing from the
+        result was not judged."""
+        schema = {"type": "object", "properties": {L: {"enum": ["yes", "no"]} for L in labels},
+                  "required": list(labels), "additionalProperties": False}
+        body = {"model": self.server.model, "temperature": 0,
+                "messages": messages + [{"role": "assistant",
+                                         "content": f"{_NO_THINK}{SHEET_LEAD} {need}\n"}],
+                "continue_final_message": True, "add_generation_prompt": False,
+                "max_tokens": 8 * len(labels) + 16, "logprobs": True, "top_logprobs": 5,
+                "response_format": {"type": "json_schema", "json_schema": {
+                    "name": "sheet", "schema": schema, "strict": True}},
+                **(options or {})}
+        if tools:  # rendered as in the agent's own prompt, but no call may be made
+            body.update(tools=tools, tool_choice="none")
+        out = self.server._send("POST", self.server.base + "/chat/completions", body,
+                                timeout=SHEET_TIMEOUT_S, attempts=attempts)
+        probs: dict[str, float] = {}
+        masses = []
+        try:
+            choice = out["choices"][0]
+            answers = iter(labels)
+            for t in choice["logprobs"]["content"]:  # the generated yes/no tokens, in label order
+                if t["token"] in ("yes", "no") and (label := next(answers, None)) is not None:
+                    alts = {a["token"]: math.exp(a["logprob"]) for a in t["top_logprobs"]}
+                    alts.setdefault(t["token"], math.exp(t["logprob"]))
+                    py, pn = alts.get("yes", 0.0), alts.get("no", 0.0)
+                    if py + pn > 0:
+                        probs[label] = py / (py + pn)
+                        masses.append(py + pn)
+            text = next((choice["message"].get(k) for k in ("content", "reasoning_content", "reasoning")
+                         if choice["message"].get(k)), "")
+        except (KeyError, IndexError, TypeError):
+            raise _Unavailable("the server did not return the sheet's logprobs") from None
+        try:
+            keys = list(json.loads(text))
+        except (ValueError, TypeError):
+            keys = None  # cut short: labels it never reached stay unjudged
+        if keys is not None and keys != list(labels):
+            probs = {}  # answers out of label order cannot be matched to items
+        u = out.get("usage") or {}
+        usage = {"input": u.get("prompt_tokens") or 0,
+                 "cached": (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                 "output": u.get("completion_tokens") or 0}
+        return probs, min(masses, default=0.0), usage
+
+
+# The sheet probe: a recall as the agent sees one, holding the clear-cut pair,
+# with a tool rendered but not callable, as in every real sheet.
+_PROBE_TOOLS = [{"type": "function", "function": {
+    "name": "recall_memory", "description": "Recall memories.",
+    "parameters": {"type": "object", "properties": {"queries": {"type": "array", "items": {"type": "string"}}},
+                   "required": ["queries"]}}}]
+_PROBE_RECALL = [
+    {"role": "user", "content": _PROBE_NEED},
+    {"role": "assistant", "content": None, "tool_calls": [{
+        "id": "call_probe", "type": "function",
+        "function": {"name": "recall_memory", "arguments": '{"queries": ["Rowan bakery"]}'}}]},
+    {"role": "tool", "tool_call_id": "call_probe",
+     "content": f"Found 2 items:\n[A] {_PROBE_YES}\n[B] {_PROBE_NO}"},
+]
+
+
+def _probe_sheet(server: _Server) -> _Sheet:
+    sheet_ = _Sheet(server)
+    probs, mass, usage = sheet_.ask(_PROBE_RECALL, _PROBE_TOOLS, ["A", "B"], _PROBE_NEED, attempts=2)
+    if len(probs) < 2 or mass < 0.5 or probs["A"] - probs["B"] < 0.5:
+        raise _Unavailable("the model does not answer the probe sheet reliably")
+    logger.info("JEV on: in-loop sheets; the probe used %d uncached tokens",
+                usage["input"] - usage["cached"])
+    return sheet_
+
+
+def _probe() -> _Judge | _Sheet:
     server = _Server()
     if server.model not in {m.get("id") for m in server.get("/models").get("data", [])}:
         raise _Unavailable("the agent model is not served by this endpoint")
+    if settings.jev_mode == "sheet":
+        return _probe_sheet(server)
     options = {}
     for answer, spellings in _SPELLINGS.items():
         ids = [server.encode(s) for s in spellings]
@@ -256,7 +364,7 @@ def _probe() -> _Judge:
     return judge_
 
 
-_judge: _Judge | None = None
+_judge: _Judge | _Sheet | None = None  # what the probe proved, for the configured mode
 _off_until = 0.0
 _probing: threading.Event | None = None  # set when the running probe ends
 _lock = threading.Lock()
@@ -354,7 +462,7 @@ def judge(need: str, texts: list[str]) -> list[float | None] | None:
     usage = {"requests": 0, "input": 0, "cached": 0, "output": 0}
     probs = None
     # A first call waits for the probe; that wait counts against its deadline.
-    if available(wait=DEADLINE_S) and (judge_ := _judge) is not None:
+    if available(wait=DEADLINE_S) and isinstance(judge_ := _judge, _Judge):
         try:
             probs = _judge_all(judge_, need, texts, usage, started + DEADLINE_S)
         except _Unavailable as e:
@@ -368,3 +476,39 @@ def judge(need: str, texts: list[str]) -> list[float | None] | None:
                     len(texts) - unjudged, len(texts), time.monotonic() - started,
                     usage["input"], usage["cached"], usage["output"])
     return probs
+
+
+def sheet(messages: list[dict], tools: list[dict] | None, labels: list[str], need: str,
+          options: dict | None = None) -> dict[str, float] | None:
+    """P(useful) per label for the labelled items of a recall, judged inside
+    the agent's own conversation by ONE short constrained answer. `messages`
+    are the agent's next turn up to the recall's output, and `tools` and
+    `options` (chat-template arguments) are the agent's own, so the server
+    renders the agent's prompt and reuses it from its cache. Returns None
+    when JEV is off, the need is blank, or the sheet failed or came back
+    incomplete: the caller then shows the recall as it would without JEV.
+    Usage, fail-opens and unjudged labels go to the request's ledger."""
+    need = _clean(need or "")[:NEED_CHARS]
+    if not settings.jev_enabled or not need or not labels:
+        return None
+    started = time.monotonic()
+    usage = {"requests": 0, "input": 0, "cached": 0, "output": 0}
+    probs = None
+    if available(wait=DEADLINE_S) and isinstance(sheet_ := _judge, _Sheet):
+        try:
+            probs, _, u = sheet_.ask(messages, tools, labels, need, options)
+            usage = {"requests": 1, **u}
+        except _Unavailable as e:
+            _switch_off(e)
+        except _ItemError:
+            probs = {}  # refused: this recall stays unjudged
+        except Exception as e:  # noqa: BLE001 - unreachable, overloaded or too slow
+            logger.warning("JEV failed open: %s", type(e).__name__)
+    unjudged = len(labels) - len(probs) if probs is not None else 0
+    add_usage("jev", calls=1, failopen=int(probs is None), unjudged=unjudged, **usage)
+    if probs is None:
+        return None
+    logger.info("JEV sheet judged %d/%d items in %.1fs (in=%d cached=%d out=%d)",
+                len(probs), len(labels), time.monotonic() - started,
+                usage["input"], usage["cached"], usage["output"])
+    return probs if not unjudged else None

@@ -37,11 +37,14 @@ from agents import (
 from openai import AsyncOpenAI, BadRequestError, UnprocessableEntityError
 from pydantic import BaseModel
 
+from braindb.agent import jev_loop
 from braindb.agent.hooks import CountdownHooks
 from braindb.agent.run_state import (
     get_run_tag,
+    install_loop,
     install_slot,
     install_usage,
+    release_loop,
     release_slot,
     release_usage,
     reset_run_tag,
@@ -397,6 +400,9 @@ async def run_typed(
     # into the ledger its caller installed; only the outermost one reports.
     usage, usage_token = install_usage()
     usage.add_tag(get_run_tag())
+    # In-loop JEV reads this run's conversation from a record the hooks
+    # keep (run_state.py); recorded only when it serves this request.
+    loop_token = install_loop() if jev_loop.wanted() else None
     # Layer-3 nudge: when the run is about to exhaust `max_turns`, the hook
     # appends a synthetic "you have N turns left, finalise via final_answer"
     # user message to the conversation. One nudge per run; disabled when
@@ -532,6 +538,7 @@ async def run_typed(
         if usage_token is not None:
             logger.info("Usage [%s] (%s): %s", get_run_tag(), agent.name, usage.line())
         release_usage(usage_token)
+        release_loop(loop_token)
         reset_run_tag(tag_token)
         release_slot(token)
 
