@@ -53,6 +53,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--db-label", default=None,
                    help="the database the API at --api-base really uses, recorded in "
                         "conversation_meta.json (default: braindb_conv_<id>)")
+    p.add_argument("--with-need", action="store_true",
+                   help="also send each question's `need` (a field of --probing-json items) with "
+                        "the query, so a JEV-enabled API filters its recalls by it")
     p.add_argument("--api-base", required=True,
                    help="braindb API base, e.g. http://api_bench_conv1:8001")
     p.add_argument("--output-dir", required=True,
@@ -124,6 +127,7 @@ def main() -> int:
     raw_payloads_by_category: dict[str, list[dict]] = {}
     question_errors = 0
     questions_kept = 0
+    needs_sent = 0
     started = time.monotonic()
 
     for category, questions in probing.items():
@@ -152,11 +156,14 @@ def main() -> int:
                     flush=True,
                 )
                 continue
+            need = q.get("need") if args.with_need else None
+            needs_sent += bool(need)
             try:
                 ans, payload = answer_one_question(
                     question_text,
                     base=args.api_base,
                     timeout=args.question_timeout,
+                    need=need,
                 )
                 print(
                     f"  [{category} {i}/{len(questions)}] OK "
@@ -206,6 +213,8 @@ def main() -> int:
         "bench_db_name": args.db_label or (f"braindb_conv_{int(conv_id):03d}" if conv_id else None),
         "phase_c_only": True,
         "errors_only_mode": args.errors_only,
+        "with_need": args.with_need,
+        "needs_sent": needs_sent,
         "api_base": args.api_base,
     }
     out.joinpath("conversation_meta.json").write_text(

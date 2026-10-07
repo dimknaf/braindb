@@ -332,8 +332,11 @@ def answer_one_question(
     question_text: str,
     base: str = BENCH_API_BASE,
     timeout: float = QUESTION_TIMEOUT_SECONDS,
+    need: str | None = None,
 ) -> tuple[str, dict]:
     """POST /agent/query with the question; return (answer_text, raw_payload).
+
+    `need`, when given, is sent as the request's `need` (JEV runs).
 
     Three-attempt retry with 5s/10s backoff. Retries on connection errors,
     timeouts, and HTTP 5xx — these are the transient classes (API recycling,
@@ -348,7 +351,7 @@ def answer_one_question(
         try:
             r = requests.post(
                 f"{base}/api/v1/agent/query",
-                json={"query": question_text},
+                json={"query": question_text, **({"need": need} if need else {})},
                 timeout=timeout,
             )
         except (requests.ConnectionError, requests.Timeout) as e:
