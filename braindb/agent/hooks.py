@@ -189,6 +189,7 @@ class CountdownHooks(RunHooks):
                 cached=getattr(u.input_tokens_details, "cached_tokens", 0),
                 output=u.output_tokens,
                 reasoning=getattr(u.output_tokens_details, "reasoning_tokens", 0),
+                peak=u.input_tokens,
             )
             record_response(response)  # in-loop JEV; a no-op without a loop record
         except Exception as e:  # noqa: BLE001 — defensive: never kill the run

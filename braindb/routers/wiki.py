@@ -15,13 +15,14 @@ from pathlib import Path
 from fastapi import APIRouter, Query
 
 from braindb import custom_profile
-from braindb.agent.agent import run_typed, get_maintainer_agent, get_writer_agent
+from braindb.agent.agent import run_typed, get_gated_writer_agent, get_maintainer_agent, get_writer_agent
 from braindb.agent.run_state import install_handoff_slot, release_handoff_slot
 from braindb.agent.schemas import MaintainerClusterDecision, MaintainerClusterItem, WikiWriteResult
 from braindb.config import settings
 from braindb.db import get_conn
 from braindb.services.activity_log import log_activity
-from braindb.services import wiki_jobs, wiki_triage
+from braindb.services import wiki_gate, wiki_jobs, wiki_triage
+from braindb.services.wiki_sections import parse_sections
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ router = APIRouter(prefix="/api/v1/wiki", tags=["wiki"])
 _PROMPTS = Path(__file__).parent.parent / "agent" / "prompts"
 _MAINTAINER_PROMPT = (_PROMPTS / "wiki_maintainer_prompt.md").read_text(encoding="utf-8")
 _WRITER_PROMPT = (_PROMPTS / "wiki_writer_prompt.md").read_text(encoding="utf-8")
+_GATED_STEPS = (_PROMPTS / "wiki_writer_gated.md").read_text(encoding="utf-8")
 
 
 def _now_line() -> str:
@@ -334,6 +336,74 @@ _INLINE_BODY_MAX_CHARS = 4000
 _DENSITY_NUDGE_CHARS = 30000
 
 
+# The writer prompt's research steps (Step 1 gather, Step 2 the identity
+# subagent, Step 3 write for the resolved entity), which the gate's outcome
+# replaces: from this heading up to the next one.
+_STEPS = ("## Mandatory order of work", "## Identity discipline")
+
+# How much of a long page's target sections a gated job shows inline.
+_GATED_SECTIONS_MAX_CHARS = 12000
+
+
+def _gated_template(tmpl: str, gate) -> str | None:
+    """The writer template with its research steps replaced by the gate's
+    facts, or None when the template does not hold those steps."""
+    a, b = tmpl.find(_STEPS[0]), tmpl.find(_STEPS[1])
+    if a < 0 or b < a:
+        return None
+    return tmpl[:a] + _GATED_STEPS.replace("%%FOUND%%", _members_block(gate.found)) + tmpl[b:]
+
+
+def _gated_body_block(wiki_id: str, revision: int, old_body: str, gate) -> str:
+    """A long page as a gated job sees it: the outline, where each kept fact
+    goes, and only those sections in full (within a budget)."""
+    _, sections = parse_sections(old_body)
+    targets: dict[str, list[str]] = {}
+    for fid, name in gate.sections.items():
+        targets.setdefault(name, []).append(fid)
+    unplaced = [f["id"] for f in gate.members + gate.found if f["id"] not in gate.sections]
+    shown, too_long, budget = [], [], _GATED_SECTIONS_MAX_CHARS
+    for s in sections:
+        if s.name in targets:
+            if s.char_count <= budget:
+                shown.append(f"<!-- section: {s.name} -->\n{s.content.strip()}")
+                budget -= s.char_count
+            else:
+                too_long.append(s.name)
+    lines = [f"[BODY OMITTED — {len(old_body)} chars, too large to inline (wiki_id {wiki_id}, revision {revision}).",
+             "Outline (section: chars):"]
+    lines += [f"- {s.name}: {s.char_count}" for s in sections]
+    lines.append("This job's facts belong in these sections (section <- fact ids):")
+    lines += [f"- {'a NEW section (name it)' if name == 'new' else name} <- {', '.join(ids)}"
+              for name, ids in targets.items()]
+    if unplaced:
+        lines.append(f"Place these yourself, reading the sections you need: {', '.join(unplaced)}")
+    if too_long:
+        lines.append(f"Too long to show here; read before replacing: {', '.join(too_long)}")
+    lines.append(("Those sections are shown in full below. " if shown else "")
+                 + "Read another section with read_wiki_section whenever the job's rules need it (the header, "
+                 "the references, a section a fact also changes). Edit with edit_wiki_section (expect_revision "
+                 'as above), then validate_wiki and final_answer(mode="attach", body="").]'
+                 + _density_nudge(len(old_body)))
+    return "\n".join(lines) + ("\n\n" + "\n\n".join(shown) if shown else "")
+
+
+def _density_nudge(chars: int) -> str:
+    """The paragraph a page above _DENSITY_NUDGE_CHARS adds to its stub."""
+    if chars <= _DENSITY_NUDGE_CHARS:
+        return ""
+    return (
+        f"\n\nThis page is ALREADY LONG ({chars} chars). Prefer\n"
+        f"density over growth: integrate into existing prose rather than\n"
+        f"append parallel sentences, and where a NON-member detail you\n"
+        f"turned up belongs to a neighbouring subject, name that page in\n"
+        f"prose instead of restating it here — or leave it out; it stays\n"
+        f"an orphan and comes back for its own page later. This never\n"
+        f"applies to a MEMBER of this job: every member must be cited\n"
+        f"here regardless of length."
+    )
+
+
 def _body_block_or_stub(mode: str, wiki_id: str | None, old_body: str) -> str:
     """For attach mode with a body too large to safely inline, return a
     stub directing the agent to use the section tools instead. Small
@@ -341,18 +411,7 @@ def _body_block_or_stub(mode: str, wiki_id: str | None, old_body: str) -> str:
     if not old_body:
         return "(none — create mode)"
     if mode == "attach" and wiki_id and len(old_body) > _INLINE_BODY_MAX_CHARS:
-        nudge = ""
-        if len(old_body) > _DENSITY_NUDGE_CHARS:
-            nudge = (
-                f"\n\nThis page is ALREADY LONG ({len(old_body)} chars). Prefer\n"
-                f"density over growth: integrate into existing prose rather than\n"
-                f"append parallel sentences, and where a NON-member detail you\n"
-                f"turned up belongs to a neighbouring subject, name that page in\n"
-                f"prose instead of restating it here — or leave it out; it stays\n"
-                f"an orphan and comes back for its own page later. This never\n"
-                f"applies to a MEMBER of this job: every member must be cited\n"
-                f"here regardless of length."
-            )
+        nudge = _density_nudge(len(old_body))
         return (
             f"[BODY OMITTED — {len(old_body)} chars, too large to inline.\n"
             f"Use the section tools to navigate without consuming context:\n"
@@ -374,7 +433,10 @@ async def wiki_write():
     content gate, no manifest, no code-built ledger. The only guarantees are
     process/bookkeeping: the prior version is snapshotted (reversible) and
     `summarises` relations are reconciled *additively* from the LLM's inline
-    refs. The LLM researches with its own tools before writing.
+    refs. The LLM researches with its own tools before writing — unless
+    JEV_WIKI_GATE settles an attach/create job first: the writer then gets
+    only the facts the gate kept (and, on a long page, only the sections they
+    belong in) and edits without research tools (services/wiki_gate.py).
     """
     # 1. Pick + claim a bucket.
     with get_conn() as conn:
@@ -452,6 +514,20 @@ async def wiki_write():
             )
         )
 
+    # 1b. The JEV gate (JEV_WIKI_GATE, services/wiki_gate.py): which facts
+    #     reach the writer and, on a page too long to inline, which sections
+    #     it is shown, taken as one-token picks before it starts. None (off,
+    #     consolidate, or anything the gate cannot settle) -> the full writer.
+    gate = None
+    try:
+        if mode in ("attach", "create") and wiki_gate.wanted():
+            gate = await asyncio.to_thread(
+                wiki_gate.prepare, mode, canonical, old_body, members,
+                mode == "attach" and len(old_body) > _INLINE_BODY_MAX_CHARS)
+    except Exception:
+        logger.exception("JEV wiki gate failed; the full writer runs")
+        gate = None
+
     def _related_wikis_block(rows: list[dict]) -> str:
         if not rows:
             return "(none — no neighbouring pages exist yet)"
@@ -476,13 +552,21 @@ async def wiki_write():
     # `.add.md` fragments are appended after substitution. No active profile ->
     # both are no-ops and this prompt is byte-identical to the base.
     _writer_tmpl = custom_profile.replace_or_base(_WRITER_PROMPT, "wiki_writer")
+    # With the gate, the research steps' outcome is given: its facts replace
+    # them, and a long page shows only the sections those facts belong in.
+    _gated = _gated_template(_writer_tmpl, gate) if gate else None
+    if _gated is None:
+        gate = None  # off, or not the template the gate was written for
+    long_gated = gate is not None and mode == "attach" and len(old_body) > _INLINE_BODY_MAX_CHARS
     prompt = (
-        _writer_tmpl
+        (_gated or _writer_tmpl)
         .replace("%%MODE%%", mode)
         .replace("%%CANONICAL%%", canonical)
         .replace("%%WIKI_ID%%", bucket["target_wiki_id"] or "(assigned after write)")
-        .replace("%%MEMBERS%%", _members_block(members))
-        .replace("%%CURRENT_BODY%%", _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
+        .replace("%%MEMBERS%%", _members_block(gate.members if gate else members))
+        .replace("%%CURRENT_BODY%%",
+                 _gated_body_block(bucket["target_wiki_id"], wiki["revision"], old_body, gate) if long_gated
+                 else _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
         .replace("%%RELATED_WIKIS%%", _related_wikis_block(related))
         .replace("%%DUPLICATES%%", _dupes_block(dupes))
     ) + _now_line() + custom_profile.additions("wiki_writer")
@@ -523,8 +607,10 @@ async def wiki_write():
     handoff_slot, handoff_token = install_handoff_slot()
     try:
         try:
+            # Built here so a build failure releases the jobs like any agent error.
+            writer_agent = get_gated_writer_agent() if gate else get_writer_agent()
             res: WikiWriteResult = await run_typed(
-                prompt, get_writer_agent(), WikiWriteResult, max_turns=30,
+                prompt, writer_agent, WikiWriteResult, max_turns=30,
                 token_budget=settings.agent_writer_handoff_token_budget,
             )
             depth = 0
@@ -570,7 +656,7 @@ async def wiki_write():
                     depth, max_depth, mode, job_ids,
                 )
                 res = await run_typed(
-                    f"{prompt}\n\n{seed}", get_writer_agent(), WikiWriteResult,
+                    f"{prompt}\n\n{seed}", writer_agent, WikiWriteResult,
                     max_turns=30,
                     token_budget=settings.agent_writer_handoff_token_budget,
                 )
@@ -592,6 +678,7 @@ async def wiki_write():
                                      "result": disp, "mode": mode,
                                      "jobs": job_ids,
                                      "error": "handoff depth exhausted",
+                                     **({"gate": gate.record()} if gate else {}),
                                  })
                 return {"written": 0, "result": disp,
                         "reason": "handoff depth exhausted"}
@@ -605,6 +692,7 @@ async def wiki_write():
                              bucket.get("target_wiki_id"), details={
                                  "result": disp, "mode": mode,
                                  "jobs": job_ids, "error": str(e)[:500],
+                                 **({"gate": gate.record()} if gate else {}),
                              })
             return {"written": 0, "result": disp, "reason": str(e)}
     finally:
@@ -672,6 +760,7 @@ async def wiki_write():
                                  "revision": pre_revision,
                                  "members": len(member_ids),
                                  "members_gone": gone, **rel,
+                                 **({"gate": gate.record()} if gate else {}),
                              })
             logger.info(
                 "writer no-op accepted: pre_rev=%s, all %d members already "
@@ -747,6 +836,7 @@ async def wiki_write():
         log_activity(conn, "wiki_write", "wiki", wiki_id, details={
             "mode": mode, "revision": revision, "jobs": job_ids,
             "members": len(member_ids), "retired": retired, **rel,
+            **({"gate": gate.record()} if gate else {}),
         })
 
     return {"written": 1, "wiki_id": wiki_id, "mode": mode,

@@ -250,6 +250,8 @@ def record_handoff(progress_summary: str, remaining_work: str) -> None:
 #
 # `weighted` = uncached input + 4 x output: cached input costs ~nothing on a
 # self-hosted server, and output tokens dominate both time and cost.
+# `peak` = the largest single LLM request's input: the most context any one
+# turn carried, which sums alone cannot show.
 
 
 class _Usage:
@@ -258,7 +260,7 @@ class _Usage:
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.agent = {"requests": 0, "input": 0, "cached": 0, "output": 0, "reasoning": 0}
+        self.agent = {"requests": 0, "input": 0, "cached": 0, "output": 0, "reasoning": 0, "peak": 0}
         self.jev = {"calls": 0, "requests": 0, "input": 0, "cached": 0, "output": 0,
                     "failopen": 0, "unjudged": 0, "skipped": 0}
         self.tools: dict[str, int] = {}
@@ -268,7 +270,10 @@ class _Usage:
         with self.lock:
             bucket = getattr(self, kind)
             for k, v in counts.items():
-                bucket[k] = bucket.get(k, 0) + int(v or 0)
+                if k == "peak":  # a maximum, not a sum
+                    bucket[k] = max(bucket.get(k, 0), int(v or 0))
+                else:
+                    bucket[k] = bucket.get(k, 0) + int(v or 0)
 
     def note_tool(self, name: str) -> None:
         with self.lock:
@@ -293,7 +298,7 @@ class _Usage:
         w_jev = j["input"] - j["cached"] + 4 * j["output"]
         tools = ",".join(f"{k}={v}" for k, v in sorted(d["tools"].items())) or "-"
         return (f"agent req={a['requests']} in={a['input']} cached={a['cached']} "
-                f"out={a['output']} reasoning={a['reasoning']} weighted={w_agent} | "
+                f"out={a['output']} reasoning={a['reasoning']} peak={a['peak']} weighted={w_agent} | "
                 f"jev calls={j['calls']} req={j['requests']} in={j['input']} "
                 f"cached={j['cached']} out={j['output']} failopen={j['failopen']} "
                 f"skipped={j['skipped']} weighted={w_jev} | tools {tools}")

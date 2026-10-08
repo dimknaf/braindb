@@ -299,6 +299,14 @@ class Settings(BaseSettings):
     # under a custom profile that replaces the maintainer's prompt; a
     # profile's maintainer additions shape the agent's decisions only.
     jev_wiki_triage: bool = False
+    # The wiki writer behind a JEV gate (services/wiki_gate.py): which facts
+    # reach the writer (identity) and which sections of a long page it is
+    # shown (placement) are one-token picks taken before it starts; the
+    # writer then edits with only those, and no research tools. Attach and
+    # create jobs only; anything the gate cannot settle runs the full writer
+    # as before. SELF-HOSTED vLLM ONLY; off by default, and off under a
+    # custom profile that replaces the writer's prompt.
+    jev_wiki_gate: bool = False
 
     @property
     def resolved_agent_model(self) -> str:

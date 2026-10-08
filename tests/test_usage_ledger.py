@@ -56,10 +56,11 @@ def _hooks() -> CountdownHooks:
 def test_on_llm_end_adds_each_calls_usage_to_the_ledger():
     ledger, token = install_usage()
     try:
-        asyncio.run(_hooks().on_llm_end(None, None, _response()))
         asyncio.run(_hooks().on_llm_end(None, None, _response(500, 0, 10, 0)))
-        assert ledger.agent == {"requests": 2, "input": 1500, "cached": 800,
-                                "output": 60, "reasoning": 30}
+        asyncio.run(_hooks().on_llm_end(None, None, _response()))
+        asyncio.run(_hooks().on_llm_end(None, None, _response(700, 0, 0, 0)))
+        assert ledger.agent == {"requests": 3, "input": 2200, "cached": 800,
+                                "output": 60, "reasoning": 30, "peak": 1000}  # peak = the largest request
     finally:
         release_usage(token)
 

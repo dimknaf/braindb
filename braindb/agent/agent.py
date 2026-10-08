@@ -214,6 +214,8 @@ def _build(
     extra_tools: tuple = (),
     extra_stop_tools: tuple[str, ...] = (),
     reasoning_effort: str = "",
+    instructions: str = SYSTEM_PROMPT,
+    base_tools: tuple | None = None,
 ) -> Agent:
     """Build an agent. NOTE: no `output_type` — see module docstring. The
     structured contract lives on `submit_tool`'s argument schema, not on
@@ -229,6 +231,10 @@ def _build(
 
     `reasoning_effort` (blank = send nothing) is passed only by the wiki
     agents; see `settings.agent_wiki_reasoning_effort`.
+
+    `instructions` and `base_tools` default to the shared system prompt and
+    `_BASE_TOOLS`; only the gated writer replaces them (it has no search,
+    memory or delegation tools, so its system prompt must not offer them).
     """
     set_tracing_disabled(disabled=True)
     # `extra_args` is forwarded verbatim into the client call. `timeout` is
@@ -257,12 +263,12 @@ def _build(
     store = False if _endpoint().startswith(_OPENAI_URL) else None
     agent = Agent(
         name=name,
-        instructions=SYSTEM_PROMPT,
+        instructions=instructions,
         model=_model(),
         model_settings=ModelSettings(extra_args=extra_args,
                                      extra_body=extra_body,
                                      store=store),
-        tools=[*_BASE_TOOLS, *extra_tools, submit_tool],
+        tools=[*(_BASE_TOOLS if base_tools is None else base_tools), *extra_tools, submit_tool],
         tool_use_behavior=StopAtTools(
             stop_at_tool_names=["final_answer", *extra_stop_tools],
         ),
@@ -284,6 +290,8 @@ def _cached(
     extra_tools: tuple = (),
     extra_stop_tools: tuple[str, ...] = (),
     reasoning_effort: str = "",
+    instructions: str = SYSTEM_PROMPT,
+    base_tools: tuple | None = None,
 ) -> Agent:
     a = _cache.get(key)
     if a is None:
@@ -292,6 +300,8 @@ def _cached(
             extra_tools=extra_tools,
             extra_stop_tools=extra_stop_tools,
             reasoning_effort=reasoning_effort,
+            instructions=instructions,
+            base_tools=base_tools,
         )
         _cache[key] = a
     return a
@@ -346,6 +356,23 @@ def get_writer_agent() -> Agent:
         extra_tools=_WRITER_EXTRA_TOOLS,
         extra_stop_tools=_WRITER_EXTRA_STOP_TOOLS,
         reasoning_effort=settings.agent_wiki_reasoning_effort,
+    )
+
+
+_GATED_WRITER_PROMPT = (Path(__file__).parent / "prompts" / "writer_gated_system.md").read_text(encoding="utf-8")
+
+
+def get_gated_writer_agent() -> Agent:
+    """The writer behind the JEV gate (services/wiki_gate.py): the page's own
+    tools only — no recall, search, subagent or entity writes — so the facts
+    the gate left out cannot come back and its context holds only the job."""
+    return _cached(
+        "writer_gated", "BrainDB Wiki Writer", submit_wiki,
+        extra_tools=_WRITER_EXTRA_TOOLS,
+        extra_stop_tools=_WRITER_EXTRA_STOP_TOOLS,
+        reasoning_effort=settings.agent_wiki_reasoning_effort,
+        instructions=_GATED_WRITER_PROMPT,
+        base_tools=(),
     )
 
 

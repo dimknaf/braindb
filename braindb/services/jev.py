@@ -155,6 +155,10 @@ def judge_text(entity_type: str, content: str | None, title: str | None = None,
 
 
 _session = requests.Session()
+# Every JEV request counts toward one limit, whichever feature sends it (the
+# judge, wiki triage, the wiki gate), so together they never put more than
+# this many requests on a server that other work shares.
+_in_flight = threading.BoundedSemaphore(WORKERS)
 
 
 class _Server:
@@ -169,10 +173,17 @@ class _Server:
 
     def _send(self, method: str, url: str, body: dict | None, *,
               timeout: float | None = None, attempts: int = 2) -> dict:
+        limit = REQUEST_TIMEOUT_S if timeout is None else timeout
         for attempt in range(1, attempts + 1):  # by default one retry on a dropped connection or a 5xx
             try:
-                r = _session.request(method, url, json=body, headers=self.headers,
-                                     timeout=REQUEST_TIMEOUT_S if timeout is None else timeout)
+                # Waiting for a free slot is bounded like the request itself,
+                # so a full limit costs a caller its timeout, never a hang.
+                if not _in_flight.acquire(timeout=limit):
+                    raise requests.Timeout("every JEV request slot stayed busy")
+                try:
+                    r = _session.request(method, url, json=body, headers=self.headers, timeout=limit)
+                finally:
+                    _in_flight.release()
             except (requests.ConnectionError, requests.Timeout):
                 if attempt == attempts:
                     raise
