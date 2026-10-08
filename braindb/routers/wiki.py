@@ -6,6 +6,7 @@ the Stage-2 `wiki_scheduler` sidecar. `/cron` and `/jobs` are pure SQL and
 non-destructive; `/maintain` and `/write` (later steps) drive the existing
 agent endpoint.
 """
+import asyncio
 import logging
 import re
 from datetime import datetime, timezone
@@ -16,11 +17,11 @@ from fastapi import APIRouter, Query
 from braindb import custom_profile
 from braindb.agent.agent import run_typed, get_maintainer_agent, get_writer_agent
 from braindb.agent.run_state import install_handoff_slot, release_handoff_slot
-from braindb.agent.schemas import MaintainerClusterDecision, WikiWriteResult
+from braindb.agent.schemas import MaintainerClusterDecision, MaintainerClusterItem, WikiWriteResult
 from braindb.config import settings
 from braindb.db import get_conn
 from braindb.services.activity_log import log_activity
-from braindb.services import wiki_jobs
+from braindb.services import wiki_jobs, wiki_triage
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ async def wiki_maintain():
     call; each seed's own triage job is then closed with its own status
     (skip→rejected, attach→done+suggestion, …), exactly as in the
     one-at-a-time path. A singleton (or flag off) is just a 1-seed unit.
+    With JEV_WIKI_TRIAGE on, JEV first decides the seeds it can with
+    one-token picks (services/wiki_triage.py); the agent decides the rest.
     """
     # 1. Claim the unit (primary + related) + per-seed staleness guard — one txn.
     with get_conn() as conn:
@@ -114,46 +117,66 @@ async def wiki_maintain():
         # numbering used to resolve its chosen number(s) back to ids below.
         cat = wiki_jobs.list_active_wikis(conn)
 
-    # 2. ONE agent call for all live seeds. The prompt directs it to RESEARCH
-    #    EACH seed's own subject (recall_memory / view_tree / delegate) before
-    #    deciding — co-occurrence is not identity. Returns one decision per seed.
-    catalog_txt = (
-        "\n".join(
-            f"{i}. {w['canonical_name']} ({w['char_count']}ch)"
-            for i, w in enumerate(cat, 1)
-        )
-        or "(no existing wikis yet — attach/consolidate are impossible; "
-           "use create/skip/ambiguous)"
-    )
-    # Optional custom-profile shaping: a `.replace.md` may swap the template
-    # (before `.format`), and `.add.md` fragments are appended AFTER `.format`
-    # (so a fragment's literal `{`/`}` can never reach str.format). No active
-    # profile -> both are no-ops and this prompt is byte-identical to the base.
-    _maintainer_tmpl = custom_profile.replace_or_base(_MAINTAINER_PROMPT, "wiki_maintainer")
-    prompt = _maintainer_tmpl.format(
-        seeds=_seeds_block(seeds), wiki_catalog=catalog_txt
-    ) + _now_line() + custom_profile.additions("wiki_maintainer")
-    # `run_typed` returns an SDK-validated MaintainerClusterDecision, or raises
-    # if the model never submitted — handled below like any agent failure.
-    try:
-        res: MaintainerClusterDecision = await run_typed(
-            prompt, get_maintainer_agent(), MaintainerClusterDecision, max_turns=30
-        )
-    except Exception as e:
-        logger.exception("maintainer agent failed")
-        with get_conn() as conn:
-            wiki_jobs.finish_jobs(conn, [s["job_id"] for s in seeds], "failed",
-                                  f"agent error: {e}"[:500])
-            # A crashed run must be visible in the DB audit trail too, not
-            # only in wiki_job.last_error and the container log.
-            log_activity(conn, "wiki_maintain", None, None, details={
-                "result": "failed",
-                "jobs": [s["job_id"] for s in seeds],
-                "error": str(e)[:500],
-            })
-        return {"claimed": len(jobs), "result": "failed", "reason": str(e)}
+    # 2a. JEV triage (JEV_WIKI_TRIAGE, services/wiki_triage.py): each seed it
+    #     decides with one-token picks skips the agent run; the rest go to the
+    #     agent below. Off -> nothing here runs and every seed goes to the agent.
+    by_id: dict[str, MaintainerClusterItem] = {}
+    if wiki_triage.wanted():
+        try:
+            by_id = await asyncio.to_thread(wiki_triage.decide, seeds, cat)
+        except Exception:
+            logger.exception("JEV wiki triage failed; the agent decides every seed")
+    jev_ids = set(by_id)
+    agent_seeds = [s for s in seeds if s["brief"]["id"] not in jev_ids]
+    agent_error: str | None = None
 
-    by_id = {d.entity_id: d for d in res.decisions}
+    # 2. ONE agent call for all live seeds JEV did not decide. The prompt
+    #    directs it to RESEARCH EACH seed's own subject (recall_memory /
+    #    view_tree / delegate) before deciding — co-occurrence is not
+    #    identity. Returns one decision per seed.
+    if agent_seeds:
+        catalog_txt = (
+            "\n".join(
+                f"{i}. {w['canonical_name']} ({w['char_count']}ch)"
+                for i, w in enumerate(cat, 1)
+            )
+            or "(no existing wikis yet — attach/consolidate are impossible; "
+               "use create/skip/ambiguous)"
+        )
+        # Optional custom-profile shaping: a `.replace.md` may swap the
+        # template (before `.format`), and `.add.md` fragments are appended
+        # AFTER `.format` (so a fragment's literal `{`/`}` can never reach
+        # str.format). No active profile -> both are no-ops and this prompt is
+        # byte-identical to the base.
+        _maintainer_tmpl = custom_profile.replace_or_base(_MAINTAINER_PROMPT, "wiki_maintainer")
+        prompt = _maintainer_tmpl.format(
+            seeds=_seeds_block(agent_seeds), wiki_catalog=catalog_txt
+        ) + _now_line() + custom_profile.additions("wiki_maintainer")
+        # `run_typed` returns an SDK-validated MaintainerClusterDecision, or
+        # raises if the model never submitted — handled below like any agent
+        # failure.
+        try:
+            res: MaintainerClusterDecision = await run_typed(
+                prompt, get_maintainer_agent(), MaintainerClusterDecision, max_turns=30
+            )
+        except Exception as e:
+            logger.exception("maintainer agent failed")
+            with get_conn() as conn:
+                wiki_jobs.finish_jobs(conn, [s["job_id"] for s in agent_seeds], "failed",
+                                      f"agent error: {e}"[:500])
+                # A crashed run must be visible in the DB audit trail too,
+                # not only in wiki_job.last_error and the container log.
+                log_activity(conn, "wiki_maintain", None, None, details={
+                    "result": "failed",
+                    "jobs": [s["job_id"] for s in agent_seeds],
+                    "error": str(e)[:500],
+                })
+            if not jev_ids:
+                return {"claimed": len(jobs), "result": "failed", "reason": str(e)}
+            agent_error = f"agent error: {e}"[:500]  # JEV's decisions still apply below
+        else:
+            # The agent saw only its own seeds; JEV's decisions stand.
+            by_id.update({d.entity_id: d for d in res.decisions if d.entity_id not in jev_ids})
 
     # 3. Per seed: apply its decision + close its OWN job (same resolution as the
     #    one-at-a-time path). A seed the model omitted is released for a normal
@@ -164,6 +187,9 @@ async def wiki_maintain():
             for s in seeds:
                 eid = s["brief"]["id"]
                 d = by_id.get(eid)
+                if d is None and agent_error:
+                    outcomes[eid] = {"action": "failed", "error": agent_error}  # job closed above
+                    continue
                 if d is None:
                     wiki_jobs.release_or_fail_jobs(
                         conn, [s["job_id"]], "maintainer omitted this seed")
@@ -171,7 +197,8 @@ async def wiki_maintain():
                     continue
                 outcomes[eid] = _apply_decision(
                     conn, decision=d.model_dump(), orphan=s["brief"],
-                    job_id=s["job_id"], cat=cat, batch_id=batch_id)
+                    job_id=s["job_id"], cat=cat, batch_id=batch_id,
+                    decided_by="jev" if eid in jev_ids else None)
         except Exception:
             logger.exception("maintainer persistence failed")
             raise
@@ -196,7 +223,8 @@ def _seeds_block(seeds: list[dict]) -> str:
 
 
 def _apply_decision(conn, *, decision: dict, orphan: dict, job_id: str,
-                    cat: list[dict], batch_id: str | None) -> dict:
+                    cat: list[dict], batch_id: str | None,
+                    decided_by: str | None = None) -> dict:
     """Resolve ONE maintainer decision for one seed and close THAT seed's triage
     job — the exact attach/create/consolidate/skip handling used in the
     one-at-a-time path, applied per seed. Wikis are referenced by catalog NUMBER
@@ -271,8 +299,11 @@ def _apply_decision(conn, *, decision: dict, orphan: dict, job_id: str,
         wiki_jobs.finish_job(conn, job_id, "failed", f"unknown action {action!r}")
         outcome = {"action": action, "error": "unknown action"}
 
+    # Who decided is part of the audit trail once JEV triage is on (agent
+    # decisions keep their rows as they were).
     log_activity(conn, "wiki_maintain", orphan["entity_type"], orphan_id,
-                 details={"job_id": job_id, **outcome})
+                 details={"job_id": job_id, **outcome,
+                          **({"decided_by": decided_by} if decided_by else {})})
     return outcome
 
 

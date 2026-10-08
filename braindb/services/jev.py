@@ -111,6 +111,9 @@ class _Unavailable(Exception):
     never a URL, a key or stored text."""
 
 
+Unavailable = _Unavailable  # the name callers outside this module catch (`Choice` raises it)
+
+
 class _ItemError(Exception):
     """The server refused ONE request (400/413/422): that item stays unjudged."""
 
@@ -202,6 +205,26 @@ class _Server:
             "chat_template_kwargs": {"enable_thinking": False}, **options})["tokens"]
 
 
+def _split(server: _Server, turns: list[dict]) -> tuple[list[int], list[int]]:
+    """`turns` plus one more user turn through the server's template, cut
+    where that turn's content goes: the fixed tokens before it, and the
+    tokens after it (the end of the turn and the answer header). Two
+    renderings that differ only in a one-character final message share
+    everything before it, and what follows it is the header."""
+    a = server.render(turns + [{"role": "user", "content": "\x01"}], add_generation_prompt=True)
+    b = server.render(turns + [{"role": "user", "content": "\x02"}], add_generation_prompt=True)
+    n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+    return a[:n], a[n + len(server.encode("\x01")):]
+
+
+def _usage(out: dict) -> dict:
+    """One response's token usage, as the usage ledger counts it."""
+    u = out.get("usage") or {}
+    return {"input": u.get("prompt_tokens") or 0,
+            "cached": (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+            "output": u.get("completion_tokens") or 0}
+
+
 class _Judge:
     """What the probe proved, reused by every judgement: the padded prefix G,
     the answer header + lead, and the yes/no token ids."""
@@ -223,12 +246,8 @@ class _Judge:
                     for answer, ids in self.options.items()}
         except (KeyError, IndexError, TypeError):
             raise _Unavailable("the server did not return the requested logprobs") from None
-        u = out.get("usage") or {}
-        usage = {"input": u.get("prompt_tokens") or 0,
-                 "cached": (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
-                 "output": u.get("completion_tokens") or 0}
         total = mass["yes"] + mass["no"]
-        return (mass["yes"] / total if total > 0 else None), total, usage
+        return (mass["yes"] / total if total > 0 else None), total, _usage(out)
 
 
 class _Sheet:
@@ -283,11 +302,7 @@ class _Sheet:
             keys = None  # cut short: labels it never reached stay unjudged
         if keys is not None and keys != list(labels):
             probs = {}  # answers out of label order cannot be matched to items
-        u = out.get("usage") or {}
-        usage = {"input": u.get("prompt_tokens") or 0,
-                 "cached": (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
-                 "output": u.get("completion_tokens") or 0}
-        return probs, min(masses, default=0.0), usage
+        return probs, min(masses, default=0.0), _usage(out)
 
 
 # The sheet probe: a recall as the agent sees one, holding the clear-cut pair,
@@ -333,21 +348,17 @@ def _probe() -> _Judge | _Sheet:
     for ex in json.loads((_PROMPTS / "jev_examples.json").read_text(encoding="utf-8")):
         turns += [{"role": "user", "content": _user(ex["need"], ex["item"])},
                   {"role": "assistant", "content": f"{LEAD} {ex['useful']}"}]
-    # G and the answer header are cut from the template's own rendering: two
-    # renderings that differ only in a one-character final message share
-    # everything before it (G), and what follows it is the header.
-    a = server.render(turns + [{"role": "user", "content": "\x01"}], add_generation_prompt=True)
-    b = server.render(turns + [{"role": "user", "content": "\x02"}], add_generation_prompt=True)
-    n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
-    tail = a[n + len(server.encode("\x01")):] + server.encode(LEAD)
+    # G and the answer header are cut from the template's own rendering.
+    fixed, header = _split(server, turns)
+    tail = header + server.encode(LEAD)
     sample = _user(_PROBE_NEED, _PROBE_YES)
     reference = server.render(
         turns + [{"role": "user", "content": sample}, {"role": "assistant", "content": LEAD}],
         add_generation_prompt=False, continue_final_message=True)
-    if a[:n] + server.encode(sample) + tail != reference:
+    if fixed + server.encode(sample) + tail != reference:
         raise _Unavailable("the assembled prompt differs from the chat template")
-    pad = -n % BLOCK
-    judge_ = _Judge(server, a[:n] + server.encode("\n") * pad, tail, options)
+    n, pad = len(fixed), -len(fixed) % BLOCK
+    judge_ = _Judge(server, fixed + server.encode("\n") * pad, tail, options)
     # The logprobs must come back and the model must get a clear-cut pair
     # right; these two requests also put G in the cache.
     p_yes, mass_yes, u_yes = judge_.ask(_PROBE_NEED, _PROBE_YES)
@@ -512,3 +523,80 @@ def sheet(messages: list[dict], tools: list[dict] | None, labels: list[str], nee
                 len(probs), len(labels), time.monotonic() - started,
                 usage["input"], usage["cached"], usage["output"])
     return probs if not unjudged else None
+
+
+# ====================================================================== #
+# Choices — one-token picks from a cached prompt family                   #
+# ====================================================================== #
+#
+# The judge's mechanics for any closed question with named options. A prompt
+# family's fixed text (a guide + worked examples as chat turns) is rendered
+# once into a prefix G padded to whole cache blocks, so the server computes it
+# once for every request; a request adds only its own text (encoded once and
+# reused by every pick on it), the answer header (thinking off: the template
+# writes an empty think block) and a short lead, and the answer is the NEXT
+# token, read as probabilities over the options. One output token per
+# decision; the model's words are never parsed. `write` is the one exception,
+# for the rare piece of genuinely new content a decision needs (e.g. a new
+# page's name): a short line under the same prefix.
+
+
+class Choice:
+    """A cached prompt family for one-token picks (see above), on the agent
+    profile's own server."""
+
+    def __init__(self, system: str, examples: list[tuple[str, str]]) -> None:
+        self.server = server = _Server()
+        turns = [{"role": "system", "content": system}]
+        for user, answer in examples:
+            turns += [{"role": "user", "content": user}, {"role": "assistant", "content": answer}]
+        fixed, self.tail = _split(server, turns)   # tail: end of the user turn + answer header
+        self.pad = -len(fixed) % BLOCK              # blank lines up to whole cache blocks
+        self.g = fixed + server.encode("\n") * self.pad
+        self._leads: dict[str, list[int]] = {}      # a family's leads are a few fixed strings
+
+    def encode(self, text: str) -> list[int]:
+        """A request's own text as tokens, for every pick on it."""
+        return self.server.encode(_clean(text))
+
+    def options(self, words: list[str]) -> dict[str, list[int]]:
+        """Option word -> its single-token spellings (leading space; as given and capitalised)."""
+        out = {}
+        for w in words:
+            ids = sorted({i[0] for s in (f" {w}", f" {w[:1].upper()}{w[1:]}")
+                          if len(i := self.server.encode(s)) == 1})
+            if not ids:
+                raise _Unavailable(f"option {w!r} is not one token for this model")
+            out[w] = ids
+        return out
+
+    def _prompt(self, body: list[int], lead: str) -> list[int]:
+        if lead not in self._leads:
+            self._leads[lead] = self.server.encode(lead)
+        return self.g + body + self.tail + self._leads[lead]
+
+    def ask(self, body: list[int], lead: str,
+            options: dict[str, list[int]]) -> tuple[dict[str, float], float, dict]:
+        """Each option's probability as the next token after the lead, for the
+        request text `body` (from `encode`), the mass the options hold
+        together, and the usage."""
+        ids = sorted({i for v in options.values() for i in v})
+        out = self.server.complete({"prompt": self._prompt(body, lead), "max_tokens": 1, "temperature": 0,
+                                    "logprobs": 0, "logprob_token_ids": ids,
+                                    "return_tokens_as_token_ids": True})
+        try:
+            top = out["choices"][0]["logprobs"]["top_logprobs"][0]
+            raw = {o: sum(math.exp(top[f"token_id:{i}"]) for i in v) for o, v in options.items()}
+        except (KeyError, IndexError, TypeError):
+            raise _Unavailable("the server did not return the requested logprobs") from None
+        mass = sum(raw.values())
+        return {o: (p / mass if mass > 0 else 0.0) for o, p in raw.items()}, mass, _usage(out)
+
+    def write(self, body: list[int], lead: str, max_tokens: int = 16) -> tuple[str, dict]:
+        """A short line of new content after the lead, thinking off; "" when
+        the line did not end within `max_tokens` (a cut-off line is no answer)."""
+        out = self.server.complete({"prompt": self._prompt(body, lead), "max_tokens": max_tokens,
+                                    "temperature": 0, "stop": ["\n"]})
+        choice = out["choices"][0]
+        line = (choice.get("text") or "").strip() if choice.get("finish_reason") == "stop" else ""
+        return line, _usage(out)

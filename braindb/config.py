@@ -292,6 +292,13 @@ class Settings(BaseSettings):
     # "render": the sheet's rendering (labelled items, items an earlier
     # turn's recall showed collapsed to one line) without the model call.
     jev_mode: Literal["filter", "sheet", "render"] = "filter"
+    # Wiki triage by JEV (services/wiki_triage.py): the maintainer's per-seed
+    # decision (action + target wiki) taken as one-token picks instead of an
+    # agent run; seeds it cannot decide confidently still go to the agent.
+    # SELF-HOSTED vLLM ONLY, like the rest of JEV. Off by default, and off
+    # under a custom profile that replaces the maintainer's prompt; a
+    # profile's maintainer additions shape the agent's decisions only.
+    jev_wiki_triage: bool = False
 
     @property
     def resolved_agent_model(self) -> str:
