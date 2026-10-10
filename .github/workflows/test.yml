@@ -82,7 +82,6 @@ jobs:
             tests/test_wiki_selfheal_db.py \
             tests/test_usage_ledger.py \
             tests/test_jev.py \
-            tests/test_jev_loop.py \
             tests/test_wiki_triage.py \
             tests/test_wiki_triage_db.py \
             tests/test_wiki_gate.py \

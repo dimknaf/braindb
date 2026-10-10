@@ -23,7 +23,6 @@ from uuid import UUID
 
 import psycopg2.extras
 from agents import function_tool
-from agents.tool_context import ToolContext
 
 from braindb.config import settings
 from braindb.db import get_conn
@@ -40,15 +39,7 @@ from braindb.services.keyword_service import (
 from braindb.services.search import fuzzy_search, preview, slice_content
 from braindb.services import wiki_sections as ws
 from braindb.services import wiki_jobs as wj
-from braindb.agent import jev_loop
-from braindb.agent.run_state import (
-    get_loop,
-    get_need,
-    get_run_tag,
-    note_tool,
-    record_handoff,
-    record_submit,
-)
+from braindb.agent.run_state import get_need, get_run_tag, note_tool, record_handoff, record_submit
 from braindb.agent.schemas import (
     AgentAnswer,
     MaintainerClusterDecision,
@@ -124,8 +115,7 @@ def _verbose(name: str):
                 # Bind positional args to param names for readable logging
                 bound = {}
                 for i, val in enumerate(args):
-                    # A tool's run context (it carries the run's input) is not an argument.
-                    if i < len(param_names) and not isinstance(val, ToolContext):
+                    if i < len(param_names):
                         bound[param_names[i]] = val
                 bound.update(kwargs)
                 try:
@@ -159,7 +149,6 @@ def _verbose(name: str):
 @function_tool
 @_verbose("recall_memory")
 async def recall_memory(
-    ctx: ToolContext,
     queries: list[str],
     max_results: int = settings.recall_default_max_results,
 ) -> str:
@@ -198,9 +187,7 @@ async def recall_memory(
     """
     try:
         req = ContextRequest(queries=queries, max_results=max_results)
-        # Filter mode drops what JEV judges not useful; in-loop JEV keeps
-        # retrieval as it is and works on the rendering below.
-        need = get_need() if settings.jev_enabled and settings.jev_mode == "filter" else ""
+        need = get_need() if settings.jev_enabled else ""
 
         def _recall():
             with get_conn() as conn:
@@ -228,25 +215,16 @@ async def recall_memory(
             return s[:cap] + f"...(+{len(s) - cap} chars; get_entity for full)"
 
         lines = [f"Found {result.total_found} items:"]
-        entries = []  # (entity id, entity type, entry), for in-loop JEV
         for item in result.items:
-            entry = (
+            lines.append(
                 f"[{item.entity_type}] rank={item.final_rank:.3f} src={item.source or '-'}\n"
                 f"  id: {item.id}\n"
                 f"  content: {_clip(item.content, content_budget)}\n"
                 f"  keywords: {_clip(', '.join(item.keywords), 120)}"
             )
-            lines.append(entry)
-            entries.append((str(item.id), item.entity_type, entry))
         for rule in result.always_on_rules:
             lines.append(f"[RULE priority={rule.ext.get('priority')}] {rule.content}")
-        text = _truncate("\n".join(lines))
-        # In-loop JEV (agent/jev_loop.py) when this run records its loop.
-        loop = get_loop()
-        if loop is None:
-            return text
-        return await jev_loop.annotate(ctx, loop, lines[0], entries, lines[1 + len(entries):],
-                                       text, _truncate)
+        return _truncate("\n".join(lines))
     except Exception as e:
         return _err(str(e))
 

@@ -31,8 +31,8 @@ class AgentQueryRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=40000)
     max_turns: int | None = Field(default=None, ge=1, le=60)
     # Optional: what the caller is trying to find out, in a sentence. With
-    # JEV enabled on a self-hosted vLLM, the agent's recalls are judged
-    # against it (see `jev_mode` in config.py). Ignored otherwise.
+    # JEV enabled on a self-hosted vLLM, the agent's recalls then keep only
+    # the items the model judges useful for it. Ignored otherwise.
     need: str | None = Field(default=None, max_length=2000)
 
 

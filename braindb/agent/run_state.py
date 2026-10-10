@@ -88,8 +88,8 @@ def get_run_tag() -> str:
 
 
 # Need — what the caller of `/agent/query` is trying to find out, when its
-# request says so (the optional `need`). Read DOWNWARD by `recall_memory`
-# and `run_typed`, so JEV can judge the recalled items against it; subagents
+# request says so (the optional `need`). Read DOWNWARD by `recall_memory`,
+# which then has JEV keep only the recalled items useful for it; subagents
 # inherit it like the run tag. Nothing else sets it: the ingest watcher and
 # the wiki runs never state a need, so their recalls are unchanged.
 _need_var: ContextVar[str] = ContextVar("braindb_need", default="")
@@ -107,66 +107,6 @@ def reset_need(token: object) -> None:
 def get_need() -> str:
     """The current request's need, or "" when none was stated."""
     return _need_var.get()
-
-
-# Loop record — one agent run's conversation, as its next turn will read it.
-# In-loop JEV (agent/jev_loop.py) asks its question inside the agent's OWN
-# conversation, so it needs that conversation; a tool never sees it. So
-# `CountdownHooks` records it here: before each LLM call, the system prompt
-# and the input items as sent (before any nudge, which lasts one call only);
-# after it, the response's items. A recall made by that response reads both.
-# `run_typed` installs a record only when in-loop JEV serves the request;
-# a nested run (a subagent has its own conversation) installs its own. Same
-# discipline as the slots: a mutable object in a ContextVar.
-
-
-class _Loop:
-    """The conversation of one agent run, and the recalled entity ids it has
-    shown, each with the turn that first showed it."""
-    __slots__ = ("turn", "agent", "system", "items", "response", "shown")
-
-    def __init__(self) -> None:
-        self.turn = 0
-        self.agent: Any = None
-        self.system: str | None = None
-        self.items: list = []
-        self.response: list = []
-        self.shown: dict[str, int] = {}
-
-
-_loop_var: ContextVar["_Loop | None"] = ContextVar("braindb_loop", default=None)
-
-
-def install_loop() -> object:
-    """Start recording a run's conversation; returns the token for
-    `release_loop`."""
-    return _loop_var.set(_Loop())
-
-
-def release_loop(token: object | None) -> None:
-    if token is not None:
-        _loop_var.reset(token)  # type: ignore[arg-type]
-
-
-def get_loop() -> "_Loop | None":
-    """The current run's record, or None when none is installed."""
-    return _loop_var.get()
-
-
-def record_turn(agent: Any, system_prompt: str | None, input_items: list) -> None:
-    """Called before each LLM call, with the items about to be sent."""
-    loop = _loop_var.get()
-    if loop is not None:
-        loop.turn += 1
-        loop.agent, loop.system = agent, system_prompt
-        loop.items, loop.response = list(input_items), []
-
-
-def record_response(response: Any) -> None:
-    """Called after each LLM call with its `ModelResponse`."""
-    loop = _loop_var.get()
-    if loop is not None:
-        loop.response = list(response.to_input_items())
 
 
 def record_submit(payload: Any) -> None:
@@ -262,7 +202,7 @@ class _Usage:
         self.lock = threading.Lock()
         self.agent = {"requests": 0, "input": 0, "cached": 0, "output": 0, "reasoning": 0, "peak": 0}
         self.jev = {"calls": 0, "requests": 0, "input": 0, "cached": 0, "output": 0,
-                    "failopen": 0, "unjudged": 0, "skipped": 0}
+                    "failopen": 0, "unjudged": 0}
         self.tools: dict[str, int] = {}
         self.tags: list[str] = []
 
@@ -301,7 +241,7 @@ class _Usage:
                 f"out={a['output']} reasoning={a['reasoning']} peak={a['peak']} weighted={w_agent} | "
                 f"jev calls={j['calls']} req={j['requests']} in={j['input']} "
                 f"cached={j['cached']} out={j['output']} failopen={j['failopen']} "
-                f"skipped={j['skipped']} weighted={w_jev} | tools {tools}")
+                f"weighted={w_jev} | tools {tools}")
 
 
 _usage_var: ContextVar["_Usage | None"] = ContextVar("braindb_usage", default=None)
