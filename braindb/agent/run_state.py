@@ -109,6 +109,90 @@ def get_need() -> str:
     return _need_var.get()
 
 
+# Reading question — what an /agent/query request's long reads are read for
+# by the JEV reader (services/reader.py): its need, else its query when it
+# is short enough to read for. Set by the router only while the reader is
+# on; read DOWNWARD by `run_typed` and `get_entity`; subagents inherit it
+# like the need. Wiki runs never have one, so their reads are unchanged.
+_reading_var: ContextVar[str] = ContextVar("braindb_reading", default="")
+
+
+def set_reading(question: str) -> object:
+    """Set the current request's reading question; returns the reset token."""
+    return _reading_var.set(question)
+
+
+def reset_reading(token: object) -> None:
+    _reading_var.reset(token)  # type: ignore[arg-type]
+
+
+def get_reading() -> str:
+    """The current request's reading question, or "" when it has none."""
+    return _reading_var.get()
+
+
+# Loop record — one agent run's conversation, as its next turn will read it.
+# The JEV reader reads a long body INSIDE the agent's own conversation: its
+# requests are the agent's next turn up to the tool's output, so the server
+# reuses what the agent already computed, and the agent's next turn what the
+# reader read. A tool never sees the conversation, so `CountdownHooks`
+# records it here: before each LLM call, the system prompt and the input
+# items as sent (before any nudge, which lasts one call only); after it, the
+# response's items. `run_typed` installs a record only when the reader serves
+# the request, and None otherwise, so a nested run (a subagent has its own
+# conversation) never writes into its caller's. Same discipline as the
+# slots: a mutable object in a ContextVar.
+
+
+class _Loop:
+    """The conversation of one agent run: the agent, its system prompt, the
+    items of its latest LLM call and that call's response items, and the
+    entities the reader has read in this run (asked for again, they are
+    pages the agent wants as they are)."""
+    __slots__ = ("agent", "system", "items", "response", "read")
+
+    def __init__(self) -> None:
+        self.agent: Any = None
+        self.system: str | None = None
+        self.items: list = []
+        self.response: list = []
+        self.read: set[str] = set()
+
+
+_loop_var: ContextVar["_Loop | None"] = ContextVar("braindb_loop", default=None)
+
+
+def install_loop(record: bool = True) -> object:
+    """Start recording a run's conversation (with `record` False, this run
+    records none); returns the token for `release_loop`."""
+    return _loop_var.set(_Loop() if record else None)
+
+
+def release_loop(token: object | None) -> None:
+    if token is not None:
+        _loop_var.reset(token)  # type: ignore[arg-type]
+
+
+def get_loop() -> "_Loop | None":
+    """The current run's record, or None when none is installed."""
+    return _loop_var.get()
+
+
+def record_turn(agent: Any, system_prompt: str | None, input_items: list) -> None:
+    """Called before each LLM call, with the items about to be sent."""
+    loop = _loop_var.get()
+    if loop is not None:
+        loop.agent, loop.system = agent, system_prompt
+        loop.items, loop.response = list(input_items), []
+
+
+def record_response(response: Any) -> None:
+    """Called after each LLM call with its `ModelResponse`."""
+    loop = _loop_var.get()
+    if loop is not None:
+        loop.response = list(response.to_input_items())
+
+
 def record_submit(payload: Any) -> None:
     """Called from inside every `submit_*` tool body. The SDK has already
     validated `payload` against the tool's Pydantic argument schema, so

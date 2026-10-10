@@ -11,8 +11,16 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from braindb.agent.agent import run_agent_query
-from braindb.agent.run_state import install_usage, release_usage, reset_need, set_need
+from braindb.agent.run_state import (
+    install_usage,
+    release_usage,
+    reset_need,
+    reset_reading,
+    set_need,
+    set_reading,
+)
 from braindb.db import get_conn
+from braindb.services import reader
 from braindb.services.activity_log import log_activity
 
 logger = logging.getLogger(__name__)
@@ -32,7 +40,8 @@ class AgentQueryRequest(BaseModel):
     max_turns: int | None = Field(default=None, ge=1, le=60)
     # Optional: what the caller is trying to find out, in a sentence. With
     # JEV enabled on a self-hosted vLLM, the agent's recalls then keep only
-    # the items the model judges useful for it. Ignored otherwise.
+    # the items the model judges useful for it, and with the JEV reader on,
+    # its long reads are read for it. Ignored otherwise.
     need: str | None = Field(default=None, max_length=2000)
 
 
@@ -49,6 +58,10 @@ async def agent_query(body: AgentQueryRequest):
     # shape stays {"answer", "max_turns"}.
     usage, usage_token = install_usage()
     need_token = set_need((body.need or "").strip())
+    # What the JEV reader reads long bodies for: the need, else a short query
+    # (services/reader.py). Empty while the reader is off.
+    reading_token = set_reading(
+        reader.reading_question(body.need, body.query) if reader.wanted() else "")
     try:
         result = await run_agent_query(body.query, max_turns=body.max_turns)
         with get_conn() as conn:
@@ -73,4 +86,5 @@ async def agent_query(body: AgentQueryRequest):
     finally:
         logger.info("Usage (agent_query): %s", usage.line())
         release_usage(usage_token)
+        reset_reading(reading_token)
         reset_need(need_token)

@@ -39,9 +39,12 @@ from pydantic import BaseModel
 
 from braindb.agent.hooks import CountdownHooks
 from braindb.agent.run_state import (
+    get_reading,
     get_run_tag,
+    install_loop,
     install_slot,
     install_usage,
+    release_loop,
     release_slot,
     release_usage,
     reset_run_tag,
@@ -87,10 +90,27 @@ from braindb.agent.tools import (
     view_tree,
 )
 from braindb.config import settings
+from braindb.services import reader
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system_prompt.md").read_text(encoding="utf-8")
+
+# With the JEV reader on (services/reader.py), the agents that read entities
+# for a request — the answering agent and its subagents — also carry how a
+# long read is judged, with worked examples: the reader asks its one-token
+# question inside their own conversation, so their system prompt is where
+# the examples are cached. On needs over long pages they lifted the
+# reader's separation of needed pieces from the rest (AUROC 0.81 to 0.90 on
+# dev, 0.88 held out) and put 0.99 of the answer's probability on yes or no.
+_READER_SECTION = (Path(__file__).parent / "prompts" / "reader_system.md").read_text(encoding="utf-8")
+
+
+def _reading_prompt() -> str:
+    """The system prompt of an agent that reads for a request."""
+    if settings.jev_reader and settings.self_hosted:
+        return f"{SYSTEM_PROMPT.rstrip()}\n\n{_READER_SECTION}"
+    return SYSTEM_PROMPT
 
 # Every tool except the final submit (that one is typed per purpose).
 _BASE_TOOLS = [
@@ -339,7 +359,7 @@ _SUBAGENT_EXTRA_TOOLS = (
 
 def get_agent() -> Agent:
     """Default agent: general recall/save (public /agent/query)."""
-    return _cached("answer", "BrainDB Memory Agent", submit_answer)
+    return _cached("answer", "BrainDB Memory Agent", submit_answer, instructions=_reading_prompt())
 
 
 def get_maintainer_agent() -> Agent:
@@ -379,7 +399,8 @@ def get_subagent() -> Agent:
     # subagent runs are overwhelmingly wiki work.
     return _cached("subagent", "BrainDB Subagent", submit_subagent,
                    extra_tools=_SUBAGENT_EXTRA_TOOLS,
-                   reasoning_effort=settings.agent_wiki_reasoning_effort)
+                   reasoning_effort=settings.agent_wiki_reasoning_effort,
+                   instructions=_reading_prompt())
 
 
 def create_braindb_agent() -> Agent:
@@ -424,6 +445,10 @@ async def run_typed(
     # into the ledger its caller installed; only the outermost one reports.
     usage, usage_token = install_usage()
     usage.add_tag(get_run_tag())
+    # The JEV reader reads long bodies inside this run's conversation, from a
+    # record the hooks keep (run_state.py); recorded only when it serves the
+    # request. A nested run (a subagent) records its own, or none.
+    loop_token = install_loop(record=bool(get_reading()) and reader.wanted())
     # Layer-3 nudge: when the run is about to exhaust `max_turns`, the hook
     # appends a synthetic "you have N turns left, finalise via final_answer"
     # user message to the conversation. One nudge per run; disabled when
@@ -559,6 +584,7 @@ async def run_typed(
         if usage_token is not None:
             logger.info("Usage [%s] (%s): %s", get_run_tag(), agent.name, usage.line())
         release_usage(usage_token)
+        release_loop(loop_token)
         reset_run_tag(tag_token)
         release_slot(token)
 

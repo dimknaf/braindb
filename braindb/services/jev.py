@@ -98,6 +98,7 @@ class _ItemError(Exception):
     """The server refused ONE request (400/413/422): that item stays unjudged."""
 
 
+
 def _clean(text: str) -> str:
     """Stored text is data, never prompt structure: '<' becomes '‹', so no
     stored string can open or close a chat turn ('<|im_end|>' inside an item
@@ -133,6 +134,8 @@ def judge_text(entity_type: str, content: str | None, title: str | None = None,
         text = text[:ITEM_CHARS] + " ...[continues]"
     return f"[{_TAG.get(entity_type, entity_type)}] {text}"
 
+
+_THINKING_OFF = {"enable_thinking": False}
 
 _session = requests.Session()
 # Every JEV request counts toward one limit, whichever feature sends it (the
@@ -187,12 +190,16 @@ class _Server:
         return self._send("POST", self.root + "/tokenize", {
             "model": self.model, "prompt": text, "add_special_tokens": False})["tokens"]
 
-    def render(self, messages: list[dict], **options) -> list[int]:
+    def render(self, messages: list[dict], template_kwargs: dict | None = _THINKING_OFF,
+               **options) -> list[int]:
         """Token ids of `messages` through the server's own chat template,
-        thinking off (the answer header then closes an empty think block)."""
-        return self._send("POST", self.root + "/tokenize", {
-            "model": self.model, "messages": messages,
-            "chat_template_kwargs": {"enable_thinking": False}, **options})["tokens"]
+        by default thinking off (the answer header then closes an empty think
+        block); `template_kwargs=None` renders them as for a request that
+        sends no template arguments."""
+        body = {"model": self.model, "messages": messages}
+        if template_kwargs is not None:
+            body["chat_template_kwargs"] = template_kwargs
+        return self._send("POST", self.root + "/tokenize", {**body, **options})["tokens"]
 
 
 def _split(server: _Server, turns: list[dict]) -> tuple[list[int], list[int]]:
@@ -213,6 +220,36 @@ def _usage(out: dict) -> dict:
     return {"input": u.get("prompt_tokens") or 0,
             "cached": (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
             "output": u.get("completion_tokens") or 0}
+
+
+def option_ids(server: _Server, words: list[str]) -> dict[str, list[int]]:
+    """Option word -> its single-token spellings (leading space; as given and capitalised)."""
+    out = {}
+    for w in words:
+        ids = sorted({i[0] for s in (f" {w}", f" {w[:1].upper()}{w[1:]}")
+                      if len(i := server.encode(s)) == 1})
+        if not ids:
+            raise _Unavailable(f"option {w!r} is not one token for this model")
+        out[w] = ids
+    return out
+
+
+def ask_ids(server: _Server, prompt: list[int],
+            options: dict[str, list[int]]) -> tuple[dict[str, float], float, dict]:
+    """Each option's probability as the next token after `prompt` (token
+    ids), the mass the options hold together, and the usage: ONE output
+    token, read from the logprobs of the options' ids."""
+    ids = sorted({i for v in options.values() for i in v})
+    out = server.complete({"prompt": prompt, "max_tokens": 1, "temperature": 0,
+                           "logprobs": 0, "logprob_token_ids": ids,
+                           "return_tokens_as_token_ids": True})
+    try:
+        top = out["choices"][0]["logprobs"]["top_logprobs"][0]
+        raw = {o: sum(math.exp(top[f"token_id:{i}"]) for i in v) for o, v in options.items()}
+    except (KeyError, IndexError, TypeError):
+        raise _Unavailable("the server did not return the requested logprobs") from None
+    mass = sum(raw.values())
+    return {o: (p / mass if mass > 0 else 0.0) for o, p in raw.items()}, mass, _usage(out)
 
 
 class _Judge:
@@ -432,14 +469,7 @@ class Choice:
 
     def options(self, words: list[str]) -> dict[str, list[int]]:
         """Option word -> its single-token spellings (leading space; as given and capitalised)."""
-        out = {}
-        for w in words:
-            ids = sorted({i[0] for s in (f" {w}", f" {w[:1].upper()}{w[1:]}")
-                          if len(i := self.server.encode(s)) == 1})
-            if not ids:
-                raise _Unavailable(f"option {w!r} is not one token for this model")
-            out[w] = ids
-        return out
+        return option_ids(self.server, words)
 
     def _prompt(self, body: list[int], lead: str) -> list[int]:
         if lead not in self._leads:
@@ -451,17 +481,7 @@ class Choice:
         """Each option's probability as the next token after the lead, for the
         request text `body` (from `encode`), the mass the options hold
         together, and the usage."""
-        ids = sorted({i for v in options.values() for i in v})
-        out = self.server.complete({"prompt": self._prompt(body, lead), "max_tokens": 1, "temperature": 0,
-                                    "logprobs": 0, "logprob_token_ids": ids,
-                                    "return_tokens_as_token_ids": True})
-        try:
-            top = out["choices"][0]["logprobs"]["top_logprobs"][0]
-            raw = {o: sum(math.exp(top[f"token_id:{i}"]) for i in v) for o, v in options.items()}
-        except (KeyError, IndexError, TypeError):
-            raise _Unavailable("the server did not return the requested logprobs") from None
-        mass = sum(raw.values())
-        return {o: (p / mass if mass > 0 else 0.0) for o, p in raw.items()}, mass, _usage(out)
+        return ask_ids(self.server, self._prompt(body, lead), options)
 
     def write(self, body: list[int], lead: str, max_tokens: int = 16) -> tuple[str, dict]:
         """A short line of new content after the lead, thinking off; "" when

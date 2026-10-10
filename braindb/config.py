@@ -297,6 +297,14 @@ class Settings(BaseSettings):
     # as before. SELF-HOSTED vLLM ONLY; off by default, and off under a
     # custom profile that replaces the writer's prompt.
     jev_wiki_gate: bool = False
+    # The adaptive reader, nested in the agent's conversation
+    # (services/reader.py): when an /agent/query request (or one of its
+    # subagents) starts reading a body longer than one tool output, the body
+    # is read once, piece by piece inside the agent's own conversation, each
+    # piece kept or dropped by one-token picks, and the agent continues with
+    # only what was kept. SELF-HOSTED vLLM ONLY; off by default, and with it
+    # off get_entity is unchanged.
+    jev_reader: bool = False
 
     @property
     def resolved_agent_model(self) -> str:

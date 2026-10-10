@@ -23,6 +23,7 @@ from uuid import UUID
 
 import psycopg2.extras
 from agents import function_tool
+from agents.tool_context import ToolContext
 
 from braindb.config import settings
 from braindb.db import get_conn
@@ -37,9 +38,19 @@ from braindb.services.keyword_service import (
     sync_keywords_for_entity,
 )
 from braindb.services.search import fuzzy_search, preview, slice_content
+from braindb.services import reader
 from braindb.services import wiki_sections as ws
 from braindb.services import wiki_jobs as wj
-from braindb.agent.run_state import get_need, get_run_tag, note_tool, record_handoff, record_submit
+from braindb.agent.run_state import (
+    add_usage,
+    get_loop,
+    get_need,
+    get_reading,
+    get_run_tag,
+    note_tool,
+    record_handoff,
+    record_submit,
+)
 from braindb.agent.schemas import (
     AgentAnswer,
     MaintainerClusterDecision,
@@ -115,7 +126,8 @@ def _verbose(name: str):
                 # Bind positional args to param names for readable logging
                 bound = {}
                 for i, val in enumerate(args):
-                    if i < len(param_names):
+                    # A tool's run context (it carries the run's input) is not an argument.
+                    if i < len(param_names) and not isinstance(val, ToolContext):
                         bound[param_names[i]] = val
                 bound.update(kwargs)
                 try:
@@ -413,9 +425,55 @@ async def save_rule(
 # ENTITIES — read / update / delete                                      #
 # ====================================================================== #
 
+async def _next_turn(ctx: ToolContext, loop) -> reader.Turn:
+    """The agent's next turn up to this call's output — its messages, tools
+    and chat-template arguments — built the way the SDK's chat model builds
+    its own request, from the conversation the hooks recorded."""
+    from agents.models.chatcmpl_converter import Converter
+    from agents.util._json import _to_dump_compatible
+
+    agent = loop.agent
+    model = agent.model
+    items = loop.items + loop.response + [
+        {"type": "function_call_output", "call_id": ctx.tool_call_id, "output": ""}]
+    messages = Converter.items_to_messages(
+        items, model=model.model, base_url=str(model._client.base_url),
+        should_replay_reasoning_content=model.should_replay_reasoning_content,
+        strict_feature_validation=model._strict_feature_validation)
+    if loop.system:
+        messages.insert(0, {"content": loop.system, "role": "system"})
+    tools = [Converter.tool_to_openai(t) for t in await agent.get_all_tools(ctx)]
+    template = (agent.model_settings.extra_body or {}).get("chat_template_kwargs")
+    return reader.Turn(_to_dump_compatible(messages), _to_dump_compatible(tools), template)
+
+
+async def _read_long(ctx: ToolContext, row: dict) -> Optional[str]:
+    """A long body read by the JEV reader inside the agent's own conversation
+    (services/reader.py), or None: then get_entity answers as it always has."""
+    loop, question = get_loop(), get_reading()
+    if loop is None or not question or not reader.wanted():
+        return None
+    if str(row.get("id")) in loop.read:  # read once already: the agent wants this page as it is
+        return None
+    if not reader.first_call(loop.response, ctx.tool_call_id):
+        add_usage("jev", skipped=1)
+        return None
+    try:
+        turn = await _next_turn(ctx, loop)
+    except Exception as e:  # noqa: BLE001 - e.g. an SDK change: answer as without the reader
+        logger.warning("JEV reader could not build the agent's next turn: %r", e)
+        add_usage("jev", calls=1, failopen=1)
+        return None
+    text = await asyncio.to_thread(reader.read, turn, row, question)
+    if text is not None:
+        loop.read.add(str(row.get("id")))
+    return text
+
+
 @function_tool
 @_verbose("get_entity")
-async def get_entity(entity_id: str, offset: int = 0, limit: Optional[int] = None) -> str:
+async def get_entity(ctx: ToolContext, entity_id: str, offset: int = 0,
+                     limit: Optional[int] = None) -> str:
     """Fetch ONE entity by ID — the full-content read (recall/list only give
     previews; come here to read a thing fully).
 
@@ -442,6 +500,16 @@ async def get_entity(entity_id: str, offset: int = 0, limit: Optional[int] = Non
         d = dict(row)
         d.pop("embedding", None)
         d.pop("search_vector", None)
+        # Starting to read a body longer than one output (a full read, or a
+        # first page of a whole output): with the JEV reader on, it is read
+        # once for the request's question and only what it needs comes back.
+        # Shorter slices (a fact's source span), later pages and pages of a
+        # body read once already are never touched: they reach what it left out.
+        if (offset == 0 and (limit is None or limit >= MAX_OUTPUT_CHARS)
+                and len(d.get("content") or "") > MAX_OUTPUT_CHARS):
+            text = await _read_long(ctx, d)
+            if text is not None:
+                return text
         if offset == 0 and limit is None:
             return _truncate(json.dumps(d, default=str, indent=2))
         # Explicit slice request → return exactly that slice + paging meta,

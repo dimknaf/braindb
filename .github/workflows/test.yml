@@ -86,6 +86,7 @@ jobs:
             tests/test_wiki_triage_db.py \
             tests/test_wiki_gate.py \
             tests/test_wiki_gate_db.py \
+            tests/test_reader.py \
             tests/test_context_jev_db.py \
             -v
 
