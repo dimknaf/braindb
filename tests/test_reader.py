@@ -203,6 +203,8 @@ class _FakeVLLM:
         mass = 0.05 if "LOWMASS" in piece else 0.98
         top = {f"token_id:{i}": math.log(mass * (0.97 if _WORDS[i - 7].strip().lower() == want else 0.01))
                for i in body["logprob_token_ids"]}
+        if "NANCUE" in piece:  # a broken forward pass: every logprob is NaN
+            top = {k: float("nan") for k in top}
         self.decisions.append({"prompt": prompt, "anchor": anchor, "want": want,
                                "cached": usage["prompt_tokens_details"]["cached_tokens"],
                                "probe": "datasource probe" in content})
@@ -662,18 +664,19 @@ def test_the_run_context_never_reaches_the_tool_log(server, monkeypatch, caplog)
     assert f'"entity_id": "{EID}"' in caplog.text and "ToolContext" not in caplog.text
 
 
-def test_a_short_slice_and_a_second_read_of_the_same_body_are_as_before(server):
+def test_a_first_page_of_any_size_reads_once_and_later_requests_are_as_before(server):
     async def body(ledger):
         await _turn(agent_mod.get_agent(), [_call("call_1")])
-        span = await _get("call_1", offset=0, limit=100)          # a source span: not a whole output
-        first = await _get("call_1", offset=0, limit=400)         # read once...
+        first = await _get("call_1", offset=0, limit=100)         # a short first page starts the read
         await _turn(agent_mod.get_agent(), [_call("call_2")])
-        again = await _get("call_2", offset=0, limit=400)         # ...then asked for as it is
-        return span, first, again, get_loop().read
+        span = await _get("call_2", offset=0, limit=100)          # then an exact span at 0 is as it is
+        await _turn(agent_mod.get_agent(), [_call("call_3")])
+        again = await _get("call_3")                              # and so is a full read
+        return first, span, again, get_loop().read
 
-    span, first, again, read = _in_a_run(body)
-    assert span == _today(0, 100) and again == _today(0, 400)
+    first, span, again, read = _in_a_run(body)
     assert first.startswith("wiki ") and read == {EID}
+    assert span == _today(0, 100) and again == _today()
 
 
 def test_a_read_that_reads_nothing_falls_back(server, monkeypatch):
@@ -762,3 +765,16 @@ def test_only_the_agents_that_read_carry_the_reading_section_and_only_when_it_is
         else:
             assert agent.instructions == agent_mod.SYSTEM_PROMPT       # byte-identical when off
     assert agent_mod.get_writer_agent().instructions == agent_mod.SYSTEM_PROMPT  # never the writer
+
+
+def test_a_piece_answered_with_nan_logprobs_stays_unjudged(server, monkeypatch):
+    # NaN fails every "mass < MIN_MASS" comparison; it must count as no answer, never as "no".
+    row = {**ROW, "content": BODY.replace("seed bread", "seed bread NANCUE")}
+    monkeypatch.setattr(tools_mod, "get_conn", _db(row))
+
+    async def body(ledger):
+        await _turn(agent_mod.get_agent(), [_call("call_1")])
+        return await _get("call_1"), ledger.as_dict()["jev"]
+
+    out, used = _in_a_run(body)
+    assert "NANCUE" in out.split("\nKept ", 1)[0] and used["unjudged"] >= 1

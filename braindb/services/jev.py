@@ -249,6 +249,8 @@ def ask_ids(server: _Server, prompt: list[int],
     except (KeyError, IndexError, TypeError):
         raise _Unavailable("the server did not return the requested logprobs") from None
     mass = sum(raw.values())
+    if not math.isfinite(mass):  # a broken forward pass (NaN logits) answers nothing
+        mass = 0.0
     return {o: (p / mass if mass > 0 else 0.0) for o, p in raw.items()}, mass, _usage(out)
 
 
@@ -274,6 +276,8 @@ class _Judge:
         except (KeyError, IndexError, TypeError):
             raise _Unavailable("the server did not return the requested logprobs") from None
         total = mass["yes"] + mass["no"]
+        if not math.isfinite(total):  # a broken forward pass (NaN logits) answers nothing
+            total = 0.0
         return (mass["yes"] / total if total > 0 else None), total, _usage(out)
 
 

@@ -500,13 +500,13 @@ async def get_entity(ctx: ToolContext, entity_id: str, offset: int = 0,
         d = dict(row)
         d.pop("embedding", None)
         d.pop("search_vector", None)
-        # Starting to read a body longer than one output (a full read, or a
-        # first page of a whole output): with the JEV reader on, it is read
+        # Starting to read a body longer than one output (a full read, or its
+        # first page, whatever its size): with the JEV reader on, it is read
         # once for the request's question and only what it needs comes back.
-        # Shorter slices (a fact's source span), later pages and pages of a
-        # body read once already are never touched: they reach what it left out.
-        if (offset == 0 and (limit is None or limit >= MAX_OUTPUT_CHARS)
-                and len(d.get("content") or "") > MAX_OUTPUT_CHARS):
+        # Later pages, and any page of a body read once already in this run
+        # (a fact's exact source span included), are never touched: they
+        # reach whatever it left out.
+        if offset == 0 and len(d.get("content") or "") > MAX_OUTPUT_CHARS:
             text = await _read_long(ctx, d)
             if text is not None:
                 return text
