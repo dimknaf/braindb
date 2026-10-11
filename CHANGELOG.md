@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-10-11
+
+Headline: **JEV — closed decisions read from the probability of a single next token, taken inside
+the conversation that uses them.** On a self-hosted vLLM server the agent reads a long entity once,
+piece by piece, keeping only what the question needs; follows recall's relations to the page or
+document it needs; and the wiki pipeline triages uncovered entities and gates the writer's facts
+with one-token picks instead of agent runs. What a decision drops never enters the conversation, so
+it is never paid for again. On any other server, or on any failure, everything behaves as before.
+Also in this release: the agent runs on the OpenAI client (LiteLLM dropped), every request records
+what it cost, and an optional `need` on `/agent/query`.
+
+### Added
+
+- **JEV reader (`JEV_READER`, on by default).** One `get_entity` call on a long entity reads the
+  whole body once, piece by piece, inside the agent's own conversation: each piece is kept or
+  rolled back by one token, and reading stops once what was kept answers the question. It replaces
+  paging a body or handing its slices to a subagent. Blind-judged on long documents: better answers
+  in less time, at about 1.3× the tokens of not reading them whole.
+- **JEV hops (`JEV_HOPS`, on by default).** After a recall, the items linked to what it showed — most
+  often the page that summarises them or the document a fact came from — are offered one at a time
+  in the same way and kept only when useful; kept ones are followed one step further. It finds what
+  sits one relation away from what recall surfaced, without a second search.
+- **JEV wiki triage (`JEV_WIKI_TRIAGE`, on by default).** The maintainer's per-seed decision (action
+  and target page) as one-token picks; seeds it cannot decide go to the agent as before. More
+  accurate than the agent run on blind gold, at a fraction of its cost.
+- **JEV writer gate (`JEV_WIKI_GATE`, on by default).** Inside the writer's own first request, the
+  facts recall finds are kept only when they are about the page's subject, and on long pages each is
+  placed in its section; the writer then starts from those, with page tools only. Far fewer
+  off-subject citations than the full writer, and far fewer missed on-subject facts.
+- **`need` on `/agent/query`.** Optional: one sentence of what the request wants to find out, which
+  the reader and hops read for (without it, a short query serves). With `JEV_ENABLED=true` (off by
+  default) recall itself is filtered by it.
+- **Per-request usage ledger.** Every `/agent/query` request records the tokens it spent — the
+  agent's requests, its subagents' and JEV's: requests, input, cached input, output — in its
+  activity row (on failure too) and in one log line. The response shape is unchanged.
+- **Benchmarks.** `phase_c_only.py` answers a benchmark's questions against an already-built
+  database (`--probing-json`, `--db-label`, `--with-need`); the judge gains parallel workers,
+  retries, and an endpoint guard.
+
+### Changed
+
+- **The agent runs on the OpenAI client.** Every profile already spoke the OpenAI Chat Completions
+  protocol, so the SDK's own model over the OpenAI client serves them all; LiteLLM is dropped and
+  `openai-agents` / `openai` are pinned. Old LiteLLM prefixes in `AGENT_MODEL` are still accepted,
+  with a warning.
+- **Alembic names the psycopg2 driver.** SQLAlchemy 2.1 maps a bare `postgresql://` URL to
+  psycopg 3, which would stop the API at start-up.
+
+### Upgrading from v0.10.0
+
+Rebuild the image (`docker compose up -d --build`): the dependencies changed. No DB migration. The
+JEV features are on by default but act only on a server that passes their probe (a self-hosted
+vLLM); anywhere else nothing changes. Set `JEV_READER`, `JEV_HOPS`, `JEV_WIKI_TRIAGE` or
+`JEV_WIKI_GATE` to `false` to turn one off.
+
 ## [0.10.0] — 2026-09-12
 
 Headline: **the wiki pipeline is now dependable under long, unattended runs.** The writer loop

@@ -1064,7 +1064,7 @@ async def delegate_to_subagent(task: str) -> str:
         # leak the subagent's SubagentResult into the parent's run_typed.
         payload: SubagentResult = await run_typed(
             task,
-            get_subagent(),
+            await asyncio.to_thread(get_subagent),  # may probe the server for JEV: off the loop
             SubagentResult,
             max_turns=settings.agent_subagent_max_turns,
         )

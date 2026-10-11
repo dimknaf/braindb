@@ -180,6 +180,7 @@ class _FakeVLLM:
 @pytest.fixture
 def server(monkeypatch):
     monkeypatch.setattr(jev.settings, "jev_wiki_gate", True)
+    monkeypatch.setattr(jev.settings, "jev_hops", False)  # on by default; the gate with hops has its own test
     monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(jev.settings, "agent_model", "")
     monkeypatch.setenv("VLLM_API_KEY", "test-secret-key")

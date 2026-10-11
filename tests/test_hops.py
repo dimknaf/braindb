@@ -216,6 +216,7 @@ def _recall_result(nodes=SHOWN):
 def server(monkeypatch):
     monkeypatch.setattr(jev.settings, "jev_hops", True)
     monkeypatch.setattr(jev.settings, "jev_reader", False)
+    monkeypatch.setattr(reader, "serves", lambda: True)  # the prompt's probe has its own tests (test_reader.py)
     monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(jev.settings, "agent_model", "")
     monkeypatch.setenv("VLLM_API_KEY", "test-secret-key")
@@ -400,6 +401,7 @@ def test_a_page_is_offered_by_its_name_summary_and_sections_a_document_with_what
 
 def test_the_answering_agent_carries_the_hops_section_only_when_they_are_on(monkeypatch):
     monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
+    monkeypatch.setattr(reader, "serves", lambda: True)  # a server that passes the probe
     for on in (True, False):
         monkeypatch.setattr(jev.settings, "jev_hops", on)
         monkeypatch.setattr(jev.settings, "jev_reader", False)

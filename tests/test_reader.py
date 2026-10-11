@@ -222,6 +222,8 @@ def _fresh_state() -> dict:
 @pytest.fixture
 def server(monkeypatch):
     monkeypatch.setattr(jev.settings, "jev_reader", True)
+    monkeypatch.setattr(jev.settings, "jev_hops", False)  # on by default; hops have their own tests
+    monkeypatch.setattr(reader, "serves", lambda: True)     # the prompt's probe has its own tests
     monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(jev.settings, "agent_model", "")
     monkeypatch.setenv("VLLM_API_KEY", "test-secret-key")
@@ -368,6 +370,7 @@ def test_get_entity_schema_is_unchanged_by_its_run_context():
 def test_run_typed_records_the_loop_only_when_the_reader_serves_the_request(
         monkeypatch, enabled, profile, question, recorded):
     monkeypatch.setattr(jev.settings, "jev_reader", enabled)
+    monkeypatch.setattr(jev.settings, "jev_hops", False)  # on by default; hops have their own tests
     monkeypatch.setattr(jev.settings, "llm_profile", profile)
     monkeypatch.setattr(reader, "_state", _fresh_state())
     seen = []
@@ -754,6 +757,7 @@ def test_a_probe_that_cannot_finish_switches_the_reader_off(server, monkeypatch)
 
 def test_a_subagent_run_while_the_reader_is_off_never_writes_its_callers_record(monkeypatch):
     monkeypatch.setattr(jev.settings, "jev_reader", True)
+    monkeypatch.setattr(jev.settings, "jev_hops", False)  # on by default; hops have their own tests
     monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(reader, "_state", _fresh_state())
     seen = []
@@ -786,6 +790,9 @@ def test_a_subagent_run_while_the_reader_is_off_never_writes_its_callers_record(
                                         (True, "deepinfra")])
 def test_only_the_agents_that_read_carry_the_reading_section_and_only_when_it_is_on(monkeypatch, on, profile):
     monkeypatch.setattr(jev.settings, "jev_reader", on)
+    monkeypatch.setattr(jev.settings, "jev_hops", False)  # on by default; hops have their own tests
+    monkeypatch.setattr(reader, "_state", _fresh_state())
+    monkeypatch.setattr(reader, "ready", lambda: None)    # a server that passes the probe
     monkeypatch.setattr(jev.settings, "llm_profile", profile)
     monkeypatch.setattr(jev.settings, "agent_model", "")
     monkeypatch.setenv("VLLM_API_KEY", "test-secret-key")
@@ -799,6 +806,35 @@ def test_only_the_agents_that_read_carry_the_reading_section_and_only_when_it_is
         else:
             assert agent.instructions == agent_mod.SYSTEM_PROMPT       # byte-identical when off
     assert agent_mod.get_writer_agent().instructions == agent_mod.SYSTEM_PROMPT  # never the writer
+
+
+def test_a_server_that_fails_the_probe_gets_the_plain_prompt_and_no_probe_per_request(monkeypatch):
+    # The switches are on by default, and any configured URL counts as self-hosted (Ollama too):
+    # the reading examples go in only once the server has passed the reader's probe.
+    monkeypatch.setattr(jev.settings, "jev_reader", True)
+    monkeypatch.setattr(jev.settings, "jev_hops", True)
+    monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
+    monkeypatch.setattr(reader, "_state", _fresh_state())
+    probes = []
+
+    def fails():
+        probes.append(1)
+        raise jev.Unavailable("the server did not return the requested logprobs")
+
+    monkeypatch.setattr(reader, "ready", fails)
+    assert agent_mod._reading_prompt() == agent_mod.SYSTEM_PROMPT
+    assert agent_mod._reading_prompt() == agent_mod.SYSTEM_PROMPT
+    assert len(probes) == 1 and not reader.wanted()        # off until it is probed again
+
+
+def test_the_reading_examples_go_in_once_the_server_passes_the_probe(monkeypatch):
+    monkeypatch.setattr(jev.settings, "jev_reader", True)
+    monkeypatch.setattr(jev.settings, "jev_hops", True)
+    monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
+    monkeypatch.setattr(reader, "_state", _fresh_state())
+    monkeypatch.setattr(reader, "ready", lambda: None)
+    assert agent_mod._reading_prompt() == "\n\n".join(
+        [agent_mod.SYSTEM_PROMPT.rstrip(), agent_mod._READER_SECTION, agent_mod._HOPS_SECTION])
 
 
 def test_a_piece_answered_with_nan_logprobs_stays_unjudged(server, monkeypatch):

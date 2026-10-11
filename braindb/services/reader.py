@@ -143,6 +143,20 @@ def _switch_off(error: Exception) -> None:
     logger.warning("JEV reader off for %d s: %s", jev.REPROBE_S, reason)
 
 
+def serves() -> bool:
+    """Whether this server has passed the reader's probe, probing it now if
+    it has not (agent._reading_prompt: only then does an agent carry the
+    reading examples). Blocking on first use: call it off the event loop."""
+    if time.monotonic() < _state["off_until"]:
+        return False
+    try:
+        ready()
+    except jev.Unavailable as e:
+        _switch_off(e)
+        return False
+    return True
+
+
 # ---------------------------------------------------------------- the turn
 
 

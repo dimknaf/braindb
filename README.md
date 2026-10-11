@@ -206,6 +206,19 @@ curl -X POST http://localhost:8000/api/v1/agent/query \
 
 The agent has 21 tools — every single BrainDB endpoint plus `delegate_to_subagent` (which spawns a fresh agent in its own context for focused deep work) and `final_answer` (which ends the loop with a validated typed payload).
 
+**Reading inside the agent's own conversation (JEV)** — on a self-hosted vLLM server, two steps are closed decisions read from the probability of a single next token, taken inside the agent's conversation, so whatever is dropped never enters it:
+
+- **Reader** — a long entity is read once, piece by piece; each piece is kept or dropped for the question, and reading stops once what was kept answers it. One `get_entity` call replaces paging the body or handing its slices to a subagent.
+- **Hops** — after a recall, the items linked to what it showed (often the page that summarises them, or the document a fact came from) are offered one at a time, kept only when useful, and followed one step further.
+
+Both are on by default (`JEV_READER`, `JEV_HOPS`) and act only on a server that passes their probe; anywhere else the agent runs exactly as before. A request can state what it wants to find out in an optional `need`, which they read for (without it, a short `query` serves):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/agent/query \
+  -H "Content-Type: application/json" \
+  -d '{"query":"When did Kestrel Mill reopen to visitors?", "need":"the date Kestrel Mill reopened"}'
+```
+
 **LLM provider — pluggable via `.env`**:
 
 `LLM_PROFILE` selects the backend. Profiles are defined in [braindb/config.py](braindb/config.py) (`_LLM_PROFILES`):
@@ -340,6 +353,8 @@ docker logs braindb_api -f              # the agent doing the work
 ![Wiki scheduler and maintainer loop — cron scans for entities not yet covered, the maintainer decides attach / create / consolidate / skip, suggestion jobs hand off to the writer, and the loop repeats](docs/assets/braindb-upkeep-loop.svg)
 
 ![Wiki writer pipeline — lock and snapshot, gather context, draft with citations, reconcile relations, validate with retry, then commit a reversible living wiki page](docs/assets/braindb-writer.svg)
+
+On a self-hosted vLLM server, two of these steps are one-token decisions (JEV; on by default, each probed first, `JEV_WIKI_TRIAGE=false` / `JEV_WIKI_GATE=false` turn them off): **triage** picks each uncovered entity's action and target page instead of an agent run, handing anything it cannot decide to the agent; the **writer gate**, inside the writer's own first request, keeps only the recalled facts that are about the page's subject and picks the section each belongs in, so the writer starts from those.
 
 You do **not** drive this by hand. The `POST /api/v1/wiki/{cron,maintain,write}`
 endpoints exist for **debugging / inspection only** — normal operation is the

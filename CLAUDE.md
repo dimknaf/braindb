@@ -75,10 +75,12 @@ braindb/
 │   ├── routers/                       # entities.py, relations.py, memory.py, agent.py, wiki.py, integrations.py
 │   ├── schemas/                       # Pydantic models (entities, relations, search)
 │   ├── services/                      # search.py, graph.py, context.py, embedding_service.py,
-│   │                                  # keyword_service.py, activity_log.py
+│   │                                  # keyword_service.py, activity_log.py,
+│   │                                  # JEV: jev.py, reader.py, hops.py, wiki_triage.py, wiki_gate.py
 │   └── agent/                         # Internal agent (OpenAI Agents SDK + pluggable provider via LLM_PROFILE)
 │       ├── agent.py                   # builder + runner (singleton)
 │       ├── tools.py                   # 21 @function_tool wrappers
+│       ├── run_state.py               # per-run state: typed submit, usage ledger, reading question
 │       └── prompts/system_prompt.md   # baked-in skill content (agent-voiced)
 ├── alembic/                           # DB migrations (raw SQL, no ORM) — current: 004
 ├── data/sources/                      # Drop files here — watcher picks them up
@@ -182,6 +184,8 @@ curl -X POST http://localhost:8000/api/v1/agent/query \
   -H "Content-Type: application/json" \
   -d '{"query":"Delegate to a subagent: find near-duplicate facts and return top 10 pairs."}'
 ```
+
+An optional `need` (one sentence of what you want to find out) lets the agent's JEV steps — the reader on long entities and hops after a recall, on a self-hosted vLLM server — read for exactly that.
 
 When working **on this repo**, prefer direct API calls (you need precision). When working **in another project** that just wants memory, prefer the agent endpoint (less ceremony).
 

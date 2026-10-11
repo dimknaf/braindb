@@ -20,6 +20,7 @@ its already-validated `payload` into `braindb.agent.run_state.last_submit`
 (a ContextVar). `run_typed` reads it back after `Runner.run` returns.
 asyncio's per-Task context isolation makes nested/parallel runs safe.
 """
+import asyncio
 import json
 import logging
 from uuid import uuid4
@@ -114,10 +115,12 @@ _GATED_WRITER_PROMPT = (Path(__file__).parent / "prompts" / "writer_gated_system
 
 
 def _reading_prompt() -> str:
-    """The system prompt of an agent that reads for a request."""
-    sections = [s for on, s in ((settings.jev_reader, _READER_SECTION), (settings.jev_hops, _HOPS_SECTION))
-                if on and settings.self_hosted]
-    return "\n\n".join([SYSTEM_PROMPT.rstrip(), *sections]) if sections else SYSTEM_PROMPT
+    """The system prompt of an agent that reads for a request: with the
+    examples of each JEV reading feature that is on, once the server has
+    passed the reader's probe (one it fails gets the plain prompt). Probes
+    on first use: build these agents off the event loop."""
+    sections = [s for on, s in ((reader.wanted(), _READER_SECTION), (hops.wanted(), _HOPS_SECTION)) if on]
+    return "\n\n".join([SYSTEM_PROMPT.rstrip(), *sections]) if sections and reader.serves() else SYSTEM_PROMPT
 
 
 # Every tool except the final submit (that one is typed per purpose).
@@ -305,7 +308,9 @@ def _build(
     return agent
 
 
-_cache: dict[str, Agent] = {}
+# Keyed by the instructions too: an agent that reads for a request carries
+# the JEV reading examples only while the server serves them (_reading_prompt).
+_cache: dict[tuple[str, str], Agent] = {}
 
 
 def _cached(
@@ -318,7 +323,7 @@ def _cached(
     instructions: str = SYSTEM_PROMPT,
     base_tools: tuple | None = None,
 ) -> Agent:
-    a = _cache.get(key)
+    a = _cache.get((key, instructions))
     if a is None:
         a = _build(
             name, submit_tool,
@@ -328,7 +333,7 @@ def _cached(
             instructions=instructions,
             base_tools=base_tools,
         )
-        _cache[key] = a
+        _cache[(key, instructions)] = a
     return a
 
 
@@ -609,5 +614,7 @@ async def run_agent_query(query: str, max_turns: int | None = None) -> dict:
     the response shape stays `{"answer","max_turns"}` for backward
     compatibility."""
     turns = max_turns or settings.agent_max_turns
-    payload: AgentAnswer = await run_typed(query, get_agent(), AgentAnswer, max_turns=turns)
+    # Built off the event loop: on first use it probes the server for JEV.
+    agent = await asyncio.to_thread(get_agent)
+    payload: AgentAnswer = await run_typed(query, agent, AgentAnswer, max_turns=turns)
     return {"answer": payload.answer, "max_turns": turns}

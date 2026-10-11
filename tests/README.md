@@ -55,6 +55,8 @@ A few tests drive internal services (e.g. `graph_expand`) over a direct DB conne
 | `test_search.py` | `/memory/search` finds created content, `/memory/context` structure, multi-query seed merging, graph traversal surfaces connected entities, `/memory/tree` returns a structure, `/memory/stats` returns counts. |
 | `test_ingest.py` | `/datasources/ingest` — 201 new, 200 duplicate (by content_hash), dup preserves first-seen metadata (second call doesn't overwrite). Test files live in `data_test/` (the test stack's data dir). |
 | `test_agent.py` | `/agent/query` smoke — 200 with an `answer` field on a trivial prompt, 4xx on empty or missing query. Needs a configured LLM provider (credentials pass through from `.env`). |
+| `test_jev.py`, `test_reader.py`, `test_hops.py`, `test_wiki_triage.py`, `test_wiki_gate.py` (+ their `*_db.py`), `test_context_jev_db.py` | JEV against fake model servers, no LLM: every decision is one token, a failed probe or request falls back to the behaviour without JEV, and with JEV off the agent's outputs and tool schemas are unchanged. |
+| `test_usage_ledger.py` | The per-request usage ledger: every run of an `/agent/query` request adds into it, and it is recorded on failure too. |
 
 ## What is NOT covered
 

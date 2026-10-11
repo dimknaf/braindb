@@ -375,6 +375,8 @@ curl -X POST http://localhost:8000/api/v1/agent/query \
 
 (`max_turns` is optional; the default — currently 20 — is used when omitted.)
 
+(`need` is optional too: one sentence, at most 2,000 characters, of what you want to find out, e.g. `"need": "the date Kestrel Mill reopened"`. On a self-hosted vLLM server the agent's JEV steps read for it — the reader on long entities and hops after a recall, both on by default — and so does the recall filter when `JEV_ENABLED=true`; without it, a short `query` serves. Elsewhere it has no effect.)
+
 **Save via the agent**:
 ```bash
 curl -X POST http://localhost:8000/api/v1/agent/query \
@@ -399,6 +401,8 @@ The agent has these tools internally: `recall_memory`, `quick_search`, `save_fac
 - Optional override: set `AGENT_MODEL=` in `.env` to use a non-default model for the active profile.
 
 **Verbose logging**: set `AGENT_VERBOSE=true` in `.env` to log every tool call to stdout (visible via `docker logs braindb_api -f`). The HTTP response stays clean — only `answer` and `max_turns`.
+
+**Usage**: every `/agent/query` request records the tokens it spent — the agent's requests (subagents included) and any JEV decisions: requests, input, cached input, output — in `details.usage` of its `agent_query` row in the activity log, and in one `Usage (agent_query)` log line; on failure too.
 
 **Encoding**: when constructing the JSON body, use ASCII characters only (plain hyphens `-`, no em-dashes `—`). On Windows shells, special characters may get mangled and the server returns 400 Bad Request.
 
