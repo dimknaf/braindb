@@ -15,7 +15,9 @@ answer one line, "[f2] | about the subject (yes or no):":
 - no: it is about a different subject (another person, company or thing that only shares a name or a word with this
   one), has nothing to do with it, or the text cannot tell (a bare shared first name, a pronoun, no identifying
   detail).
-Co-occurring on one fact does not make two entities the same subject. Only the facts answered yes stay in your job.
+Co-occurring on one fact does not make two entities the same subject, and a fact that names the subject only in
+passing (where something was announced, listed, reported or traded) is about whoever did it, not about the subject.
+Only the facts answered yes stay in your job.
 On a page too long to show in full, you then answer for each member and kept fact "[m1] | section:" with the letter
 of the outline section it belongs in, or "new" when no section fits it.
 Examples (made up, not in memory):
@@ -61,6 +63,18 @@ SUMMARY: retail bank headquartered in Marrow.
   keywords: ['marrow']
   content: Marrow city council approved a new tram line.
 [f1] | about the subject (yes or no): no
+SUBJECT: Brenno Exchange Wire
+SUMMARY: the stock exchange's announcement service, through which listed companies publish their news.
+[f1] id: 11111111-0000-0000-0000-000000000008
+  type: fact
+  keywords: ['calder labs', 'brenno exchange wire']
+  content: Calder Labs said via the Brenno Exchange Wire that its 2025 revenue rose 12%.
+[f1] | about the subject (yes or no): no
+[f2] id: 11111111-0000-0000-0000-000000000009
+  type: fact
+  keywords: ['brenno exchange wire']
+  content: Since 2024 the Brenno Exchange Wire publishes every announcement within 60 seconds of filing.
+[f2] | about the subject (yes or no): yes
 Outline:
 A. overview: 900 chars - Calder Labs builds battery-cell testing robots...
 B. timeline: 1400 chars - 2019: founded in Brenno...
