@@ -12,8 +12,10 @@ adaptive reader's way: one piece at a time, each followed by ONE token,
 "[s.p] | useful (yes or no):" — thinking off, the answer read from the
 logprobs of the yes/no ids. A piece judged useful stays, and reading
 continues through it; one that is not is rolled back, and the next piece
-follows what was kept before it. Nothing is summarised, and nothing kept is
-trimmed.
+follows what was kept before it. After a piece that stays, one more token,
+"[s.p] | enough to answer (yes or no):": yes, and reading stops there (a
+lookup whose answer is kept need not read on); the rest is listed as not
+read. Nothing is summarised, and nothing kept is trimmed.
 
 Nested: the tool output being built IS the reader's memory, inside the
 agent's own conversation. Each decision request is the agent's next-turn
@@ -66,10 +68,13 @@ _PROMPTS = Path(__file__).resolve().parent.parent / "agent" / "prompts"
 _HEADER = (_PROMPTS / "reader_header.md").read_text(encoding="utf-8").strip()
 
 LEAD = "| useful (yes or no):"  # asked after each piece, behind the piece's anchor
+ENOUGH_LEAD = "| enough to answer (yes or no):"  # asked after each piece that stays
 THINK = "<think>\n\n</think>\n\n"  # the closed empty think block the answer turn opens with
 STOP_TOOLS = ("final_answer", "handoff_to_successor")  # a turn that calls one has no next turn
 
 KEEP = 0.5          # P(yes) from which a piece stays (chosen on dev needs over long pages)
+ENOUGH = 0.95       # P(yes) from which what was kept answers the question: reading stops (lookups stop
+                    # early on a related piece below it; chosen on dev needs over long pages)
 MIN_MASS = 0.5      # below this the options hold too little probability: the piece stays
 MARGIN = 3          # a keep point lies at least this many tokens past its block edge...
 WINDOW = 192        # ...and at most this many
@@ -93,7 +98,7 @@ class Turn:
     template_kwargs: dict | None
 
 
-class _Mismatch(Exception):
+class Mismatch(Exception):
     """The request the reader would send is not the server's own rendering
     of the agent's turn: this read falls back, and the reader stays on."""
 
@@ -142,8 +147,9 @@ def _switch_off(error: Exception) -> None:
 
 
 def _with(turn: Turn, content: str, answer: str) -> list[dict]:
-    """The turn's messages with `content` as the tool's output, then an
-    answer turn that starts with `answer`."""
+    """The turn's messages with `content` as its last message's (the tool's
+    output, or the wiki gate's user message), then an answer turn that starts
+    with `answer`."""
     return turn.messages[:-1] + [{**turn.messages[-1], "content": content},
                                  {"role": "assistant", "content": answer}]
 
@@ -155,17 +161,20 @@ def _render(server: jev._Server, turn: Turn, content: str, answer: str) -> list[
                          continue_final_message=True)
 
 
-def _frame(server: jev._Server, turn: Turn) -> tuple[list[int], list[int]]:
+def split_turn(server: jev._Server, turn: Turn, consts: dict) -> tuple[list[int], list[int]]:
     """C, the agent's next-turn prompt up to the tool's output, and T, from
     the end of that output to the opened answer turn, cut from the server's
     own rendering with the agent's own template arguments. The output's last
     token and the template's newline after it are one token in a rendering,
-    so the output is counted with its newline and T starts after it."""
-    x, q, think = (_state["consts"][k] for k in ("x", "q", "think"))
+    so the output is counted with its newline and T starts after it. The
+    content may instead be a user message's (the wiki gate's): the template
+    trims it and the end-of-turn marker follows it, so T starts there."""
+    x = consts["x"] if turn.messages[-1]["role"] == "tool" else consts["x_user"]
+    q, think = consts["q"], consts["think"]
     a, b = _render(server, turn, "x", "Q"), _render(server, turn, "y", "Q")
     n = next((i for i, (p, r) in enumerate(zip(a, b)) if p != r), None)
     if n is None or a[n:n + len(x)] != x or a[-len(q):] != q:
-        raise _Mismatch("the tool output is not where the reader expects it in the turn")
+        raise Mismatch("the content is not where the reader expects it in the turn")
     t = a[n + len(x):len(a) - len(q)]
     if t[-len(think):] != think:
         raise jev.Unavailable("the template does not open the answer turn with a closed think block")
@@ -184,10 +193,10 @@ def _lead_ids(server: jev._Server, text: str) -> list[int]:
     return _state["leads"][text]
 
 
-def _check(server: jev._Server, turn: Turn, content: str, lead: str, prompt: list[int]) -> None:
+def check(server: jev._Server, turn: Turn, content: str, lead: str, prompt: list[int]) -> None:
     """The assembled request must be the server's own rendering of the turn."""
     if _render(server, turn, content, lead) != prompt:
-        raise _Mismatch("the assembled request differs from the server's rendering")
+        raise Mismatch("the assembled request differs from the server's rendering")
 
 
 # --------------------------------------------------------------- the body
@@ -350,7 +359,7 @@ def _probe(server: jev._Server, options: dict) -> None:
     """The model must keep the piece that answers a clear-cut question and
     drop the one that does not, read the reader's way; the requests must be
     the server's own renderings."""
-    c, t = _frame(server, _PROBE_TURN)
+    c, t = split_turn(server, _PROBE_TURN, _state["consts"])
     body = "\n\n".join(_PROBE_PIECES)
     row = {"entity_type": "datasource", "id": "probe", "title": "Rowan bakery", "content": body}
     header = _header(row, body, [("text", 0)], _PROBE_QUESTION)
@@ -359,8 +368,8 @@ def _probe(server: jev._Server, options: dict) -> None:
         content, lead = f"{header}[0.{i}] (text)\n{text}\n", _lead(f"0.{i}")
         prompt = c + server.encode(content) + t + _lead_ids(server, lead)
         try:
-            _check(server, _PROBE_TURN, content, lead, prompt)
-        except _Mismatch as e:
+            check(server, _PROBE_TURN, content, lead, prompt)
+        except Mismatch as e:
             raise jev.Unavailable(str(e)) from None
         probs, mass, _ = jev.ask_ids(server, prompt, options)
         if mass < MIN_MASS:
@@ -368,6 +377,24 @@ def _probe(server: jev._Server, options: dict) -> None:
         p.append(probs["yes"])
     if p[0] - p[1] < 0.5:
         raise jev.Unavailable("the model does not judge the probe pieces reliably")
+
+
+def connect() -> tuple[jev._Server, dict, int, dict]:
+    """The agent model's server, its yes/no option ids, its served window and
+    the rendering markers `split_turn` cuts by (jev.Unavailable when it states no
+    window to read into)."""
+    server = jev._Server()
+    card = next((m for m in server.get("/models").get("data", [])
+                 if m.get("id") == server.model), None)
+    if card is None:
+        raise jev.Unavailable("the agent model is not served by this endpoint")
+    window = int(card.get("max_model_len") or 0)
+    if window <= 2 * ROOM:
+        raise jev.Unavailable("the server does not state a context window to read into")
+    options = jev.option_ids(server, ["yes", "no"])
+    consts = {"x": server.encode("x\n"), "x_user": server.encode("x"), "q": server.encode("Q"),
+              "think": server.encode(THINK)}
+    return server, options, window, consts
 
 
 def _ready() -> tuple[jev._Server, dict, int]:
@@ -378,22 +405,12 @@ def _ready() -> tuple[jev._Server, dict, int]:
             raise jev.Unavailable("the reader is off until it is probed again")
         if _state["server"] is None:
             try:
-                server = jev._Server()
-                card = next((m for m in server.get("/models").get("data", [])
-                             if m.get("id") == server.model), None)
-                if card is None:
-                    raise jev.Unavailable("the agent model is not served by this endpoint")
-                window = int(card.get("max_model_len") or 0)
-                if window <= 2 * ROOM:
-                    raise jev.Unavailable("the server does not state a context window to read into")
-                options = jev.option_ids(server, ["yes", "no"])
-                _state["consts"] = {"x": server.encode("x\n"), "q": server.encode("Q"),
-                                    "think": server.encode(THINK)}
+                server, options, window, _state["consts"] = connect()
                 _probe(server, options)
             except jev.Unavailable:
                 raise
             except Exception as e:  # noqa: BLE001 - a probe that cannot finish keeps it off too
-                raise jev.Unavailable(str(e) if isinstance(e, _Mismatch) else type(e).__name__) from None
+                raise jev.Unavailable(str(e) if isinstance(e, Mismatch) else type(e).__name__) from None
             _state.update(server=server, options=options, window=window)
             logger.info("JEV reader on: a served window of %d tokens", window)
         return _state["server"], _state["options"], _state["window"]
@@ -415,7 +432,7 @@ def read(turn: Turn, row: dict, question: str) -> str | None:
         out = _read(turn, row, body, question, started, usage)
     except jev.Unavailable as e:
         _switch_off(e)
-    except _Mismatch as e:
+    except Mismatch as e:
         logger.warning("JEV reader fell back: %s", e)
     except Exception as e:  # noqa: BLE001 - unreachable, refused or too slow: today's output
         logger.warning("JEV reader failed open: %s", type(e).__name__)
@@ -426,7 +443,7 @@ def read(turn: Turn, row: dict, question: str) -> str | None:
 def _read(turn: Turn, row: dict, body: str, question: str, started: float,
           usage: dict) -> str | None:
     server, options, window = _ready()
-    c, t = _frame(server, turn)
+    c, t = split_turn(server, turn, _state["consts"])
 
     def spend(u: dict) -> None:
         usage["requests"] += 1
@@ -468,7 +485,8 @@ def _read(turn: Turn, row: dict, body: str, question: str, started: float,
         frame = f"[{anchor}] ({parts[si][0]})\n"
         lead = _lead(anchor)
         lead_ids = _lead_ids(server, lead)
-        hi = min(edge + WINDOW, edge + jev.BLOCK - 2 - len(t) - len(lead_ids))
+        enough_ids = _lead_ids(server, f"[{anchor}] {ENOUGH_LEAD}")  # asked at the same point if it stays
+        hi = min(edge + WINDOW, edge + jev.BLOCK - 2 - len(t) - max(len(lead_ids), len(enough_ids)))
         ratio = read_chars / read_tokens if read_tokens else CHARS_PER_TOKEN
         q, ids = _cut(server, body, cuts, frame, pos, edge + MARGIN - k_m, hi - k_m, ratio)
         if q < len(body) and (len(body) - q) < MIN_PIECE * ratio:
@@ -485,25 +503,35 @@ def _read(turn: Turn, row: dict, body: str, question: str, started: float,
             break
         prompt = c + s_ids + t + lead_ids
         if not checked:
-            _check(server, turn, content, lead, prompt)
+            check(server, turn, content, lead, prompt)
             checked = True
         probs, mass, u = jev.ask_ids(server, prompt, options)
         spend(u)
         if mass < MIN_MASS:
             usage["unjudged"] += 1
-        if probs["yes"] >= KEEP or mass < MIN_MASS:  # stays: the content continues through it
+        stays = probs["yes"] >= KEEP or mass < MIN_MASS
+        if stays:                                    # the content continues through it
             memory, m_ids = content, s_ids
             spans.append(kept)
         else:                                        # rolled back: the next piece follows `memory`
             spans.append(dropped)
         spans[-1].append((start, q))
         pos = start = q
+        if stays and body[pos:].strip():
+            # Does what was kept answer the question? Asked at the same point,
+            # so its request ends in the same block as the piece's.
+            probs, mass, u = jev.ask_ids(server, c + s_ids + t + enough_ids, options)
+            spend(u)
+            if mass >= MIN_MASS and probs["yes"] >= ENOUGH:
+                unread, why = start, "enough for the question"
+                break
     if not spans:
         return None  # nothing was read: the agent gets what it would have without the reader
     if unread is None and start < len(body):  # trailing whitespace joins the last span
         spans[-1][-1] = (spans[-1][-1][0], len(body))
-    logger.info("JEV read %s %s: kept %d of %d pieces (%d of %d chars) in %.1fs "
+    logger.info("JEV read %s %s: kept %d of %d pieces (%d of %d chars, %s) in %.1fs "
                 "(in=%d cached=%d out=%d)", row.get("entity_type"), str(row.get("id"))[:8],
                 len(kept), len(kept) + len(dropped), sum(b - a for a, b in kept), len(body),
+                f"stopped at {unread}: {why}" if unread is not None else "read to the end",
                 time.monotonic() - started, usage["input"], usage["cached"], usage["output"])
     return memory + _note(body, parts, kept, dropped, unread, why)

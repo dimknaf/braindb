@@ -197,7 +197,11 @@ class _FakeVLLM:
         anchor = re.match(r"\[(\d+\.\d+)\]", lead).group(1)
         content = text.rsplit("<tool_response>\n", 1)[-1].split("\n</tool_response>", 1)[0]
         piece = content.rsplit(f"[{anchor}] (", 1)[-1]
-        want = "yes" if ("USEFUL" in piece or "opened the Rowan bakery" in piece) else "no"
+        kind = "enough" if lead.endswith(reader.ENOUGH_LEAD) else "useful"
+        if kind == "enough":  # does what was kept answer the question
+            want = "yes" if "ENOUGH" in piece else "no"
+        else:
+            want = "yes" if ("USEFUL" in piece or "opened the Rowan bakery" in piece) else "no"
         if not self.probe_ok and "Rowan" in piece:
             want = "no" if want == "yes" else "yes"
         mass = 0.05 if "LOWMASS" in piece else 0.98
@@ -205,7 +209,7 @@ class _FakeVLLM:
                for i in body["logprob_token_ids"]}
         if "NANCUE" in piece:  # a broken forward pass: every logprob is NaN
             top = {k: float("nan") for k in top}
-        self.decisions.append({"prompt": prompt, "anchor": anchor, "want": want,
+        self.decisions.append({"prompt": prompt, "anchor": anchor, "want": want, "kind": kind,
                                "cached": usage["prompt_tokens_details"]["cached_tokens"],
                                "probe": "datasource probe" in content})
         return _Response(200, {"choices": [{"logprobs": {"top_logprobs": [top]}}], "usage": usage})
@@ -534,23 +538,31 @@ def test_a_long_read_keeps_only_useful_pieces_inside_the_agents_own_turn(server,
 
     # One token per piece; each keep point a few tokens past a block edge;
     # each request reuses what was kept, and so does the agent's next turn.
-    reads = [d for d in server.decisions if not d["probe"]]
+    # A kept piece is followed by "enough to answer", asked at the same point.
+    asked = [d for d in server.decisions if not d["probe"]]
+    reads = [d for d in asked if d["kind"] == "useful"]
     assert len(server.warms) == 1 and len(reads) >= 4
+    assert [d["anchor"] for d in asked if d["kind"] == "enough"] == [d["anchor"] for d in reads[:-1] if d["want"] == "yes"]
     last = len(server.warms[0]) // BLOCK * BLOCK               # the warm request's checkpoint
     for i, d in enumerate(reads):
         lead = _text(d["prompt"]).rsplit("</think>\n\n", 1)[-1]
         assert lead == f"[{d['anchor']}] | useful (yes or no):"
         assert _text(d["prompt"]).endswith(_TAIL + lead)
         keep_point = len(d["prompt"]) - len(_tok(_TAIL)) - len(_tok(lead)) - 1
-        bound = min(reader.WINDOW, BLOCK - 2 - len(_tok(_TAIL)) - len(_tok(lead)))
+        enough = f"[{d['anchor']}] | enough to answer (yes or no):"
+        bound = min(reader.WINDOW, BLOCK - 2 - len(_tok(_TAIL)) - max(len(_tok(lead)), len(_tok(enough))))
         if i < len(reads) - 1:
             assert reader.MARGIN <= keep_point % BLOCK <= bound
         assert d["cached"] == last                              # kept or not, it continues from M
         if d["want"] == "yes":
             last = keep_point // BLOCK * BLOCK
+            e = next((x for x in asked if x["kind"] == "enough" and x["anchor"] == d["anchor"]), None)
+            if e is not None:   # the same point: it reuses the piece's checkpoint and leaves the same one
+                assert e["prompt"][:keep_point + 1] == d["prompt"][:keep_point + 1]
+                assert e["cached"] == last and len(e["prompt"]) // BLOCK * BLOCK == last
     agent_next = _render(sent["messages"], sent["tools"], None, add_generation_prompt=True)
     assert server.cache.use(agent_next, store=False) == last > 0
-    assert (used["calls"], used["requests"], used["failopen"]) == (1, 1 + len(reads), 0)
+    assert (used["calls"], used["requests"], used["failopen"]) == (1, 1 + len(asked), 0)
 
 
 def _small_turn(template_kwargs: dict | None = None) -> reader.Turn:
@@ -588,9 +600,31 @@ def test_a_piece_whose_options_hold_little_probability_stays(server, monkeypatch
     assert "LOWMASS" in out.split("\nKept ", 1)[0] and used["unjudged"] >= 1
 
 
+def test_reading_stops_once_what_was_kept_answers_the_question(server, monkeypatch):
+    # The piece with the answer says it is enough: nothing after it is read.
+    row = {**ROW, "content": BODY.replace("USEFUL opened in 2018 USEFUL", "USEFUL ENOUGH opened in 2018 USEFUL ENOUGH")}
+    out = _read(_small_turn(), row)
+    asked = [d for d in server.decisions if not d["probe"]]
+    assert [d["kind"] for d in asked][-2:] == ["useful", "enough"] and asked[-1]["want"] == "yes"
+    head, note = out.split("\nKept ", 1)
+    assert "USEFUL ENOUGH" in head and "seed bread" not in head
+    unread = _spans("Kept " + note, "Not read (enough for the question):")
+    assert unread and unread[-1][1] == len(row["content"]) and "seed bread" in row["content"][unread[0][0]:]
+    assert "Read any of these with get_entity(entity_id, offset, limit)." in note
+
+
+def test_not_enough_or_too_little_probability_reads_on(server, monkeypatch):
+    # "enough" answered no, or with little probability on its options: reading goes on to the end.
+    for text in ("USEFUL opened in 2018 USEFUL", "USEFUL ENOUGH LOWMASS opened in 2018 USEFUL ENOUGH LOWMASS"):
+        server.decisions.clear()
+        out = _read(_small_turn(), {**ROW, "content": BODY.replace("USEFUL opened in 2018 USEFUL", text)})
+        assert "Not read" not in out
+        assert [d for d in server.decisions if d["kind"] == "enough" and not d["probe"]]
+
+
 def test_reading_stops_where_the_agent_would_run_out_of_room(server):
     assert _read(_small_turn()) is not None
-    reads = [d for d in server.decisions if not d["probe"]]
+    reads = [d for d in server.decisions if not d["probe"] and d["kind"] == "useful"]
     after = next(i for i, d in enumerate(reads) if d["want"] == "yes") + 1
     assert after < len(reads)                   # a piece follows the kept one
     lead = _text(reads[after]["prompt"]).rsplit("</think>\n\n", 1)[-1]
