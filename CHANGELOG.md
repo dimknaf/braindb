@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.11.0] — 2026-10-11
+## [0.11.0] — 2026-10-12
 
 Headline: **JEV — closed decisions read from the probability of a single answer token, taken
 inside the conversation that uses them.** The agent reads a long entity once, piece by piece,
@@ -69,6 +69,12 @@ DeepInfra model and a self-hosted vLLM do); anywhere else nothing changes. Set `
 `JEV_HOPS`, `JEV_WIKI_TRIAGE` or `JEV_WIKI_GATE` to `false` to turn one off. A `.env` that sets
 `AGENT_MODEL` keeps its own model; one that relied on the `deepinfra` default now gets DeepSeek
 V4.1 Flash.
+
+JEV is new, and it saves tokens only while the server caches the conversation: each decision
+resends the conversation so far plus one short question. After upgrading, check the input and
+cached input that each `/agent/query` records (`details.usage` of its `agent_query` row in the
+activity log). In our runs 87–92% of JEV's input there came from the cache; much less means
+something breaks the cache, and the features are better turned off until it is found.
 
 ## [0.10.0] — 2026-09-12
 
