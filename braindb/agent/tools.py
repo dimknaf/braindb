@@ -238,9 +238,11 @@ async def recall_memory(
         for rule in result.always_on_rules:
             lines.append(f"[RULE priority={rule.ext.get('priority')}] {rule.content}")
         text = _truncate("\n".join(lines))
-        # With JEV_HOPS on, the neighbours of these items that JEV keeps for
-        # the request's question follow them (services/hops.py).
-        return await _hop(ctx, [str(item.id) for item in result.items], text) or text
+        # With JEV_HOPS on, the neighbours of the items shown that JEV keeps
+        # for the request's question follow them (services/hops.py). An item
+        # the cut above left out was not shown: hops may offer it.
+        shown = [str(item.id) for item in result.items if str(item.id) in text]
+        return await _hop(ctx, shown, text) or text
     except Exception as e:
         return _err(str(e))
 

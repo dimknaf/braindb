@@ -12,14 +12,16 @@ not). With JEV_HOPS on, a recall_memory call in an /agent/query request with
 a reading question (services/reader.py's: the need, else a short query) is
 extended the adaptive reader's way, nested in the agent's own conversation:
 the neighbours of the shown items (relations only: no keyword tags, no
-retired pages, nothing already shown), strongest relation first, are
-appended one at a time to the tool's output, each followed by ONE token,
-"[h1.2] | useful (yes or no):", thinking off, read from the logprobs of the
-yes/no ids. Yes: the output continues through it, and its own neighbours are
-the next hop's candidates. No, or too little probability on the options: it
-is rolled back and never followed. Up to HOPS hops of at most CANDIDATES
-neighbours each. Nothing recall showed is removed, and anything that goes
-wrong gives recall's output as it was.
+retired pages, nothing already shown), those most of the shown items link
+to first, are appended one at a time to the tool's output, each followed by
+ONE token, "[h1.2] | useful (yes or no):", thinking off, read from the
+logprobs of the yes/no ids. A page is offered by its name, summary line and
+section names, a document also with the shown item it is linked from, and
+anything else by its content. Yes (P >= KEEP): the output continues through
+it, and its own neighbours are the next hop's candidates. No, or too little
+probability on the options: it is rolled back and never followed. Up to
+HOPS hops of at most CANDIDATES neighbours each. Nothing recall showed is
+removed, and anything that goes wrong gives recall's output as it was.
 
 Each decision request is the agent's next turn up to the tool's output, as
 the reader's are (reader.split_turn and reader.check): every neighbour is
@@ -42,33 +44,50 @@ from braindb.agent.run_state import add_usage
 from braindb.config import settings
 from braindb.db import get_conn
 from braindb.services import jev, reader
+from braindb.services.wiki_jobs import SUMMARY_RE
+from braindb.services.wiki_sections import parse_sections
 
 logger = logging.getLogger(__name__)
 
 LEAD = "| useful (yes or no):"  # asked after each neighbour, behind its anchor
 HOPS = 2            # hops followed from what recall showed
-CANDIDATES = 10     # neighbours offered per hop, strongest relation first
-KEEP = 0.5          # P(yes) from which a neighbour stays, and is followed
+CANDIDATES = 6      # neighbours offered per hop, those most of the shown items link to first
+KEEP = 0.8          # P(yes) from which a neighbour stays, and is followed
 MIN_MASS = 0.5      # below this the options hold too little probability: rolled back
 PREVIEW = 400       # chars of a neighbour's content it is offered with
+SECTIONS = 12       # a page's section names it is offered with
 DEADLINE_S = 60     # for all of a recall's hops; what is left is not offered
+# Pages and documents first among neighbours equally linked: they are where
+# the facts recall shows were summarised or came from.
+_TYPE_ORDER = {"wiki": 0, "datasource": 0, "source": 1}
 
 _state: dict = {"off_until": 0.0}
 _lock = threading.Lock()
 
+# Each neighbour once, with how many of the given items link to it, the
+# first (best-ranked) of them, and that link's relation.
 _NEIGHBOURS_SQL = """
-SELECT DISTINCT ON (t.id)
-       t.id::text AS id, t.entity_type, t.title, t.content, t.keywords,
-       r.relation_type, (r.from_entity_id = f.id) AS outgoing, f.id::text AS via, f.ord,
-       COALESCE(r.relevance_score, 0.5) * COALESCE(r.importance_score, 0.5) AS weight
-FROM unnest(%s::uuid[]) WITH ORDINALITY AS f(id, ord)
-JOIN relations r ON r.from_entity_id = f.id OR r.to_entity_id = f.id
-JOIN entities t ON t.id = CASE WHEN r.from_entity_id = f.id THEN r.to_entity_id ELSE r.from_entity_id END
-LEFT JOIN wikis_ext w ON w.entity_id = t.id
-WHERE r.relation_type <> 'tagged_with' AND t.entity_type <> 'keyword'
-  AND (t.entity_type <> 'wiki' OR w.retired_at IS NULL)
-  AND NOT (t.id = ANY(%s::uuid[]))
-ORDER BY t.id, weight DESC, f.ord
+WITH links AS (
+    SELECT t.id AS tid, f.id AS via, f.ord, r.relation_type, (r.from_entity_id = f.id) AS outgoing,
+           COALESCE(r.relevance_score, 0.5) * COALESCE(r.importance_score, 0.5) AS weight
+    FROM unnest(%s::uuid[]) WITH ORDINALITY AS f(id, ord)
+    JOIN relations r ON r.from_entity_id = f.id OR r.to_entity_id = f.id
+    JOIN entities t ON t.id = CASE WHEN r.from_entity_id = f.id THEN r.to_entity_id ELSE r.from_entity_id END
+    LEFT JOIN wikis_ext w ON w.entity_id = t.id
+    WHERE r.relation_type <> 'tagged_with' AND t.entity_type <> 'keyword'
+      AND (t.entity_type <> 'wiki' OR w.retired_at IS NULL)
+      AND NOT (t.id = ANY(%s::uuid[]))
+)
+SELECT t.id::text AS id, t.entity_type, t.title, t.content, t.keywords,
+       count(DISTINCT l.via) AS links, min(l.ord) AS ord, max(l.weight) AS weight,
+       (array_agg(l.relation_type ORDER BY l.ord, l.weight DESC))[1] AS relation_type,
+       (array_agg(l.outgoing ORDER BY l.ord, l.weight DESC))[1] AS outgoing,
+       (array_agg(l.via::text ORDER BY l.ord, l.weight DESC))[1] AS via,
+       (array_agg(v.content ORDER BY l.ord, l.weight DESC))[1] AS via_content
+FROM links l
+JOIN entities t ON t.id = l.tid
+JOIN entities v ON v.id = l.via
+GROUP BY t.id, t.entity_type, t.title, t.content, t.keywords
 """
 
 
@@ -81,16 +100,26 @@ def wanted() -> bool:
 def neighbours(conn, ids: list[str], exclude: set[str], limit: int,
                types: tuple[str, ...] | None = None) -> list[dict]:
     """The relation neighbours of `ids` not in `exclude` (keyword tags,
-    keywords and retired pages left out), strongest relation first, then
-    the order of `ids`: at most `limit`, of `types` when given."""
+    keywords and retired pages left out), of `types` when given, at most
+    `limit`: those most of `ids` link to first, then pages and documents,
+    then those of the earliest of `ids` (recall's order is the question's).
+    Replayed on 30 needs over a personal memory, this order brought the
+    document a need was answered from within the first five neighbours for
+    7 of the 10 needs where it was one relation away (stored relation weight:
+    3 of 10)."""
     if not ids or limit <= 0:
         return []
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(_NEIGHBOURS_SQL, (list(ids), sorted({*exclude, *ids})))
         rows = [dict(r) for r in cur.fetchall()]
-    if types:
-        rows = [r for r in rows if r["entity_type"] in types]
-    rows.sort(key=lambda r: (-float(r["weight"] or 0), r["ord"]))
+    return _first(rows, limit, types)
+
+
+def _first(rows: list[dict], limit: int, types: tuple[str, ...] | None = None) -> list[dict]:
+    """`neighbours`' order and cut, on its rows."""
+    rows = [r for r in rows if not types or r["entity_type"] in types]
+    rows.sort(key=lambda r: (-r["links"], _TYPE_ORDER.get(r["entity_type"], 2), r["ord"],
+                             -float(r["weight"] or 0)))
     return rows[:limit]
 
 
@@ -101,18 +130,39 @@ def _switch_off(error: Exception) -> None:
     logger.warning("JEV hops off for %d s: %s", jev.REPROBE_S, reason)
 
 
+def _clip(text: str | None, n: int) -> str:
+    s = " ".join((text or "").split())
+    return s if len(s) <= n else s[:n] + f"...(+{len(s) - n} chars; get_entity for full)"
+
+
+def _view(n: dict) -> str:
+    """What a neighbour is judged by. A page by its name, summary line and
+    section names (its body opens with machine metadata), a document by its
+    title and opening and the shown item it is linked from, anything else
+    by its content."""
+    if n["entity_type"] == "wiki":
+        body = n.get("content") or ""
+        summary = SUMMARY_RE.search(body)
+        _, sections = parse_sections(body)
+        names = "; ".join(s.name for s in sections[:SECTIONS]) + ("; ..." if len(sections) > SECTIONS else "")
+        return (f"  page: {n.get('title') or ''}" + (f" - {_clip(summary.group(1), 300)}" if summary else "")
+                + (f"\n  sections: {names}" if names else "") + "\n")
+    text = _clip(f"{n.get('title') or ''} {n.get('content') or ''}", PREVIEW)
+    if n["entity_type"] == "datasource" and n.get("via_content"):
+        return f"  content: {text}\n  linked from: {_clip(n['via_content'], 200)}\n"
+    return f"  content: {text}\n"
+
+
 def _item(anchor: str, n: dict) -> str:
-    """One neighbour as the tool's output carries it: its anchor, type and
-    relation, then id and content as recall shows its items, and a newline
-    (the template closes a tool output on one)."""
-    text = " ".join(((n.get("title") or "") + " " + (n.get("content") or "")).split())
-    if len(text) > PREVIEW:
-        text = text[:PREVIEW] + f"...(+{len(text) - PREVIEW} chars; get_entity for full)"
+    """One neighbour as the tool's output carries it: its anchor, type,
+    relation and how many shown items link to it, then its id and view, and
+    a newline (the template closes a tool output on one)."""
     # The relation as seen from the item it hangs on: "derived_from from 3f2a1b0c"
     # (that item derives from this one), "summarises to 3f2a1b0c" (this one summarises it).
     way = "from" if n["outgoing"] else "to"
-    return (f"[{anchor}] [{n['entity_type']}] {n['relation_type']} {way} {n['via'][:8]}\n"
-            f"  id: {n['id']}\n  content: {text}\n")
+    also = f" (and {n['links'] - 1} more of the items above)" if n.get("links", 1) > 1 else ""
+    return (f"[{anchor}] [{n['entity_type']}] {n['relation_type']} {way} {n['via'][:8]}{also}\n"
+            f"  id: {n['id']}\n{_view(n)}")
 
 
 def extend(turn: reader.Turn, shown: list[str], text: str, question: str) -> str | None:

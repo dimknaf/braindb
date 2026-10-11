@@ -337,6 +337,16 @@ def test_each_hop_decision_is_the_agents_next_turn_and_one_token(server):
         assert d["content"].startswith("Found 2 items:")
 
 
+def test_an_item_recalls_cut_left_out_counts_as_not_shown(server, monkeypatch):
+    # Recall's output is cut at MAX_OUTPUT_CHARS: an item past the cut was not
+    # shown, so hops may offer it (here N1, recalled but cut away).
+    monkeypatch.setattr(tools_mod, "assemble_context", lambda conn, req, need=None: _recall_result(SHOWN + [N1]))
+    monkeypatch.setattr(tools_mod, "MAX_OUTPUT_CHARS", len(_today().split(f"  id: {N1['id']}")[0]) + 5)
+    out, _ = _in_a_run([_call("call_1")])
+    visible = out.split("\n\nNeighbours of the items above")[0]
+    assert N1["id"] not in visible and N1["id"] in out          # offered and kept by hops
+
+
 def test_nothing_kept_gives_recalls_output_as_it_was(server, monkeypatch):
     for n in (N1, N3):
         monkeypatch.setitem(n, "content", n["content"].replace("USEFUL", "background"))
@@ -357,6 +367,35 @@ def test_a_request_the_server_renders_differently_falls_back_and_hops_stay_on(se
     today = _today()
     out, used = _in_a_run([_call("call_1")])
     assert out == today and used["failopen"] == 1 and hops.wanted()
+
+
+def test_neighbours_most_shown_items_link_to_come_first_then_pages_and_documents():
+    row = lambda i, links, t, ord_, w=0.5: {"id": i, "entity_type": t, "links": links, "ord": ord_, "weight": w}
+    rows = [row("fact-strong", 1, "fact", 1, 0.9), row("page-3", 3, "wiki", 7), row("doc-3", 3, "datasource", 2),
+            row("fact-3", 3, "fact", 1), row("doc-1", 1, "datasource", 9), row("fact-1-late", 1, "fact", 4, 0.9)]
+    assert [r["id"] for r in hops._first(rows, 10)] == ["doc-3", "page-3", "fact-3", "doc-1", "fact-strong",
+                                                        "fact-1-late"]
+    assert [r["id"] for r in hops._first(rows, 2)] == ["doc-3", "page-3"]
+    assert [r["id"] for r in hops._first(rows, 10, types=("fact",))] == ["fact-3", "fact-strong", "fact-1-late"]
+
+
+def test_a_page_is_offered_by_its_name_summary_and_sections_a_document_with_what_links_it():
+    page = {"id": "p", "entity_type": "wiki", "title": "Rowan bakery", "relation_type": "summarises",
+            "outgoing": False, "via": "3f2a1b0c-0000", "links": 4,
+            "content": ("<!-- wiki:meta canonical_name=Rowan bakery -->\n# Rowan bakery\n"
+                        "> **Summary:** a bakery on Tarn Street.\n<!-- section: overview -->\nText.\n"
+                        "<!-- section: breads -->\nRye.\n")}
+    item = hops._item("h1.1", page)
+    assert item.startswith("[h1.1] [wiki] summarises to 3f2a1b0c (and 3 more of the items above)\n")
+    assert "page: Rowan bakery - a bakery on Tarn Street." in item and "sections: overview; breads" in item
+    assert "wiki:meta" not in item and item.endswith("\n")
+    doc = {"id": "d", "entity_type": "datasource", "title": "Tarn Gazette", "content": "Kel Aster trained at Pell.",
+           "relation_type": "derived_from", "outgoing": True, "via": "5d4c3b2a-0000", "links": 1,
+           "via_content": "Kel Aster opened the Rowan bakery."}
+    item = hops._item("h1.2", doc)
+    assert item.startswith("[h1.2] [datasource] derived_from from 5d4c3b2a\n")
+    assert "content: Tarn Gazette Kel Aster trained at Pell." in item
+    assert "linked from: Kel Aster opened the Rowan bakery." in item
 
 
 def test_the_answering_agent_carries_the_hops_section_only_when_they_are_on(monkeypatch):
