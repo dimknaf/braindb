@@ -28,7 +28,7 @@ import logging
 import re
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 import openai.resources.chat.completions as chat_completions
 import pytest
 from agents.models.interface import ModelTracing
@@ -624,7 +624,7 @@ def test_a_body_too_long_to_read_this_way_is_skipped(server, monkeypatch):
 
 def test_a_probe_that_cannot_finish_switches_the_reader_off(server, monkeypatch):
     def unreachable(body):
-        raise httpx.ConnectError("down")
+        raise httpx2.ConnectError("down")
 
     server.reply = unreachable
 

@@ -28,7 +28,7 @@ import logging
 import time
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 import pytest
 from agents.tool_context import ToolContext
 
@@ -190,7 +190,7 @@ def test_where_it_does_not_the_question_ends_a_tools_output_or_follows_a_users_m
 
 def test_a_server_too_slow_to_answer_switches_jev_off_instead_of_being_waited_on(server, ledger):
     def slow(body):
-        raise httpx.ReadTimeout("too slow")
+        raise httpx2.ReadTimeout("too slow")
 
     server.reply = slow
     assert jev.judge("need", ["[fact] GOOD"]) is None

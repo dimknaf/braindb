@@ -226,7 +226,8 @@ def make_relation(api: str) -> Callable[..., dict]:
 
 class FakeChat:
     """An OpenAI-compatible chat completions endpoint for the JEV tests, put
-    behind the real openai client (an httpx MockTransport), so every request
+    behind the real openai client (a MockTransport of httpx2, the HTTP
+    library the openai client uses), so every request
     is built and every reply read exactly as in production.
 
     Each request's JSON body is kept in `bodies`. `reply(body)` says what the
@@ -282,7 +283,7 @@ class FakeChat:
         import json as _json
         import math
 
-        import httpx
+        import httpx2
 
         from braindb.services import jev
 
@@ -299,7 +300,7 @@ class FakeChat:
         if isinstance(tokens, int):
             status = tokens
         if status:
-            return httpx.Response(status, json={"error": {"message": "refused by the fake", "type": "test"}})
+            return httpx2.Response(status, json={"error": {"message": "refused by the fake", "type": "test"}})
         out, finish = [], "stop"
         for text, alts in tokens:
             if len(out) >= body.get("max_tokens", 16):
@@ -327,20 +328,20 @@ class FakeChat:
             "usage": {"prompt_tokens": len(sent) // 4, "completion_tokens": len(out),
                       "total_tokens": len(sent) // 4 + len(out),
                       "prompt_tokens_details": {"cached_tokens": shared // 4}}}
-        # NaN must survive into the reply (a broken forward pass): json.dumps writes it, httpx's json= would not.
-        return httpx.Response(200, content=_json.dumps(payload).encode(),
+        # NaN must survive into the reply (a broken forward pass): json.dumps writes it, httpx2's json= would not.
+        return httpx2.Response(200, content=_json.dumps(payload).encode(),
                               headers={"content-type": "application/json"})
 
 
 def _serve(monkeypatch, handler) -> None:
     """Every openai client JEV builds talks to `handler` instead of a network."""
-    import httpx
+    import httpx2
     import openai
 
     from braindb.services import jev
 
     monkeypatch.setattr(jev, "OpenAI", lambda **kw: openai.OpenAI(
-        **kw, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
+        **kw, http_client=httpx2.Client(transport=httpx2.MockTransport(handler))))
 
 
 @pytest.fixture(autouse=True)
@@ -350,13 +351,13 @@ def _no_model_server(monkeypatch):
     JEV state. Unless a test installs a fake (`fake_chat`), every JEV request
     is refused as unauthorised, so JEV stays off, as on a server it cannot use."""
     try:
-        import httpx
+        import httpx2
 
         from braindb.services import hops, jev, reader, wiki_gate, wiki_triage
     except ImportError:  # an environment without the package: integration tests only
         yield
         return
-    _serve(monkeypatch, lambda request: httpx.Response(401, json={"error": {"message": "no model server in tests"}}))
+    _serve(monkeypatch, lambda request: httpx2.Response(401, json={"error": {"message": "no model server in tests"}}))
     monkeypatch.setattr(jev, "_judge", None)
     monkeypatch.setattr(jev, "_off_until", 0.0)
     monkeypatch.setattr(jev, "_modes", {})
