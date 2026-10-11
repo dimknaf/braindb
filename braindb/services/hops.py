@@ -214,7 +214,7 @@ def _extend(turn: reader.Turn, shown: list[str], text: str, question: str, deadl
                 break
             content = memory + item
             probs, mass, u = jev.ask(server, reader.with_content(turn, content), f"[{anchor}] {LEAD}",
-                                     jev.YES_NO, turn.tools)
+                                     jev.YES_NO, turn.tools, turn.extra)
             spend(u)
             offered += 1
             if mass >= MIN_MASS and probs["yes"] >= KEEP:  # stays, and is followed next hop

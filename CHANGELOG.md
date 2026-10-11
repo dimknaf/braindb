@@ -12,10 +12,12 @@ inside the conversation that uses them.** The agent reads a long entity once, pi
 keeping only what the question needs; follows recall's relations to the page or document it needs;
 and the wiki pipeline triages uncovered entities and gates the writer's facts with one-token picks
 instead of agent runs. What a decision drops never enters the conversation, so it is never paid for
-again. Every JEV request is a standard OpenAI chat completion on the agent's own server, so it runs
-wherever the replies carry logprobs and thinking turns off with `reasoning_effort` — the new
-default model on DeepInfra, DeepSeek V4.1 Flash, as well as a self-hosted vLLM. On any other server,
-or on any failure, everything behaves as before. Also in this release: the agent runs on the OpenAI
+again. Every JEV request is the agent's own request through the openai library with the question
+added — opening the model's reply where the server continues one (vLLM, SGLang, llama.cpp), so the
+server's cache of the conversation serves it; elsewhere ending the output with thinking off by
+`reasoning_effort`. It runs wherever the replies carry logprobs: a self-hosted vLLM, and the new
+default model on DeepInfra, DeepSeek V4.1 Flash. On any other server, or on any failure, everything
+behaves as before. Also in this release: the agent runs on the OpenAI
 client (LiteLLM dropped), every request records what it cost, and an optional `need` on
 `/agent/query`.
 

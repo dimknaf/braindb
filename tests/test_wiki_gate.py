@@ -165,21 +165,36 @@ def test_only_facts_about_the_subject_stay_and_a_left_out_fact_is_rolled_back(se
     assert gate.sections == {}
 
 
-def test_each_decision_is_the_writer_s_own_first_request_with_the_question_ending_its_job(server, monkeypatch):
+def test_each_decision_is_the_writer_s_own_first_request_with_the_question_opening_its_reply(server, monkeypatch):
     m1 = _entity("Calder Labs opened a factory")
     _recall(monkeypatch, [_entity("Calder Labs hired engineers"), _entity("CUE_NO other firm")])
-    turn = _turn([m1])
+    turn = reader.Turn(_turn([m1]).messages, TOOLS, {"chat_template_kwargs": {"reasoning_effort": "low"}})
     gate = wiki_gate.prepare(turn, "Calder Labs", SHORT_PAGE, [m1], [])
     for d in _job(server):
         b = d["body"]
-        assert b["messages"][0] == turn.messages[0] and [m["role"] for m in b["messages"]] == ["system", "user", "user"]
+        assert b["messages"][0] == turn.messages[0] and [m["role"] for m in b["messages"]] == ["system", "user", "assistant"]
         assert b["messages"][1]["content"].startswith(turn.messages[1]["content"])   # the job, then the facts
-        assert b["messages"][2]["content"] == f"Answer with one word: yes or no.\n[{d['anchor']}] {wiki_gate.ID_LEAD}"
-        assert b["tools"] == TOOLS and b["tool_choice"] == "none" and b["reasoning_effort"] == "none"
-        assert b["max_tokens"] == jev.ANSWER_TOKENS and b["temperature"] == 0 and b["stop"] == ["\n"]
+        assert b["messages"][2] == {"role": "assistant", "content": f"[{d['anchor']}] {wiki_gate.ID_LEAD}"}
+        assert b["messages"][1]["content"].endswith("\nAnswer with one word: yes or no.")
+        assert b["chat_template_kwargs"] == {"reasoning_effort": "low"}            # the writer's own settings
+        assert b["continue_final_message"] is True and "reasoning_effort" not in b
+        assert b["tools"] == TOOLS and b["tool_choice"] == "none" and b["max_tokens"] == 1
         # each continues what was kept; so does the writer's own first request
         so_far = d["content"].rsplit(f"\n\n[{d['anchor']}] id:", 1)[0]
         assert gate.prompt.startswith(so_far)
+
+
+def test_a_server_that_does_not_continue_a_reply_gets_the_question_as_its_own_turn(server, monkeypatch):
+    server.continues = False
+    m1 = _entity("Calder Labs opened a factory")
+    _recall(monkeypatch, [_entity("Calder Labs hired engineers"), _entity("CUE_NO other firm")])
+    gate = _prepare([m1])
+    assert gate is not None and [f["content"] for f in gate.found] == ["Calder Labs hired engineers"]
+    for d in _job(server):
+        b = d["body"]
+        assert [m["role"] for m in b["messages"]] == ["system", "user", "user"]
+        assert b["messages"][2]["content"] == f"Answer with one word: yes or no.\n[{d['anchor']}] {wiki_gate.ID_LEAD}"
+        assert b["reasoning_effort"] == "none" and b["stop"] == ["\n"]
 
 
 def test_the_members_are_never_asked_about_and_never_leave_the_job(server, monkeypatch):

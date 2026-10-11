@@ -175,12 +175,12 @@ def _ready(turn: reader.Turn) -> jev.Server:
         if _state["server"] is None:
             server = jev.Server()
             try:
-                probe = reader.Turn([turn.messages[0], {"role": "user", "content": _PROBE_HEAD}], turn.tools)
+                probe = reader.Turn([turn.messages[0], {"role": "user", "content": _PROBE_HEAD}], turn.tools, turn.extra)
                 p = []
                 for i, f in enumerate(_PROBE_FACTS, 1):
                     content = f"{_PROBE_HEAD}\n\n{_fact(f'f{i}', f)}"
                     probs, mass, _ = jev.ask(server, reader.with_content(probe, content), f"[f{i}] {ID_LEAD}",
-                                             jev.YES_NO, probe.tools)
+                                             jev.YES_NO, probe.tools, probe.extra)
                     if mass < MIN_MASS:
                         raise jev.Unavailable("the options hold too little probability in the probe job")
                     p.append(probs["yes"])
@@ -235,7 +235,7 @@ def _decide(server: jev.Server, turn: reader.Turn, canonical: str, old_body: str
         """`lead` asked after `content` as the writer's prompt; the prompt's size too."""
         if time.monotonic() > deadline:
             raise TimeoutError("the wiki gate's decisions missed the deadline")
-        probs, mass, u = jev.ask(server, reader.with_content(turn, content), lead, options, turn.tools)
+        probs, mass, u = jev.ask(server, reader.with_content(turn, content), lead, options, turn.tools, turn.extra)
         usage["requests"] += 1
         for k in ("input", "cached", "output"):
             usage[k] += u[k]

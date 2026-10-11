@@ -20,9 +20,9 @@ read. Nothing is summarised, and nothing kept is trimmed.
 Nested: the tool output being built IS the reader's memory, inside the
 agent's own conversation. Each decision request is the agent's next request
 up to that output — the messages and tools the SDK will send — with the
-question at the end of the output, where it never stays (services/jev.py
-`ask`: a standard chat completion, thinking off, the answer read from the
-logprobs of the yes/no token the model writes). Successive requests
+question asked after the output, where it never stays (services/jev.py
+`ask`: thinking off, the answer read from the logprobs of the yes/no token
+the model writes). Successive requests
 share everything up to the pieces kept, so the server's prefix cache computes
 each piece once (but for the tail past its last cache block), and the
 agent's next turn continues from that cache.
@@ -90,9 +90,12 @@ CHARS_PER_TOKEN = 3.8  # a first estimate, refined on each body as it is read
 class Turn:
     """The agent's next request up to one tool call's output, as plain data:
     its messages (the last one is that call's tool message, or the wiki
-    gate's user message) and its tools."""
+    gate's user message), its tools, and its own request fields beyond
+    OpenAI's (the model settings' extra body, e.g. chat-template arguments),
+    so a question asked in it is the agent's exact request."""
     messages: list[dict]
     tools: list[dict]
+    extra: dict | None = None
 
 
 _lock = threading.Lock()
@@ -359,7 +362,7 @@ def _read(turn: Turn, row: dict, body: str, question: str, started: float,
 
     def ask(content: str, lead: str) -> tuple[dict, float, int]:
         """`lead` asked after `content` as the tool's output; the prompt's size too."""
-        probs, mass, u = jev.ask(server, with_content(turn, content), lead, jev.YES_NO, turn.tools)
+        probs, mass, u = jev.ask(server, with_content(turn, content), lead, jev.YES_NO, turn.tools, turn.extra)
         usage["requests"] += 1
         for k in ("input", "cached", "output"):
             usage[k] += u[k]

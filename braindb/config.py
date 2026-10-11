@@ -271,12 +271,13 @@ class Settings(BaseSettings):
     agent_wiki_reasoning_effort: str = ""
 
     # JEV — closed yes/no relevance judgements read from one token's
-    # probability (services/jev.py), as standard chat completions on the
-    # agent profile's own server: any OpenAI-compatible server whose replies
-    # carry logprobs and that turns thinking off with `reasoning_effort`
-    # "none". Each feature probes the server on first use and stays off where
-    # it fails; any failure gives the behaviour without it. This switch is the
-    # recall filter only: off by default, and with it off recall is unchanged.
+    # probability (services/jev.py), asked in the conversation's own request
+    # on the agent profile's own server (the question opening the reply where
+    # the server continues one, else thinking off by `reasoning_effort`): any
+    # OpenAI-compatible server whose replies carry logprobs. Each feature
+    # probes the server on first use and stays off where it fails; any
+    # failure gives the behaviour without it. This switch is the recall
+    # filter only: off by default, and with it off recall is unchanged.
     # On, a recall made while answering an /agent/query request that states a
     # `need` keeps only the items the model judges useful for that need. The
     # other JEV features below (wiki triage, wiki gate, reader, hops) have

@@ -40,6 +40,7 @@ from braindb.agent.run_state import (
     set_reading,
 )
 from braindb.services import hops, jev, reader, wiki_gate
+from conftest import FakeChat
 
 QUESTION = "Where did Kel Aster train?"
 
@@ -57,9 +58,9 @@ class _Model:
         self.decisions = []
 
     def __call__(self, body: dict):
-        content = body["messages"][-1]["content"]
-        anchor = _QUESTION_LINE.search(content).group(1)
-        item = content.rsplit(f"[{anchor}] ", 2)[-2] if content.count(f"[{anchor}] ") > 1 else content
+        question, content = FakeChat.asked(body)
+        anchor = _QUESTION_LINE.search(question).group(1)
+        item = content.rsplit(f"[{anchor}] ", 1)[-1]
         want = "yes" if ("USEFUL" in item or "opened the Rowan bakery" in item) else "no"
         mass = 0.05 if "LOWMASS" in item else 0.98
         other = "no" if want == "yes" else "yes"
@@ -209,18 +210,19 @@ def test_hops_keep_only_useful_neighbours_and_follow_only_those(server):
     assert (used["calls"], used["failopen"]) == (1, 0) and used["requests"] == len(asked)
 
 
-def test_each_hop_decision_is_the_agents_next_request_with_the_question_ending_the_output(server):
+def test_each_hop_decision_is_the_agents_next_request_with_the_question_opening_the_reply(server):
     out, _ = _in_a_run([_call("call_1")])
     asked = [d for d in server.decisions if not d["probe"]]
     for d in asked:
-        b, tool = d["body"], d["body"]["messages"][-1]
+        b, tool, reply = d["body"], d["body"]["messages"][-2], d["body"]["messages"][-1]
         assert tool["role"] == "tool" and tool["content"].startswith("Found 2 items:")
-        assert tool["content"].endswith(f"\n[{d['anchor']}] | useful (yes or no):")
+        assert reply == {"role": "assistant", "content": f"[{d['anchor']}] | useful (yes or no):"}
+        assert tool["content"].endswith("\nAnswer with one word: yes or no.")
         assert [m["role"] for m in b["messages"][:2]] == ["system", "user"]          # the agent's own turns
         assert b["messages"][0]["content"] == agent_mod.get_agent().instructions
-        assert b["tools"] and b["tool_choice"] == "none" and b["reasoning_effort"] == "none"
-        assert b["max_tokens"] == jev.ANSWER_TOKENS and b["stop"] == ["\n"]
-        so_far = tool["content"].rsplit(f"[{d['anchor']}] ", 2)[0]
+        assert b["tools"] and b["tool_choice"] == "none" and "reasoning_effort" not in b
+        assert b["continue_final_message"] is True and b["max_tokens"] == 1
+        so_far = tool["content"].rsplit(f"[{d['anchor']}] ", 1)[0]
         assert out.startswith(so_far)                         # each continues what was kept
 
 

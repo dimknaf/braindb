@@ -446,7 +446,9 @@ async def sdk_turn(agent, ctx, items: list, system: str | None) -> reader.Turn:
     if system:
         messages.insert(0, {"content": system, "role": "system"})
     tools = [Converter.tool_to_openai(t) for t in await agent.get_all_tools(ctx)]
-    return reader.Turn(_to_dump_compatible(messages), _to_dump_compatible(tools))
+    extra = agent.model_settings.extra_body
+    return reader.Turn(_to_dump_compatible(messages), _to_dump_compatible(tools),
+                       _to_dump_compatible(extra) if extra else None)
 
 
 async def _next_turn(ctx: ToolContext, loop) -> reader.Turn:

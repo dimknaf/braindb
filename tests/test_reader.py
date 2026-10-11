@@ -50,6 +50,7 @@ from braindb.agent.run_state import (
 )
 from braindb.agent.schemas import AgentAnswer
 from braindb.services import jev, reader
+from conftest import FakeChat
 
 QUESTION = "When did the Kestrel mill open?"
 EID = "00000000-0000-0000-0000-00000000000a"
@@ -79,8 +80,8 @@ class _Model:
         self.decisions, self.probe_ok = [], True
 
     def __call__(self, body: dict):
-        content = body["messages"][-1]["content"]
-        anchor, kind = _QUESTION_LINE.search(content).groups()
+        question, content = FakeChat.asked(body)
+        anchor, kind = _QUESTION_LINE.search(question).groups()
         piece = content.rsplit(f"[{anchor}] (", 1)[-1]
         kind = "useful" if kind == "useful" else "enough"
         if kind == "enough":
@@ -422,9 +423,10 @@ def test_a_long_read_keeps_only_useful_pieces_inside_the_agents_own_turn(server,
     assert all(b1 <= a2 for (_, b1), (a2, _) in zip(dropped, dropped[1:]))  # in order, apart
     assert kept_chars + sum(b - a for a, b in dropped) == len(BODY)   # every char accounted for
 
-    # Each request IS the agent's next request, as the SDK sends it, with the
-    # question line ending the tool output and nothing else added: standard
-    # parameters, thinking off, the reply text only.
+    # Each request IS the agent's next request, as the SDK sends it, the tool
+    # output so far as its last message, and the question opening the
+    # model's reply, which the server continues: the answer is ONE token,
+    # and the agent's own settings are unchanged (no thinking switch).
     asked = [d for d in server.decisions if not d["probe"]]
     reads = [d for d in asked if d["kind"] == "useful"]
     assert len(reads) >= 4
@@ -432,19 +434,41 @@ def test_a_long_read_keeps_only_useful_pieces_inside_the_agents_own_turn(server,
     tool = {k: v for k, v in sent["messages"][-1].items() if k != "content"}
     for d in asked:
         b = d["body"]
-        assert b["messages"][:-1] == sent["messages"][:-1]
-        assert {k: v for k, v in b["messages"][-1].items() if k != "content"} == tool
+        assert b["messages"][:-2] == sent["messages"][:-1]
+        assert {k: v for k, v in b["messages"][-2].items() if k != "content"} == tool
         lead = f"[{d['anchor']}] " + (reader.LEAD if d["kind"] == "useful" else reader.ENOUGH_LEAD)
-        assert b["messages"][-1]["content"].endswith("\nAnswer with one word: yes or no.\n" + lead)
-        assert b["tools"] == sent["tools"] and b["tool_choice"] == "none" and b["reasoning_effort"] == "none"
-        assert b["max_tokens"] == jev.ANSWER_TOKENS and b["stop"] == ["\n"] and b["temperature"] == 0
+        assert b["messages"][-1] == {"role": "assistant", "content": lead}
+        assert b["messages"][-2]["content"].endswith("\nAnswer with one word: yes or no.")
+        assert b["continue_final_message"] is True and b["add_generation_prompt"] is False
+        assert b["tools"] == sent["tools"] and b["tool_choice"] == "none" and "reasoning_effort" not in b
+        assert b["max_tokens"] == 1 and b["temperature"] == 0
 
     # Each request continues what was kept, and so does the agent's next one:
     # its output begins with everything every decision was asked after.
     for d in reads:
-        so_far = d["body"]["messages"][-1]["content"].rsplit(f"[{d['anchor']}] (", 1)[0]
+        so_far = d["body"]["messages"][-2]["content"].rsplit(f"[{d['anchor']}] (", 1)[0]
         assert out.startswith(so_far)
     assert (used["calls"], used["requests"], used["failopen"]) == (1, len(asked), 0)
+
+
+def test_a_server_that_does_not_continue_a_reply_is_asked_the_standard_way(server, monkeypatch):
+    # The question then ends the tool output, nothing else added, thinking off
+    # by the standard switch; the read keeps the same pieces.
+    server.continues = False
+
+    async def body(ledger):
+        await _turn(agent_mod.get_agent(), [_call("call_1")])
+        return await _get("call_1")
+
+    out = _in_a_run(body)
+    assert all(w in out.split("\nKept ", 1)[0] for w in ("opened", "2018"))
+    for d in [d for d in server.decisions if not d["probe"]]:
+        b = d["body"]
+        lead = f"[{d['anchor']}] " + (reader.LEAD if d["kind"] == "useful" else reader.ENOUGH_LEAD)
+        assert b["messages"][-1]["role"] == "tool"
+        assert b["messages"][-1]["content"].endswith("\nAnswer with one word: yes or no.\n" + lead)
+        assert b["reasoning_effort"] == "none" and "continue_final_message" not in b
+        assert b["max_tokens"] == jev.ANSWER_TOKENS and b["stop"] == ["\n"]
 
 
 def _small_turn() -> reader.Turn:

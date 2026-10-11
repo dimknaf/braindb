@@ -10,16 +10,28 @@ compares that probability with a threshold: the model still owns the
 judgement (no keyword rule, no new similarity path); it states it in one
 token instead of a paragraph.
 
-Every request is a standard OpenAI chat completion through the openai
-library, on the agent profile's own endpoint and model: thinking off with
-`reasoning_effort="none"`, `temperature` 0, `logprobs` with `top_logprobs`.
-The answer is the first option token the model writes, either first or
-right after it restates the question's line (some models do, as the worked
-examples write it); its probability comes from that token's top_logprobs,
+Every request is an OpenAI chat completion through the openai library, on
+the agent profile's own endpoint and model, `temperature` 0, `logprobs`
+with `top_logprobs`. A question asked inside a conversation (`ask`) is the
+conversation's own request plus one line naming the options and the
+question, in one of two forms, found once per server (`Server.mode`):
+- "prefill": the line ends the last message, the question opens the
+  model's reply, and the server continues it (`continue_final_message`, as
+  vLLM, SGLang and llama.cpp offer). The request is otherwise the agent's
+  exact request, its own settings included, so it shares the server's
+  cache of it whatever the chat template does with a thinking setting, and
+  the template closes the answer turn's thinking. The answer is the next
+  token.
+- "standard": the line and the question end the conversation, thinking off
+  with `reasoning_effort="none"` (OpenAI's own API has no reply prefill).
+  It shares the cache where the template renders that setting after the
+  conversation, not at its top. The answer is the first option token the
+  model writes, first or right after it restates the question's line.
+Either way the answer's probability comes from that token's top_logprobs,
 or from its own logprob when the server returns no alternatives. A request
 that repeats an earlier one's beginning is served from the server's prefix
-cache, so the fixed guide and examples, or a conversation so far, are
-computed once.
+cache, so a conversation so far, or a fixed guide and examples, is computed
+once.
 
 Any OpenAI-compatible server that returns logprobs and can turn thinking
 off can serve it; `available()` proves that on first use (a clear-cut pair
@@ -146,6 +158,11 @@ def judge_text(entity_type: str, content: str | None, title: str | None = None,
 # judge, wiki triage, the wiki gate, the reader, hops), so together they
 # never put more than this many requests on a server that other work shares.
 _in_flight = threading.BoundedSemaphore(WORKERS)
+# The fields that ask a server to continue the reply a request opens.
+_CONTINUE = {"continue_final_message": True, "add_generation_prompt": False}
+# Server.mode, by (endpoint, model).
+_modes: dict[tuple[str, str], str] = {}
+_modes_lock = threading.Lock()
 
 
 class Server:
@@ -161,35 +178,79 @@ class Server:
         self.effort = True
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None,
-             max_tokens: int = ANSWER_TOKENS, stop: list[str] | None = None):
-        """One chat completion, thinking off, with the logprobs of what it
-        writes. With `tools` (an agent's own, so the request starts as its
-        requests do) the reply must be text."""
+             max_tokens: int = ANSWER_TOKENS, stop: list[str] | None = None,
+             thinking_off: bool = True, extra: dict | None = None):
+        """One chat completion with the logprobs of what it writes: thinking
+        off by the standard switch unless `thinking_off` is False (a reply
+        the request opens, whose template closes the thinking itself); `extra`
+        are request fields beyond OpenAI's own. With `tools` (an agent's own,
+        so the request starts as its requests do) the reply must be text."""
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": 0,
                 "logprobs": True, "top_logprobs": TOP_LOGPROBS}
         if tools:
             body.update(tools=tools, tool_choice="none")
         if stop:
             body["stop"] = stop
+        if extra:
+            body["extra_body"] = extra
         # Waiting for a free slot is bounded like the request itself, so a
         # full limit costs a caller its timeout, never a hang.
         if not _in_flight.acquire(timeout=REQUEST_TIMEOUT_S):
             raise TimeoutError("every JEV request slot stayed busy")
         try:
-            return self._create(body)
+            return self._create(body, thinking_off)
         finally:
             _in_flight.release()
 
-    def _create(self, body: dict):
+    def mode(self) -> str:
+        """How this server is asked a question inside a conversation (module
+        docstring): "prefill" when it continues a reply the request opens,
+        else "standard". Found once per server and model."""
+        key = (str(self.client.base_url), self.model)
+        with _modes_lock:
+            if key not in _modes:
+                _modes[key] = "prefill" if self._continues() else "standard"
+                logger.info("JEV asks this server in the %s form", _modes[key])
+            return _modes[key]
+
+    def _continues(self) -> bool:
+        """Whether a reply the request opens is continued: the probe pair,
+        each with the answer line opening the model's reply after worked
+        examples whose replies write that line and its answer (as the reading
+        prompts' examples do), must be answered by its next token, and
+        rightly."""
+        examples = [{"role": "system", "content": _GUIDE}]
+        for ex in _EXAMPLES[:8]:
+            examples += [{"role": "user", "content": _user(ex["need"], ex["item"])},
+                         {"role": "assistant", "content": f"{LEAD} {ex['useful']}"}]
+        p = []
+        for item in (_PROBE_YES, _PROBE_NO):
+            turns = examples + [{"role": "user", "content": _user(_PROBE_NEED, item)},
+                                {"role": "assistant", "content": LEAD}]
+            try:
+                out = self.chat(turns, max_tokens=1, thinking_off=False, extra=_CONTINUE)
+            except _ItemError:
+                return False  # the server refuses the fields
+            probs, mass = answer(out, YES_NO, LEAD)
+            if mass < MIN_MASS:
+                return False  # a new turn begins instead: not continued
+            p.append(probs["yes"])
+        return p[0] - p[1] >= 0.5
+
+    def _create(self, body: dict, thinking_off: bool = True):
+        effort = thinking_off and self.effort
         try:
-            return self.client.chat.completions.create(
-                **body, **({"reasoning_effort": "none"} if self.effort else {}))
+            return self.client.chat.completions.create(**body, **({"reasoning_effort": "none"} if effort else {}))
+        except openai.APITimeoutError:
+            # A server too slow for JEV now (a long conversation it cannot
+            # take from its cache): off until re-probed, not waited on per call.
+            raise Unavailable("the server did not answer in time") from None
         except (openai.AuthenticationError, openai.PermissionDeniedError, openai.NotFoundError) as e:
             raise Unavailable(f"HTTP {e.status_code}") from None
         except openai.APIStatusError as e:
             if e.status_code not in (400, 413, 422):
                 raise
-            if self.effort:
+            if effort:
                 # A server that rejects the standard switch: once more without
                 # it. If the model then thinks, no option comes first and the
                 # probe keeps JEV off.
@@ -263,25 +324,39 @@ def answer(out, options: list[str], lead: str) -> tuple[dict[str, float], float]
 
 
 def ask(server: Server, messages: list[dict], question: str, options: list[str],
-        tools: list[dict] | None = None) -> tuple[dict[str, float], float, dict]:
-    """`question` asked right after the last of `messages`: each option's
+        tools: list[dict] | None = None, extra: dict | None = None) -> tuple[dict[str, float], float, dict]:
+    """`question` asked right after the last of `messages`, in the request a
+    conversation makes (its `tools`, and `extra`: its own request fields
+    beyond OpenAI's, e.g. chat-template arguments): each option's
     probability at the answer, the mass the options hold there, and the
-    usage. After a tool's output the question ends that output, nothing else
-    added: a template that replays reasoning keys it to the last user
-    message, so a new user turn would re-render the agent's earlier turns and
-    lose the server's prefix cache. After a user's message (a job with no
-    turns of the model's yet) it is its own user turn, which every model
-    answers directly. Either way the question line comes after one line
-    naming the options, which keeps a model that answers with tool calls
-    from reaching for one. The reply stops at the end of its first line."""
-    question = f"Answer with one word: {', '.join(options[:-1])} or {options[-1]}.\n{question}"
+    usage. One line naming the options comes before the question: it keeps
+    a model that answers with tool calls from reaching for one, and one told
+    to keep its replies brief (a low reasoning effort) from ending its reply
+    before the answer.
+
+    Where the server continues a reply the request opens (`Server.mode`),
+    that line ends the last message and the question opens the model's
+    reply, the conversation's own request otherwise unchanged; the answer is
+    its next token.
+
+    Otherwise thinking goes off by the standard switch, and the question
+    follows that line. After a tool's output both end that output, nothing
+    else added: a template that replays reasoning keys it to the last user
+    message, so a new user turn would re-render the agent's earlier turns
+    and lose the server's prefix cache. After a user's message (a job with
+    no turns of the model's yet) they are their own user turn, which every
+    model answers directly. The reply stops at the end of its first line."""
+    line = f"Answer with one word: {', '.join(options[:-1])} or {options[-1]}."
     last = messages[-1]
-    if last.get("role") == "tool":
-        text = last.get("content") or ""
-        asked = messages[:-1] + [{**last, "content": f"{text}{'' if text.endswith(chr(10)) else chr(10)}{question}"}]
+    text = last.get("content") or ""
+    text += "" if text.endswith("\n") else "\n"
+    if server.mode() == "prefill":
+        asked = messages[:-1] + [{**last, "content": text + line}, {"role": "assistant", "content": question}]
+        out = server.chat(asked, tools=tools, max_tokens=1, thinking_off=False, extra={**(extra or {}), **_CONTINUE})
+    elif last.get("role") == "tool":
+        out = server.chat(messages[:-1] + [{**last, "content": f"{text}{line}\n{question}"}], tools=tools, stop=["\n"])
     else:
-        asked = messages + [{"role": "user", "content": question}]
-    out = server.chat(asked, tools=tools, stop=["\n"])
+        out = server.chat(messages + [{"role": "user", "content": f"{line}\n{question}"}], tools=tools, stop=["\n"])
     probs, mass = answer(out, options, question)
     return probs, mass, usage_of(out)
 

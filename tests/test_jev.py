@@ -28,6 +28,7 @@ import logging
 import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from agents.tool_context import ToolContext
 
@@ -144,22 +145,57 @@ def test_a_server_that_refuses_the_thinking_switch_is_asked_without_it_from_then
     assert len(with_effort) == 1                         # refused once, remembered for the process
 
 
-def test_a_question_ends_a_tools_output_and_follows_a_users_message_as_its_own_turn(server):
+_TURNS = [{"role": "user", "content": "q"},
+          {"role": "assistant", "content": None, "tool_calls": [
+              {"id": "c1", "type": "function", "function": {"name": "get_entity", "arguments": "{}"}}]},
+          {"role": "tool", "tool_call_id": "c1", "content": "OUTPUT GOOD\n"}]
+
+
+def test_where_the_server_continues_a_reply_the_question_opens_it_in_the_conversations_own_request(server):
+    # The request is the conversation's own, its own settings included and no
+    # thinking switch, so the server's cache of it serves the question; one
+    # line naming the options ends the output, and the answer is the next
+    # token. Whether the server continues is found once.
+    s = jev.Server()
+    extra = {"chat_template_kwargs": {"reasoning_effort": "low"}}
+    for _ in range(2):
+        jev.ask(s, _TURNS, "[1.1] | useful (yes or no):", jev.YES_NO, None, extra)
+    b = server.bodies[-1]
+    assert b["messages"] == _TURNS[:-1] + [{**_TURNS[-1], "content": "OUTPUT GOOD\nAnswer with one word: yes or no."},
+                                           {"role": "assistant", "content": "[1.1] | useful (yes or no):"}]
+    assert b["continue_final_message"] is True and b["add_generation_prompt"] is False
+    assert b["chat_template_kwargs"] == {"reasoning_effort": "low"} and "reasoning_effort" not in b
+    assert b["max_tokens"] == 1 and set(b) <= STANDARD | {"continue_final_message", "add_generation_prompt",
+                                                          "chat_template_kwargs"}
+    checks = [x for x in server.bodies if x.get("continue_final_message") and x["messages"][0]["content"] == jev._GUIDE]
+    assert len(checks) == 2                              # the probe pair, once per server
+
+
+def test_where_it_does_not_the_question_ends_a_tools_output_or_follows_a_users_message(server):
     # After a tool's output nothing is added but the question (a template that
     # replays reasoning would re-render the agent's turns for a new user turn);
-    # after a user's message it is its own turn. One line names the options.
+    # after a user's message it is its own turn. One line names the options,
+    # and thinking goes off by the standard switch.
+    server.continues = False
     s = jev.Server()
-    turns = [{"role": "user", "content": "q"},
-             {"role": "assistant", "content": None, "tool_calls": [
-                 {"id": "c1", "type": "function", "function": {"name": "get_entity", "arguments": "{}"}}]},
-             {"role": "tool", "tool_call_id": "c1", "content": "OUTPUT GOOD\n"}]
-    jev.ask(s, turns, "[1.1] | useful (yes or no):", jev.YES_NO)
-    assert server.bodies[-1]["messages"] == turns[:-1] + [
-        {**turns[-1], "content": "OUTPUT GOOD\nAnswer with one word: yes or no.\n[1.1] | useful (yes or no):"}]
+    jev.ask(s, _TURNS, "[1.1] | useful (yes or no):", jev.YES_NO)
+    assert server.bodies[-1]["messages"] == _TURNS[:-1] + [
+        {**_TURNS[-1], "content": "OUTPUT GOOD\nAnswer with one word: yes or no.\n[1.1] | useful (yes or no):"}]
+    assert server.bodies[-1]["reasoning_effort"] == "none"
     job = [{"role": "system", "content": "S"}, {"role": "user", "content": "THE JOB GOOD"}]
     jev.ask(s, job, "[m1] | section:", ["A", "B", "new"])
     assert server.bodies[-1]["messages"] == job + [
         {"role": "user", "content": "Answer with one word: A, B or new.\n[m1] | section:"}]
+
+
+def test_a_server_too_slow_to_answer_switches_jev_off_instead_of_being_waited_on(server, ledger):
+    def slow(body):
+        raise httpx.ReadTimeout("too slow")
+
+    server.reply = slow
+    assert jev.judge("need", ["[fact] GOOD"]) is None
+    n = len(server.bodies)
+    assert not jev.available() and len(server.bodies) == n      # off until re-probed: no request per call
 
 
 def _reply(tokens, alternatives=True):

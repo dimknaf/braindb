@@ -232,11 +232,16 @@ class FakeChat:
     Each request's JSON body is kept in `bodies`. `reply(body)` says what the
     model writes: a list of tokens, each `(text, {token: probability})` for a
     token with alternatives (the chosen one is `text`) or `(text, None)`; or
-    an HTTP status for that request alone. `status` answers every request
-    with that status; `alternatives = False` returns only the chosen
-    token's logprob (as some gateways do). `max_tokens` and `stop` apply as
-    a server applies them; usage counts 4 chars of the request a token, and
-    caches what it shares with the request before."""
+    an HTTP status for that request alone (`asked(body)` gives the question
+    line and the content it is asked about, in either of jev's forms).
+    `status` answers every request with that status; `alternatives = False`
+    returns only the chosen token's logprob (as some gateways do);
+    `continues = False` makes it a server that does not continue a reply the
+    request opens (it starts a new turn, as a hosted gateway did), so jev
+    asks it in the standard form. jev's own check of that (`Server.mode`) is
+    answered here. `max_tokens` and `stop` apply as a server applies them;
+    usage counts 4 chars of the request a token, and caches what it shares
+    with the request before."""
 
     def __init__(self, model: str, reply):
         import threading
@@ -245,8 +250,33 @@ class FakeChat:
         self.bodies: list[dict] = []
         self.status: int | None = None
         self.alternatives = True
+        self.continues = True
         self._lock = threading.Lock()
         self._last = ""
+
+    @staticmethod
+    def asked(body: dict) -> tuple[str, str]:
+        """The question line a JEV request asks, and the content it asks it
+        about: the reply's opening and the message before it (continue form),
+        or the last line of the last message and the rest of it, or the
+        message before when the question is its own turn (standard form)."""
+        msgs = body["messages"]
+        last = msgs[-1]
+        if last["role"] == "assistant":
+            return last["content"], msgs[-2]["content"]
+        lines = (last["content"] or "").rstrip("\n").split("\n")
+        if last["role"] == "user" and len(msgs) > 1 and msgs[-2]["role"] == "user":
+            return lines[-1], msgs[-2]["content"]
+        return lines[-1], "\n".join(lines[:-1])
+
+    def _check(self, body: dict):
+        """jev's check that a reply the request opens is continued."""
+        from braindb.services import jev
+
+        if not self.continues:
+            return [("\n", None)]                   # a new turn begins: no answer
+        want = "yes" if jev._PROBE_YES in body["messages"][-2]["content"] else "no"
+        return [(f" {want}", {f" {want}": 0.98, f" {'no' if want == 'yes' else 'yes'}": 0.01})]
 
     def handle(self, request):
         import json as _json
@@ -254,11 +284,18 @@ class FakeChat:
 
         import httpx
 
+        from braindb.services import jev
+
         body = _json.loads(request.content)
         with self._lock:
             self.bodies.append(body)
         status = self.status or None
-        tokens = None if status else self.reply(body)
+        if not status and body.get("continue_final_message") and body["messages"][0]["content"] == jev._GUIDE:
+            tokens = self._check(body)
+        elif not status and body.get("continue_final_message") and not self.continues:
+            tokens = [("\n", None)]
+        else:
+            tokens = None if status else self.reply(body)
         if isinstance(tokens, int):
             status = tokens
         if status:
@@ -322,6 +359,7 @@ def _no_model_server(monkeypatch):
     _serve(monkeypatch, lambda request: httpx.Response(401, json={"error": {"message": "no model server in tests"}}))
     monkeypatch.setattr(jev, "_judge", None)
     monkeypatch.setattr(jev, "_off_until", 0.0)
+    monkeypatch.setattr(jev, "_modes", {})
     monkeypatch.setattr(reader, "_state", {"server": None, "off_until": 0.0})
     monkeypatch.setattr(hops, "_state", {"off_until": 0.0})
     monkeypatch.setattr(wiki_gate, "_state", {"server": None, "off_until": 0.0})
