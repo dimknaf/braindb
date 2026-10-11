@@ -18,6 +18,7 @@ from braindb import custom_profile
 from braindb.agent.agent import run_typed, get_gated_writer_agent, get_maintainer_agent, get_writer_agent
 from braindb.agent.run_state import install_handoff_slot, release_handoff_slot
 from braindb.agent.schemas import MaintainerClusterDecision, MaintainerClusterItem, WikiWriteResult
+from braindb.agent.tools import first_turn
 from braindb.config import settings
 from braindb.db import get_conn
 from braindb.services.activity_log import log_activity
@@ -345,19 +346,33 @@ _STEPS = ("## Mandatory order of work", "## Identity discipline")
 _GATED_SECTIONS_MAX_CHARS = 12000
 
 
-def _gated_template(tmpl: str, gate) -> str | None:
+def _gated_template(tmpl: str) -> str | None:
     """The writer template with its research steps replaced by the gate's
-    facts, or None when the template does not hold those steps."""
+    (the checked facts come last in the prompt), or None when the template
+    does not hold those steps."""
     a, b = tmpl.find(_STEPS[0]), tmpl.find(_STEPS[1])
     if a < 0 or b < a:
         return None
-    return tmpl[:a] + _GATED_STEPS.replace("%%FOUND%%", _members_block(gate.found)) + tmpl[b:]
+    return tmpl[:a] + _GATED_STEPS + tmpl[b:]
 
 
-def _gated_body_block(wiki_id: str, revision: int, old_body: str, gate) -> str:
-    """A long page as a gated job sees it: the outline, where each kept fact
+def _gated_outline_block(wiki_id: str, revision: int, old_body: str, sections: list) -> str:
+    """A long page as a gated job's prompt shows it before the facts: its
+    outline, lettered for the gate's placement."""
+    lines = [f"[BODY OMITTED — {len(old_body)} chars, too large to inline (wiki_id {wiki_id}, revision {revision}).",
+             "Outline (section: chars - its first words):"]
+    lines += wiki_gate.outline(sections)
+    lines.append("Where this job's facts belong, and those sections in full, follow the facts at the end of this "
+                 "prompt. Read another section with read_wiki_section whenever the job's rules need it (the header, "
+                 "the references, a section a fact also changes). Edit with edit_wiki_section (expect_revision "
+                 'as above), then validate_wiki and final_answer(mode="attach", body="").]'
+                 + _density_nudge(len(old_body)))
+    return "\n".join(lines)
+
+
+def _gated_sections_block(gate, sections: list) -> str:
+    """What a gated job's prompt ends with on a long page: where each fact
     goes, and only those sections in full (within a budget)."""
-    _, sections = parse_sections(old_body)
     targets: dict[str, list[str]] = {}
     for fid, name in gate.sections.items():
         targets.setdefault(name, []).append(fid)
@@ -370,22 +385,16 @@ def _gated_body_block(wiki_id: str, revision: int, old_body: str, gate) -> str:
                 budget -= s.char_count
             else:
                 too_long.append(s.name)
-    lines = [f"[BODY OMITTED — {len(old_body)} chars, too large to inline (wiki_id {wiki_id}, revision {revision}).",
-             "Outline (section: chars):"]
-    lines += [f"- {s.name}: {s.char_count}" for s in sections]
-    lines.append("This job's facts belong in these sections (section <- fact ids):")
+    lines = ["### Where this job's facts belong (section <- fact ids)"]
     lines += [f"- {'a NEW section (name it)' if name == 'new' else name} <- {', '.join(ids)}"
               for name, ids in targets.items()]
     if unplaced:
         lines.append(f"Place these yourself, reading the sections you need: {', '.join(unplaced)}")
     if too_long:
         lines.append(f"Too long to show here; read before replacing: {', '.join(too_long)}")
-    lines.append(("Those sections are shown in full below. " if shown else "")
-                 + "Read another section with read_wiki_section whenever the job's rules need it (the header, "
-                 "the references, a section a fact also changes). Edit with edit_wiki_section (expect_revision "
-                 'as above), then validate_wiki and final_answer(mode="attach", body="").]'
-                 + _density_nudge(len(old_body)))
-    return "\n".join(lines) + ("\n\n" + "\n\n".join(shown) if shown else "")
+    if shown:
+        lines.append("Those sections in full:")
+    return "\n\n" + "\n".join(lines) + ("\n\n" + "\n\n".join(shown) if shown else "")
 
 
 def _density_nudge(chars: int) -> str:
@@ -434,9 +443,11 @@ async def wiki_write():
     process/bookkeeping: the prior version is snapshotted (reversible) and
     `summarises` relations are reconciled *additively* from the LLM's inline
     refs. The LLM researches with its own tools before writing — unless
-    JEV_WIKI_GATE settles an attach/create job first: the writer then gets
-    only the facts the gate kept (and, on a long page, only the sections they
-    belong in) and edits without research tools (services/wiki_gate.py).
+    JEV_WIKI_GATE takes an attach/create job: the facts memory holds about the
+    subject are then checked one at a time inside the gated writer's own first
+    request, and it gets only those kept (and, on a long page, only the
+    sections they belong in) and edits without research tools
+    (services/wiki_gate.py).
     """
     # 1. Pick + claim a bucket.
     with get_conn() as conn:
@@ -514,20 +525,6 @@ async def wiki_write():
             )
         )
 
-    # 1b. The JEV gate (JEV_WIKI_GATE, services/wiki_gate.py): which facts
-    #     reach the writer and, on a page too long to inline, which sections
-    #     it is shown, taken as one-token picks before it starts. None (off,
-    #     consolidate, or anything the gate cannot settle) -> the full writer.
-    gate = None
-    try:
-        if mode in ("attach", "create") and wiki_gate.wanted():
-            gate = await asyncio.to_thread(
-                wiki_gate.prepare, mode, canonical, old_body, members,
-                mode == "attach" and len(old_body) > _INLINE_BODY_MAX_CHARS)
-    except Exception:
-        logger.exception("JEV wiki gate failed; the full writer runs")
-        gate = None
-
     def _related_wikis_block(rows: list[dict]) -> str:
         if not rows:
             return "(none — no neighbouring pages exist yet)"
@@ -552,24 +549,46 @@ async def wiki_write():
     # `.add.md` fragments are appended after substitution. No active profile ->
     # both are no-ops and this prompt is byte-identical to the base.
     _writer_tmpl = custom_profile.replace_or_base(_WRITER_PROMPT, "wiki_writer")
-    # With the gate, the research steps' outcome is given: its facts replace
-    # them, and a long page shows only the sections those facts belong in.
-    _gated = _gated_template(_writer_tmpl, gate) if gate else None
-    if _gated is None:
-        gate = None  # off, or not the template the gate was written for
-    long_gated = gate is not None and mode == "attach" and len(old_body) > _INLINE_BODY_MAX_CHARS
-    prompt = (
-        (_gated or _writer_tmpl)
-        .replace("%%MODE%%", mode)
-        .replace("%%CANONICAL%%", canonical)
-        .replace("%%WIKI_ID%%", bucket["target_wiki_id"] or "(assigned after write)")
-        .replace("%%MEMBERS%%", _members_block(gate.members if gate else members))
-        .replace("%%CURRENT_BODY%%",
-                 _gated_body_block(bucket["target_wiki_id"], wiki["revision"], old_body, gate) if long_gated
-                 else _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
-        .replace("%%RELATED_WIKIS%%", _related_wikis_block(related))
-        .replace("%%DUPLICATES%%", _dupes_block(dupes))
-    ) + _now_line() + custom_profile.additions("wiki_writer")
+
+    def _prompt(tmpl: str, members_block: str, body_block: str) -> str:
+        return (
+            tmpl
+            .replace("%%MODE%%", mode)
+            .replace("%%CANONICAL%%", canonical)
+            .replace("%%WIKI_ID%%", bucket["target_wiki_id"] or "(assigned after write)")
+            .replace("%%MEMBERS%%", members_block)
+            .replace("%%CURRENT_BODY%%", body_block)
+            .replace("%%RELATED_WIKIS%%", _related_wikis_block(related))
+            .replace("%%DUPLICATES%%", _dupes_block(dupes))
+        ) + _now_line() + custom_profile.additions("wiki_writer")
+
+    # 2b. The JEV gate (JEV_WIKI_GATE, services/wiki_gate.py), inside the
+    #     gated writer's own first request: the job is its prompt (research
+    #     steps replaced, a long page as its lettered outline), then LAST the
+    #     facts memory holds about the subject, each kept or rolled back by
+    #     one token, and on a long page each member's and kept fact's section;
+    #     those sections close the prompt. None (off, consolidate, a profile
+    #     that replaces the writer's prompt, or anything the gate cannot do)
+    #     -> the full writer, with exactly today's prompt.
+    gate = None
+    long_page = mode == "attach" and len(old_body) > _INLINE_BODY_MAX_CHARS
+    sections = parse_sections(old_body)[1] if long_page else []
+    _gated = _gated_template(_writer_tmpl)
+    try:
+        if mode in ("attach", "create") and _gated is not None and wiki_gate.wanted():
+            head = _prompt(_gated, wiki_gate.members_block(members),
+                           _gated_outline_block(bucket["target_wiki_id"], wiki["revision"], old_body, sections)
+                           if long_page else _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
+            turn = await first_turn(get_gated_writer_agent(), head.strip())
+            gate = await asyncio.to_thread(wiki_gate.prepare, turn, canonical, old_body, members, sections)
+    except Exception:
+        logger.exception("JEV wiki gate failed; the full writer runs")
+        gate = None
+    if gate:
+        prompt = gate.prompt + (_gated_sections_block(gate, sections) if long_page else "")
+    else:
+        prompt = _prompt(_writer_tmpl, _members_block(members),
+                         _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
     # Capture pre-run revision on the target wiki for `attach` mode so we
     # can detect whether the writer used the section-edit tools (each
     # bumps `wikis_ext.revision` directly). The writer may then submit an

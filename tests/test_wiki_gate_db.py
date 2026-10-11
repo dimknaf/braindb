@@ -5,14 +5,15 @@ the isolated test stack). The gate's decision and the writer agent are both
 stubbed: this pins the ROUTE's contract, not the model —
 
 - a gated job reaches the writer with only the kept facts: the research and
-  identity steps are replaced by the gate's facts, a found fact the gate left
+  identity steps are replaced by the gate's, the job is the gated writer's
+  first request (the one the gate decides in), a found fact the gate left
   out is not in the prompt, the writer runs without research tools, and the
   activity row records the gate;
 - without a gate (off, no decision, or a failing gate) the writer's prompt is
   byte-identical to the pre-gate assembly and runs on the full writer;
 - a handoff successor of a gated job runs on the gated writer too;
-- on a long page the writer is shown only the sections its facts belong in,
-  within a budget, and is told what it was not shown;
+- on a long page the job shows the lettered outline, and after the facts
+  only the sections they belong in, within a budget, saying what it left out;
 - a gated no-op is accepted like any other, with the gate on its row.
 """
 from __future__ import annotations
@@ -32,6 +33,7 @@ from braindb.agent.run_state import record_handoff
 from braindb.agent.schemas import WikiWriteResult
 from braindb.services import wiki_jobs
 from braindb.services.wiki_gate import Gate
+from braindb.services.wiki_sections import parse_sections
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://braindb:braindb@localhost:5436/braindb_test")
 HEADER = ("<!-- wiki:meta canonical_name=PytestGate Calder Labs language=en -->\n# PytestGate Calder Labs\n"
@@ -118,26 +120,37 @@ def _agent_stub(calls, result):
     return run_typed
 
 
-def _use_gate(monkeypatch, gate):
+def _use_gate(monkeypatch, gate, turns=None):
+    """`prepare` as the router sees it: the gated writer's prompt is its first
+    request's job, then the kept facts."""
+    def prepare(turn, canonical, old_body, members, sections):
+        if turns is not None:
+            turns.append(turn)
+        found = "".join(f"\n\n[f{i}] id: {f['id']}\n  content: {f['content']}" for i, f in enumerate(gate.found, 1))
+        gate.prompt = f"{turn.messages[-1]['content']}\n\n### Facts found in memory{found}"
+        return gate
     monkeypatch.setattr(wiki_router.wiki_gate, "wanted", lambda: True)
-    monkeypatch.setattr(wiki_router.wiki_gate, "prepare", lambda *a, **k: gate)
+    monkeypatch.setattr(wiki_router.wiki_gate, "prepare", prepare)
 
 
 def test_a_gated_job_reaches_the_writer_with_only_the_kept_facts(short_page, monkeypatch):
     conn, ids = short_page
     found = {"id": str(uuid.uuid4()), "entity_type": "fact", "content": "_pytest_gate Calder Labs won a prize", "keywords": []}
     left_out = str(uuid.uuid4())
-    calls = []
-    _use_gate(monkeypatch, _gate(ids, found=[found], excluded=[left_out]))
+    calls, turns = [], []
+    _use_gate(monkeypatch, _gate(ids, found=[found], excluded=[left_out]), turns)
     monkeypatch.setattr(wiki_router, "run_typed", _agent_stub(calls, WikiWriteResult(
         mode="attach", body=ids["body"] + f"Both [[ref:{ids['m1']}]] [[ref:{ids['m2']}]].\n")))
     result = asyncio.run(wiki_router.wiki_write())
     assert result["written"] == 1
     prompt, agent = calls[0]
     assert "Step 1 — Gather raw facts" not in prompt and "MANDATORY `delegate_to_subagent`" not in prompt
-    assert "Facts found in memory about this subject" in prompt and found["id"] in prompt
-    assert ids["m1"] in prompt and ids["m2"] in prompt and left_out not in prompt
+    assert prompt.index(ids["m1"]) < prompt.index("### Facts found in memory") < prompt.index(found["id"])
+    assert ids["m2"] in prompt and left_out not in prompt
     assert agent is agent_mod.get_gated_writer_agent()
+    # the gate decided inside the gated writer's own first request for this job
+    assert turns[0].messages[0] == {"content": agent_mod._GATED_WRITER_PROMPT, "role": "system"}
+    assert prompt.startswith(turns[0].messages[1]["content"])
     rows = _write_row(conn, ids["wiki"])
     assert rows and rows[0]["gate"]["excluded"] == [left_out] and rows[0]["gate"]["found"] == [found["id"]]
 
@@ -197,8 +210,10 @@ def test_a_long_page_shows_only_the_sections_its_facts_belong_in(long_page, monk
     asyncio.run(wiki_router.wiki_write())
     prompt, _ = calls[0]
     assert f"- timeline <- {ids['m1']}" in prompt and "TIMELINE_TEXT 2019 founded." in prompt
-    assert "OVERVIEW_ONLY_TEXT" not in prompt and "FINANCES_TEXT" not in prompt
-    assert "- overview: " in prompt and "- finances: " in prompt          # the outline still names them
+    assert prompt.count("OVERVIEW_ONLY_TEXT") < 10                        # its first words only, in the outline
+    assert "<!-- section: overview -->" not in prompt and "<!-- section: finances -->" not in prompt
+    assert "A. overview: " in prompt and "C. finances: " in prompt          # the outline still names them
+    assert prompt.index("C. finances: ") < prompt.index("### Facts found in memory") < prompt.index("- timeline <- ")
     assert f"Place these yourself, reading the sections you need: {ids['m2']}" in prompt
     assert "revision 1" in prompt and "the others stay as they are" not in prompt
 
@@ -221,9 +236,11 @@ def test_the_long_page_block_keeps_to_its_budget_and_says_what_it_left_out():
     body = HEADER + f"<!-- section: overview -->\n{big}\n<!-- section: timeline -->\nTIMELINE_TEXT.\n"
     members = [{"id": "m1", "entity_type": "fact", "content": "a", "keywords": []},
                {"id": "m2", "entity_type": "fact", "content": "b", "keywords": []}]
-    block = wiki_router._gated_body_block("w", 3, body, Gate(members, [], sections={"m1": "overview"}))
+    _, sections = parse_sections(body)
+    block = (wiki_router._gated_outline_block("w", 3, body, sections)
+             + wiki_router._gated_sections_block(Gate(members, [], sections={"m1": "overview"}), sections))
     assert big not in block and "Too long to show here; read before replacing: overview" in block
     assert "Place these yourself, reading the sections you need: m2" in block
-    assert "TIMELINE_TEXT" not in block and "revision 3" in block
-    assert "Those sections are shown in full below" not in block       # nothing was shown
+    assert "<!-- section: timeline -->" not in block and "revision 3" in block
+    assert "Those sections in full" not in block                        # nothing was shown
     assert "ALREADY LONG" in block                                      # the density paragraph long pages get
