@@ -273,10 +273,12 @@ class Settings(BaseSettings):
     # JEV — closed yes/no relevance judgements read from one token's
     # probability (services/jev.py). SELF-HOSTED vLLM ONLY: it needs vLLM's
     # token-id prompts, /tokenize and logprob_token_ids, and on any other
-    # endpoint its first-use probe keeps it off. Off by default, and with it
-    # off nothing changes. On, a recall made while answering an /agent/query
-    # request that states a `need` keeps only the items the model judges
-    # useful for that need.
+    # endpoint its first-use probe keeps it off. This switch is the recall
+    # filter only: off by default, and with it off recall is unchanged. On, a
+    # recall made while answering an /agent/query request that states a
+    # `need` keeps only the items the model judges useful for that need. The
+    # other JEV features below (wiki triage, wiki gate, reader, hops) have
+    # switches of their own.
     jev_enabled: bool = False
     # Minimum P(useful) an item needs to be kept. Chosen on dev needs over a
     # news memory: every threshold from 0.01 to 0.4 kept the same essential

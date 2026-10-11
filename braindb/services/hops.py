@@ -152,7 +152,7 @@ def _extend(turn: reader.Turn, shown: list[str], text: str, question: str, deadl
               f"{question}\n")
     # Recall's output through this line, so that a neighbour rolled back
     # before any is kept returns to a cached block near it.
-    spend(jev._usage(server.complete({"prompt": c + server.encode(memory), "max_tokens": 1, "temperature": 0})))
+    spend(jev.usage_of(server.complete({"prompt": c + server.encode(memory), "max_tokens": 1, "temperature": 0})))
     seen, frontier = set(shown), list(shown)
     offered, kept, checked, done = 0, 0, False, False
     for hop in range(1, HOPS + 1):

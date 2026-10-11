@@ -40,7 +40,6 @@ before.
 from __future__ import annotations
 
 import logging
-import re
 import string
 import threading
 import time
@@ -54,7 +53,7 @@ from braindb.db import get_conn
 from braindb.schemas.search import ContextRequest
 from braindb.services import hops, jev, reader
 from braindb.services.context import assemble_context
-from braindb.services.wiki_jobs import fetch_members, keywords_from_meta, parse_refs
+from braindb.services.wiki_jobs import REF_RE, fetch_members, keywords_from_meta, parse_refs
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +67,6 @@ PACK_HOPS = 6      # with JEV_HOPS on, facts one relation away from the members,
 FACT_CHARS = 1200  # of each fact's content
 DEADLINE_S = 90    # for all of a job's decisions
 WORKERS = 8        # placements of one job in parallel (jev's in-flight limit still applies)
-_REF = re.compile(r"\[\[ref:[^\]]*\]\]")
 
 _state: dict = {"server": None, "off_until": 0.0}
 _lock = threading.Lock()
@@ -123,7 +121,7 @@ def outline(sections: list) -> list[str]:
     """A long page's outline lines: lettered for placement when it has no more
     sections than there are letters."""
     mark = (lambda i: f"{LETTERS[i]}.") if len(sections) <= len(LETTERS) else (lambda i: "-")
-    return [f"{mark(i)} {s.name}: {s.char_count} chars - {_clip(_REF.sub('', s.content), 110)}"
+    return [f"{mark(i)} {s.name}: {s.char_count} chars - {_clip(REF_RE.sub('', s.content), 110)}"
             for i, s in enumerate(sections)]
 
 
@@ -166,10 +164,10 @@ def _switch_off(error: Exception) -> None:
 # shares its name.
 _PROBE_HEAD = "### Facts found in memory\nSUBJECT: Rowan bakery\nSUMMARY: a bakery on Tarn Street, opened in 2018."
 _PROBE_FACTS = ({"id": "probe-1", "entity_type": "fact", "content": "Kel Aster opened the Rowan bakery on Tarn Street in June 2018."},
-                {"id": "probe-2", "entity_type": "fact", "content": "Rowan Atkinson starred in the 1990s sitcom Mr. Bean."})
+                {"id": "probe-2", "entity_type": "fact", "content": "Rowan Pell, the Brenno actor, starred in the 1990s sitcom Tarn Lane."})
 
 
-def _ready(turn: reader.Turn) -> tuple[jev._Server, dict, dict, int, dict]:
+def _ready(turn: reader.Turn) -> tuple[jev.Server, dict, dict, int, dict]:
     """The server, the yes/no and the section options, the served window and
     the rendering markers, probed once per process in the gated writer's own
     system prompt and tools (again after REPROBE_S when it was switched off)."""
@@ -264,7 +262,7 @@ def _decide(ready: tuple, turn: reader.Turn, canonical: str, old_body: str, memb
     m_ids = server.encode(memory)
     # The prompt through the subject, so that a fact left out before any is
     # kept rolls back to a cached block near it.
-    u = jev._usage(server.complete({"prompt": c + m_ids, "max_tokens": 1, "temperature": 0}))
+    u = jev.usage_of(server.complete({"prompt": c + m_ids, "max_tokens": 1, "temperature": 0}))
     usage["requests"] += 1
     for k in ("input", "cached", "output"):
         usage[k] += u[k]

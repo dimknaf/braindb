@@ -110,10 +110,12 @@ def get_need() -> str:
 
 
 # Reading question — what an /agent/query request's long reads are read for
-# by the JEV reader (services/reader.py): its need, else its query when it
-# is short enough to read for. Set by the router only while the reader is
-# on; read DOWNWARD by `run_typed` and `get_entity`; subagents inherit it
-# like the need. Wiki runs never have one, so their reads are unchanged.
+# by the JEV reader (services/reader.py), and what JEV hops judge recall's
+# neighbours for (services/hops.py): its need, else its query when it is
+# short enough to read for. Set by the router only while the reader or hops
+# are on; read DOWNWARD by `run_typed`, `get_entity` and `recall_memory`;
+# subagents inherit it like the need. Wiki runs never have one, so their
+# reads and recalls are unchanged.
 _reading_var: ContextVar[str] = ContextVar("braindb_reading", default="")
 
 
@@ -138,8 +140,8 @@ def get_reading() -> str:
 # reader read. A tool never sees the conversation, so `CountdownHooks`
 # records it here: before each LLM call, the system prompt and the input
 # items as sent (before any nudge, which lasts one call only); after it, the
-# response's items. `run_typed` installs a record only when the reader serves
-# the request, and None otherwise, so a nested run (a subagent has its own
+# response's items. `run_typed` installs a record only when the reader or
+# hops serve the request, and None otherwise, so a nested run (a subagent has its own
 # conversation) never writes into its caller's. Same discipline as the
 # slots: a mutable object in a ContextVar.
 

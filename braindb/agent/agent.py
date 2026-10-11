@@ -30,6 +30,7 @@ from agents import (
     Agent,
     ModelSettings,
     OpenAIChatCompletionsModel,
+    RunContextWrapper,
     Runner,
     StopAtTools,
     set_tracing_disabled,
@@ -78,6 +79,7 @@ from braindb.agent.tools import (
     save_rule,
     save_source,
     save_thought,
+    sdk_turn,
     search_sql,
     submit_answer,
     submit_maintainer,
@@ -106,6 +108,9 @@ SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system_prompt.md").read_te
 _READER_SECTION = (Path(__file__).parent / "prompts" / "reader_system.md").read_text(encoding="utf-8")
 # ...and, with hops on, how a neighbour offered after a recall is judged.
 _HOPS_SECTION = (Path(__file__).parent / "prompts" / "hops_system.md").read_text(encoding="utf-8")
+# The writer behind the JEV gate (services/wiki_gate.py), with worked
+# examples of the gate's two questions.
+_GATED_WRITER_PROMPT = (Path(__file__).parent / "prompts" / "writer_gated_system.md").read_text(encoding="utf-8")
 
 
 def _reading_prompt() -> str:
@@ -113,6 +118,7 @@ def _reading_prompt() -> str:
     sections = [s for on, s in ((settings.jev_reader, _READER_SECTION), (settings.jev_hops, _HOPS_SECTION))
                 if on and settings.self_hosted]
     return "\n\n".join([SYSTEM_PROMPT.rstrip(), *sections]) if sections else SYSTEM_PROMPT
+
 
 # Every tool except the final submit (that one is typed per purpose).
 _BASE_TOOLS = [
@@ -378,9 +384,6 @@ def get_writer_agent() -> Agent:
     )
 
 
-_GATED_WRITER_PROMPT = (Path(__file__).parent / "prompts" / "writer_gated_system.md").read_text(encoding="utf-8")
-
-
 def get_gated_writer_agent() -> Agent:
     """The writer behind the JEV gate (services/wiki_gate.py): the page's own
     tools only — no recall, search, subagent or entity writes — so the facts
@@ -393,6 +396,14 @@ def get_gated_writer_agent() -> Agent:
         instructions=_GATED_WRITER_PROMPT,
         base_tools=(),
     )
+
+
+async def first_turn(agent: Agent, prompt: str) -> reader.Turn:
+    """`agent`'s first request for `prompt` (its system prompt, the prompt,
+    its tools and chat-template arguments): the wiki gate decides inside it
+    before the agent runs."""
+    ctx = RunContextWrapper(context=None)
+    return await sdk_turn(agent, ctx, [{"role": "user", "content": prompt}], await agent.get_system_prompt(ctx))
 
 
 def get_subagent() -> Agent:

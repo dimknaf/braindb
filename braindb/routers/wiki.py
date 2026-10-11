@@ -15,10 +15,9 @@ from pathlib import Path
 from fastapi import APIRouter, Query
 
 from braindb import custom_profile
-from braindb.agent.agent import run_typed, get_gated_writer_agent, get_maintainer_agent, get_writer_agent
+from braindb.agent.agent import first_turn, run_typed, get_gated_writer_agent, get_maintainer_agent, get_writer_agent
 from braindb.agent.run_state import install_handoff_slot, release_handoff_slot
 from braindb.agent.schemas import MaintainerClusterDecision, MaintainerClusterItem, WikiWriteResult
-from braindb.agent.tools import first_turn
 from braindb.config import settings
 from braindb.db import get_conn
 from braindb.services.activity_log import log_activity
@@ -572,10 +571,11 @@ async def wiki_write():
     #     -> the full writer, with exactly today's prompt.
     gate = None
     long_page = mode == "attach" and len(old_body) > _INLINE_BODY_MAX_CHARS
-    sections = parse_sections(old_body)[1] if long_page else []
+    sections: list = []
     _gated = _gated_template(_writer_tmpl)
     try:
         if mode in ("attach", "create") and _gated is not None and wiki_gate.wanted():
+            sections = parse_sections(old_body)[1] if long_page else []
             head = _prompt(_gated, wiki_gate.members_block(members),
                            _gated_outline_block(bucket["target_wiki_id"], wiki["revision"], old_body, sections)
                            if long_page else _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))

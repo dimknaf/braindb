@@ -429,48 +429,31 @@ async def save_rule(
 # ENTITIES — read / update / delete                                      #
 # ====================================================================== #
 
-async def _next_turn(ctx: ToolContext, loop) -> reader.Turn:
-    """The agent's next turn up to this call's output — its messages, tools
+async def sdk_turn(agent, ctx, items: list, system: str | None) -> reader.Turn:
+    """A request of `agent` for the conversation `items` — its messages, tools
     and chat-template arguments — built the way the SDK's chat model builds
-    its own request, from the conversation the hooks recorded."""
+    its own request. JEV decides inside such a request (services/reader.py)."""
     from agents.models.chatcmpl_converter import Converter
     from agents.util._json import _to_dump_compatible
 
-    agent = loop.agent
     model = agent.model
-    items = loop.items + loop.response + [
-        {"type": "function_call_output", "call_id": ctx.tool_call_id, "output": ""}]
     messages = Converter.items_to_messages(
         items, model=model.model, base_url=str(model._client.base_url),
         should_replay_reasoning_content=model.should_replay_reasoning_content,
         strict_feature_validation=model._strict_feature_validation)
-    if loop.system:
-        messages.insert(0, {"content": loop.system, "role": "system"})
-    tools = [Converter.tool_to_openai(t) for t in await agent.get_all_tools(ctx)]
-    template = (agent.model_settings.extra_body or {}).get("chat_template_kwargs")
-    return reader.Turn(_to_dump_compatible(messages), _to_dump_compatible(tools), template)
-
-
-async def first_turn(agent, prompt: str) -> reader.Turn:
-    """An agent's first request for `prompt` (its system prompt, the prompt,
-    its tools and chat-template arguments), built as `_next_turn` builds a
-    later one: the wiki gate decides inside it before the agent runs."""
-    from agents.models.chatcmpl_converter import Converter
-    from agents.run_context import RunContextWrapper
-    from agents.util._json import _to_dump_compatible
-
-    ctx = RunContextWrapper(context=None)
-    model = agent.model
-    messages = Converter.items_to_messages(
-        [{"role": "user", "content": prompt}], model=model.model, base_url=str(model._client.base_url),
-        should_replay_reasoning_content=model.should_replay_reasoning_content,
-        strict_feature_validation=model._strict_feature_validation)
-    system = await agent.get_system_prompt(ctx)
     if system:
         messages.insert(0, {"content": system, "role": "system"})
     tools = [Converter.tool_to_openai(t) for t in await agent.get_all_tools(ctx)]
     template = (agent.model_settings.extra_body or {}).get("chat_template_kwargs")
     return reader.Turn(_to_dump_compatible(messages), _to_dump_compatible(tools), template)
+
+
+async def _next_turn(ctx: ToolContext, loop) -> reader.Turn:
+    """The agent's next turn up to this call's output, from the conversation
+    the hooks recorded."""
+    items = loop.items + loop.response + [
+        {"type": "function_call_output", "call_id": ctx.tool_call_id, "output": ""}]
+    return await sdk_turn(loop.agent, ctx, items, loop.system)
 
 
 async def _hop(ctx: ToolContext, shown: list[str], text: str) -> Optional[str]:

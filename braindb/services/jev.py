@@ -48,6 +48,8 @@ from braindb.services.wiki_sections import parse_sections
 logger = logging.getLogger(__name__)
 
 _PROMPTS = Path(__file__).resolve().parent.parent / "agent" / "prompts"
+_GUIDE = (_PROMPTS / "jev_judge.md").read_text(encoding="utf-8").strip()
+_EXAMPLES = json.loads((_PROMPTS / "jev_examples.json").read_text(encoding="utf-8"))
 
 # The answer every judgement completes, and the spellings read back from
 # the logits. Each spelling must be ONE token (`available()` checks).
@@ -86,20 +88,16 @@ _PROBE_YES = "[fact] Kel Aster opened the Rowan bakery on 2 June 2018."
 _PROBE_NO = "[fact] The Rowan bakery sells rye bread on Saturdays."
 
 
-class _Unavailable(Exception):
+class Unavailable(Exception):
     """The server cannot do JEV: off until re-probed. Its message is ours —
     never a URL, a key or stored text."""
-
-
-Unavailable = _Unavailable  # the name callers outside this module catch (`Choice` raises it)
 
 
 class _ItemError(Exception):
     """The server refused ONE request (400/413/422): that item stays unjudged."""
 
 
-
-def _clean(text: str) -> str:
+def clean(text: str) -> str:
     """Stored text is data, never prompt structure: '<' becomes '‹', so no
     stored string can open or close a chat turn ('<|im_end|>' inside an item
     would otherwise be read as the real special token). Blank runs are
@@ -127,7 +125,7 @@ def judge_text(entity_type: str, content: str | None, title: str | None = None,
         parts = (title, disambiguation, summary, body)
     else:
         parts = (title, body)
-    text = _clean(REF_RE.sub("", "\n".join(p for p in parts if p)))
+    text = clean(REF_RE.sub("", "\n".join(p for p in parts if p)))
     if len(text) > ITEM_CHARS:
         # The guide tells the judge a cut item says more after the cut: on
         # dev this kept long items whose answer lies past the window.
@@ -144,7 +142,7 @@ _session = requests.Session()
 _in_flight = threading.BoundedSemaphore(WORKERS)
 
 
-class _Server:
+class Server:
     """The agent profile's own vLLM endpoint and model: JEV has no endpoint
     settings of its own."""
 
@@ -173,7 +171,7 @@ class _Server:
             if r.status_code >= 500 and attempt == 1:
                 continue
             if r.status_code in (401, 403, 404):
-                raise _Unavailable(f"HTTP {r.status_code}")
+                raise Unavailable(f"HTTP {r.status_code}")
             if r.status_code in (400, 413, 422):
                 raise _ItemError(f"HTTP {r.status_code}")
             r.raise_for_status()
@@ -202,7 +200,7 @@ class _Server:
         return self._send("POST", self.root + "/tokenize", {**body, **options})["tokens"]
 
 
-def _split(server: _Server, turns: list[dict]) -> tuple[list[int], list[int]]:
+def _split(server: Server, turns: list[dict]) -> tuple[list[int], list[int]]:
     """`turns` plus one more user turn through the server's template, cut
     where that turn's content goes: the fixed tokens before it, and the
     tokens after it (the end of the turn and the answer header). Two
@@ -214,7 +212,7 @@ def _split(server: _Server, turns: list[dict]) -> tuple[list[int], list[int]]:
     return a[:n], a[n + len(server.encode("\x01")):]
 
 
-def _usage(out: dict) -> dict:
+def usage_of(out: dict) -> dict:
     """One response's token usage, as the usage ledger counts it."""
     u = out.get("usage") or {}
     return {"input": u.get("prompt_tokens") or 0,
@@ -222,19 +220,19 @@ def _usage(out: dict) -> dict:
             "output": u.get("completion_tokens") or 0}
 
 
-def option_ids(server: _Server, words: list[str]) -> dict[str, list[int]]:
+def option_ids(server: Server, words: list[str]) -> dict[str, list[int]]:
     """Option word -> its single-token spellings (leading space; as given and capitalised)."""
     out = {}
     for w in words:
         ids = sorted({i[0] for s in (f" {w}", f" {w[:1].upper()}{w[1:]}")
                       if len(i := server.encode(s)) == 1})
         if not ids:
-            raise _Unavailable(f"option {w!r} is not one token for this model")
+            raise Unavailable(f"option {w!r} is not one token for this model")
         out[w] = ids
     return out
 
 
-def ask_ids(server: _Server, prompt: list[int],
+def ask_ids(server: Server, prompt: list[int],
             options: dict[str, list[int]]) -> tuple[dict[str, float], float, dict]:
     """Each option's probability as the next token after `prompt` (token
     ids), the mass the options hold together, and the usage: ONE output
@@ -247,18 +245,18 @@ def ask_ids(server: _Server, prompt: list[int],
         top = out["choices"][0]["logprobs"]["top_logprobs"][0]
         raw = {o: sum(math.exp(top[f"token_id:{i}"]) for i in v) for o, v in options.items()}
     except (KeyError, IndexError, TypeError):
-        raise _Unavailable("the server did not return the requested logprobs") from None
+        raise Unavailable("the server did not return the requested logprobs") from None
     mass = sum(raw.values())
     if not math.isfinite(mass):  # a broken forward pass (NaN logits) answers nothing
         mass = 0.0
-    return {o: (p / mass if mass > 0 else 0.0) for o, p in raw.items()}, mass, _usage(out)
+    return {o: (p / mass if mass > 0 else 0.0) for o, p in raw.items()}, mass, usage_of(out)
 
 
 class _Judge:
     """What the probe proved, reused by every judgement: the padded prefix G,
     the answer header + lead, and the yes/no token ids."""
 
-    def __init__(self, server: _Server, g: list[int], tail: list[int],
+    def __init__(self, server: Server, g: list[int], tail: list[int],
                  options: dict[str, list[int]]) -> None:
         self.server, self.g, self.tail, self.options = server, g, tail, options
         self.ids = sorted(i for ids in options.values() for i in ids)
@@ -274,26 +272,25 @@ class _Judge:
             mass = {answer: sum(math.exp(top[f"token_id:{i}"]) for i in ids)
                     for answer, ids in self.options.items()}
         except (KeyError, IndexError, TypeError):
-            raise _Unavailable("the server did not return the requested logprobs") from None
+            raise Unavailable("the server did not return the requested logprobs") from None
         total = mass["yes"] + mass["no"]
         if not math.isfinite(total):  # a broken forward pass (NaN logits) answers nothing
             total = 0.0
-        return (mass["yes"] / total if total > 0 else None), total, _usage(out)
+        return (mass["yes"] / total if total > 0 else None), total, usage_of(out)
 
 
 def _probe() -> _Judge:
-    server = _Server()
+    server = Server()
     if server.model not in {m.get("id") for m in server.get("/models").get("data", [])}:
-        raise _Unavailable("the agent model is not served by this endpoint")
+        raise Unavailable("the agent model is not served by this endpoint")
     options = {}
     for answer, spellings in _SPELLINGS.items():
         ids = [server.encode(s) for s in spellings]
         if any(len(i) != 1 for i in ids):
-            raise _Unavailable("yes/no are not single tokens for this model")
+            raise Unavailable("yes/no are not single tokens for this model")
         options[answer] = sorted({i[0] for i in ids})
-    turns = [{"role": "system",
-              "content": (_PROMPTS / "jev_judge.md").read_text(encoding="utf-8").strip()}]
-    for ex in json.loads((_PROMPTS / "jev_examples.json").read_text(encoding="utf-8")):
+    turns = [{"role": "system", "content": _GUIDE}]
+    for ex in _EXAMPLES:
         turns += [{"role": "user", "content": _user(ex["need"], ex["item"])},
                   {"role": "assistant", "content": f"{LEAD} {ex['useful']}"}]
     # G and the answer header are cut from the template's own rendering.
@@ -304,7 +301,7 @@ def _probe() -> _Judge:
         turns + [{"role": "user", "content": sample}, {"role": "assistant", "content": LEAD}],
         add_generation_prompt=False, continue_final_message=True)
     if fixed + server.encode(sample) + tail != reference:
-        raise _Unavailable("the assembled prompt differs from the chat template")
+        raise Unavailable("the assembled prompt differs from the chat template")
     n, pad = len(fixed), -len(fixed) % BLOCK
     judge_ = _Judge(server, fixed + server.encode("\n") * pad, tail, options)
     # The logprobs must come back and the model must get a clear-cut pair
@@ -312,7 +309,7 @@ def _probe() -> _Judge:
     p_yes, mass_yes, u_yes = judge_.ask(_PROBE_NEED, _PROBE_YES)
     p_no, mass_no, u_no = judge_.ask(_PROBE_NEED, _PROBE_NO)
     if p_yes is None or p_no is None or min(mass_yes, mass_no) < 0.5 or p_yes - p_no < 0.5:
-        raise _Unavailable("the model does not answer the probe pair reliably")
+        raise Unavailable("the model does not answer the probe pair reliably")
     # The prompt files are sized so G lands just under whole blocks (the
     # measured prompt pads 143 tokens). A pad of a quarter block or more
     # means they were edited and should be re-sized: the pad is blank lines
@@ -334,7 +331,7 @@ def _switch_off(error: Exception) -> None:
     global _judge, _off_until
     _off_until = time.monotonic() + REPROBE_S  # first, so no caller re-probes in between
     _judge = None
-    reason = str(error) if isinstance(error, _Unavailable) else type(error).__name__
+    reason = str(error) if isinstance(error, Unavailable) else type(error).__name__
     logger.warning("JEV off for %d s: %s", REPROBE_S, reason)
 
 
@@ -400,7 +397,7 @@ def _judge_all(judge_: _Judge, need: str, texts: list[str], usage: dict,
     for f in done:
         try:
             collect(rest[f], f)
-        except _Unavailable:
+        except Unavailable:
             raise
         except Exception:  # noqa: BLE001 - a lost item stays unjudged (kept)
             pass
@@ -414,7 +411,7 @@ def judge(need: str, texts: list[str]) -> list[float | None] | None:
     had. Token usage, fail-opens and unjudged items go to the request's
     usage ledger, so a run that silently fell back is visible. Requests
     still running past the deadline are not counted."""
-    need = _clean(need or "")[:NEED_CHARS]
+    need = clean(need or "")[:NEED_CHARS]
     if not settings.jev_enabled or not need or not texts:
         return None
     started = time.monotonic()
@@ -424,7 +421,7 @@ def judge(need: str, texts: list[str]) -> list[float | None] | None:
     if available(wait=DEADLINE_S) and (judge_ := _judge) is not None:
         try:
             probs = _judge_all(judge_, need, texts, usage, started + DEADLINE_S)
-        except _Unavailable as e:
+        except Unavailable as e:
             _switch_off(e)
         except Exception as e:  # noqa: BLE001 - the first request failed: unreachable or overloaded
             logger.warning("JEV failed open: %s", type(e).__name__)
@@ -458,7 +455,7 @@ class Choice:
     profile's own server."""
 
     def __init__(self, system: str, examples: list[tuple[str, str]]) -> None:
-        self.server = server = _Server()
+        self.server = server = Server()
         turns = [{"role": "system", "content": system}]
         for user, answer in examples:
             turns += [{"role": "user", "content": user}, {"role": "assistant", "content": answer}]
@@ -469,7 +466,7 @@ class Choice:
 
     def encode(self, text: str) -> list[int]:
         """A request's own text as tokens, for every pick on it."""
-        return self.server.encode(_clean(text))
+        return self.server.encode(clean(text))
 
     def options(self, words: list[str]) -> dict[str, list[int]]:
         """Option word -> its single-token spellings (leading space; as given and capitalised)."""
@@ -494,4 +491,4 @@ class Choice:
                                     "temperature": 0, "stop": ["\n"]})
         choice = out["choices"][0]
         line = (choice.get("text") or "").strip() if choice.get("finish_reason") == "stop" else ""
-        return line, _usage(out)
+        return line, usage_of(out)

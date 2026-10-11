@@ -119,10 +119,10 @@ def reading_question(need: str | None, query: str | None) -> str:
     query when short enough to judge pieces against (QUESTION_CHARS); ""
     when neither (the ingest watcher's long extraction prompts are
     instructions, not questions)."""
-    need = " ".join(jev._clean(need or "").split())  # one line: the header states it on one
+    need = " ".join(jev.clean(need or "").split())  # one line: the header states it on one
     if need:
         return need[:QUESTION_CHARS]
-    query = " ".join(jev._clean(query or "").split())
+    query = " ".join(jev.clean(query or "").split())
     return query if len(query) <= QUESTION_CHARS else ""
 
 
@@ -154,14 +154,14 @@ def _with(turn: Turn, content: str, answer: str) -> list[dict]:
                                  {"role": "assistant", "content": answer}]
 
 
-def _render(server: jev._Server, turn: Turn, content: str, answer: str) -> list[int]:
+def _render(server: jev.Server, turn: Turn, content: str, answer: str) -> list[int]:
     """The server's own rendering of `_with(...)`, ending with `answer`."""
     return server.render(_with(turn, content, answer), template_kwargs=turn.template_kwargs,
                          tools=turn.tools, add_generation_prompt=False,
                          continue_final_message=True)
 
 
-def split_turn(server: jev._Server, turn: Turn, consts: dict) -> tuple[list[int], list[int]]:
+def split_turn(server: jev.Server, turn: Turn, consts: dict) -> tuple[list[int], list[int]]:
     """C, the agent's next-turn prompt up to the tool's output, and T, from
     the end of that output to the opened answer turn, cut from the server's
     own rendering with the agent's own template arguments. The output's last
@@ -187,13 +187,13 @@ def _lead(anchor: str) -> str:
     return f"[{anchor}] {LEAD}"
 
 
-def _lead_ids(server: jev._Server, text: str) -> list[int]:
+def _lead_ids(server: jev.Server, text: str) -> list[int]:
     if text not in _state["leads"]:
         _state["leads"][text] = server.encode(text)
     return _state["leads"][text]
 
 
-def check(server: jev._Server, turn: Turn, content: str, lead: str, prompt: list[int]) -> None:
+def check(server: jev.Server, turn: Turn, content: str, lead: str, prompt: list[int]) -> None:
     """The assembled request must be the server's own rendering of the turn."""
     if _render(server, turn, content, lead) != prompt:
         raise Mismatch("the assembled request differs from the server's rendering")
@@ -251,7 +251,7 @@ def _piece(frame: str, body: str, a: int, b: int) -> str:
     return f"{frame}{body[a:b].strip()}\n"
 
 
-def _cut(server: jev._Server, body: str, cuts: list[list[int]], frame: str, a: int,
+def _cut(server: jev.Server, body: str, cuts: list[list[int]], frame: str, a: int,
          lo: int, hi: int, ratio: float) -> tuple[int, list[int]]:
     """Where the piece starting at `a` ends, and its tokens: the strongest cut
     whose piece takes between `lo` and `hi` tokens; the rest of the body when
@@ -355,7 +355,7 @@ _PROBE_PIECES = ("Kel Aster opened the Rowan bakery on 2 June 2018, after two ye
                  "The Rowan bakery sells rye bread on Saturdays and closes on Mondays.")
 
 
-def _probe(server: jev._Server, options: dict) -> None:
+def _probe(server: jev.Server, options: dict) -> None:
     """The model must keep the piece that answers a clear-cut question and
     drop the one that does not, read the reader's way; the requests must be
     the server's own renderings."""
@@ -379,11 +379,11 @@ def _probe(server: jev._Server, options: dict) -> None:
         raise jev.Unavailable("the model does not judge the probe pieces reliably")
 
 
-def connect() -> tuple[jev._Server, dict, int, dict]:
+def connect() -> tuple[jev.Server, dict, int, dict]:
     """The agent model's server, its yes/no option ids, its served window and
     the rendering markers `split_turn` cuts by (jev.Unavailable when it states no
     window to read into)."""
-    server = jev._Server()
+    server = jev.Server()
     card = next((m for m in server.get("/models").get("data", [])
                  if m.get("id") == server.model), None)
     if card is None:
@@ -397,7 +397,7 @@ def connect() -> tuple[jev._Server, dict, int, dict]:
     return server, options, window, consts
 
 
-def ready() -> tuple[jev._Server, dict, int, dict]:
+def ready() -> tuple[jev.Server, dict, int, dict]:
     """The server, the yes/no options, the served window and the rendering
     markers, probed once per process (again after REPROBE_S when a probe or a
     read switched it off). Shared with services/hops.py, which judges inside
@@ -458,7 +458,7 @@ def _read(turn: Turn, row: dict, body: str, question: str, started: float,
     m_ids = server.encode(memory)
     # The agent's prompt through the header, so that a piece dropped before
     # any is kept rolls back to a cached block near it.
-    spend(jev._usage(server.complete({"prompt": c + m_ids, "max_tokens": 1, "temperature": 0})))
+    spend(jev.usage_of(server.complete({"prompt": c + m_ids, "max_tokens": 1, "temperature": 0})))
     kept: list[tuple[int, int]] = []
     dropped: list[tuple[int, int]] = []
     spans: list[list[tuple[int, int]]] = []  # kept or dropped, in reading order

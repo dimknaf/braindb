@@ -159,7 +159,7 @@ class _FakeVLLM:
         item = content.rsplit(f"[{anchor}] id:", 1)[-1].split("\n[", 1)[0]
         mass = 0.98
         if lead.endswith(wiki_gate.ID_LEAD):
-            want = "no" if ("CUE_NO" in item or "Rowan Atkinson" in item) else "yes"
+            want = "no" if ("CUE_NO" in item or "Rowan Pell" in item) else "yes"
             if not self.probe_ok and "Rowan" in item:
                 want = "no" if want == "yes" else "yes"
             if "CUE_LOWMASS" in item:
@@ -388,7 +388,7 @@ def test_every_jev_request_counts_toward_one_in_flight_limit(monkeypatch):
     monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setenv("VLLM_API_KEY", "test-secret-key")
     monkeypatch.setattr(jev, "_session", _Slow())
-    server = jev._Server()
+    server = jev.Server()
     with ThreadPoolExecutor(max_workers=3 * jev.WORKERS) as pool:     # several features at once
         list(pool.map(lambda _: server.complete({"prompt": [1]}), range(3 * jev.WORKERS)))
     assert 1 < state["max"] <= jev.WORKERS
@@ -398,13 +398,12 @@ def test_the_gated_writer_has_only_the_page_tools_and_its_first_request_is_the_s
     import asyncio
 
     from braindb.agent import agent as agent_mod
-    from braindb.agent.tools import first_turn
     gated = agent_mod.get_gated_writer_agent()
     assert {t.name for t in gated.tools} == {"read_wiki_outline", "read_wiki_section", "check_members_cited",
                                              "edit_wiki_section", "delete_wiki_section", "validate_wiki",
                                              "handoff_to_successor", "final_answer"}
     assert gated.instructions == agent_mod._GATED_WRITER_PROMPT and gated is not agent_mod.get_writer_agent()
-    turn = asyncio.run(first_turn(gated, "THE JOB"))
+    turn = asyncio.run(agent_mod.first_turn(gated, "THE JOB"))
     assert turn.messages == [{"content": agent_mod._GATED_WRITER_PROMPT, "role": "system"},
                              {"role": "user", "content": "THE JOB"}]
     assert sorted(t["function"]["name"] for t in turn.tools) == sorted(t.name for t in gated.tools)

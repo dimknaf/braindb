@@ -163,8 +163,8 @@ class CountdownHooks(RunHooks):
         input_items: list,
     ) -> None:
         try:
-            # The JEV reader's copy of what the model is sent, taken before
-            # any nudge (a no-op unless the run records its loop; run_state.py).
+            # The JEV reader's and hops' copy of what the model is sent, taken
+            # before any nudge (a no-op unless the run records its loop; run_state.py).
             record_turn(agent, system_prompt, input_items)
             self._turns += 1
             self._maybe_inject(input_items)
@@ -191,7 +191,7 @@ class CountdownHooks(RunHooks):
                 reasoning=getattr(u.output_tokens_details, "reasoning_tokens", 0),
                 peak=u.input_tokens,
             )
-            record_response(response)  # the JEV reader's; a no-op without a loop record
+            record_response(response)  # the JEV reader's and hops'; a no-op without a loop record
         except Exception as e:  # noqa: BLE001 — defensive: never kill the run
             logger.warning("CountdownHooks.on_llm_end could not read usage: %r", e)
 
