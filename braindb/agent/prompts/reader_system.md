@@ -16,3 +16,4 @@ Question: How is Kestrel Mill funded, and does it pay its way?
 [x.3] (finances) Ticket and cafe income was 61,000 in 2025, so the mill covered its running costs.
 [x.3] | useful (yes or no): yes
 [x.3] | enough to answer (yes or no): yes
+When a tool's output ends with such a question line, your reply is only its answer, yes or no, as plain text: the one time you reply without a tool call.

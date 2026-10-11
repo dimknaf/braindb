@@ -364,7 +364,7 @@ curl -X POST http://localhost:8000/api/v1/entities/datasources/ingest \
 
 ### BrainDB Agent — natural language queries
 
-`POST /api/v1/agent/query` — instead of orchestrating individual API calls, send a plain English request and let BrainDB's internal agent handle it. The agent uses the OpenAI Agents SDK (provider pluggable via `LLM_PROFILE` — **`deepinfra` with `google/gemma-4-31B-it` is the recommended default**; `nim` and local vLLM are also supported) and has access to all 21 BrainDB operations as function tools.
+`POST /api/v1/agent/query` — instead of orchestrating individual API calls, send a plain English request and let BrainDB's internal agent handle it. The agent uses the OpenAI Agents SDK (provider pluggable via `LLM_PROFILE` — **`deepinfra` with `deepseek-ai/DeepSeek-V4.1-Flash` is the recommended default**; `nim` and local vLLM are also supported) and has access to all 21 BrainDB operations as function tools.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/agent/query \
@@ -375,7 +375,7 @@ curl -X POST http://localhost:8000/api/v1/agent/query \
 
 (`max_turns` is optional; the default — currently 20 — is used when omitted.)
 
-(`need` is optional too: one sentence, at most 2,000 characters, of what you want to find out, e.g. `"need": "the date Kestrel Mill reopened"`. On a self-hosted vLLM server the agent's JEV steps read for it — the reader on long entities and hops after a recall, both on by default — and so does the recall filter when `JEV_ENABLED=true`; without it, a short `query` serves. Elsewhere it has no effect.)
+(`need` is optional too: one sentence, at most 2,000 characters, of what you want to find out, e.g. `"need": "the date Kestrel Mill reopened"`. The agent's JEV steps read for it — the reader on long entities and hops after a recall, both on by default, on a server whose replies carry logprobs (see README) — and so does the recall filter when `JEV_ENABLED=true`; without it, a short `query` serves. Elsewhere it has no effect.)
 
 **Save via the agent**:
 ```bash

@@ -92,7 +92,7 @@ External databases need the `pg_trgm` and `pgvector` extensions; the connecting 
 
 ### 4. Pick an LLM provider (for the internal agent)
 
-The agent talks to any OpenAI-compatible Chat Completions backend. **Recommended for new users: `deepinfra` with `google/gemma-4-31B-it`** — fast (5–30s per agent call), cheap, validated end-to-end on the wiki/maintainer/writer pipeline. `nim` is a free-tier fallback (occasionally flaky). `openai_compatible` points the agent at any OpenAI-compatible `/v1` endpoint (Ollama, LM Studio, copilot-api, a remote vLLM). The `vllm_*` profiles run a local model on your own GPU workstation — useful for offline / cost-free experiments, but require a running vLLM server reachable from the docker network (typically via SSH tunnel).
+The agent talks to any OpenAI-compatible Chat Completions backend. **Recommended for new users: `deepinfra` with `deepseek-ai/DeepSeek-V4.1-Flash`** — fast, cheap, and its replies carry the logprobs JEV reads (below), so the reader, hops, triage and the writer gate run on it. `nim` is a free-tier fallback (occasionally flaky). `openai_compatible` points the agent at any OpenAI-compatible `/v1` endpoint (Ollama, LM Studio, copilot-api, a remote vLLM). The `vllm_*` profiles run a local model on your own GPU workstation — useful for offline / cost-free experiments, but require a running vLLM server reachable from the docker network (typically via SSH tunnel).
 
 In `.env`:
 ```
@@ -206,7 +206,7 @@ curl -X POST http://localhost:8000/api/v1/agent/query \
 
 The agent has 21 tools — every single BrainDB endpoint plus `delegate_to_subagent` (which spawns a fresh agent in its own context for focused deep work) and `final_answer` (which ends the loop with a validated typed payload).
 
-**Reading inside the agent's own conversation (JEV)** — on a self-hosted vLLM server, two steps are closed decisions read from the probability of a single next token, taken inside the agent's conversation, so whatever is dropped never enters it:
+**Reading inside the agent's own conversation (JEV)** — two steps are closed decisions read from the probability of a single answer token, taken inside the agent's conversation, so whatever is dropped never enters it. They are standard chat completions on the agent's own server: any OpenAI-compatible server whose replies carry logprobs and that turns thinking off with `reasoning_effort: "none"` (checked with DeepSeek V4.1 Flash on DeepInfra and with Qwen on a self-hosted vLLM):
 
 - **Reader** — a long entity is read once, piece by piece; each piece is kept or dropped for the question, and reading stops once what was kept answers it. One `get_entity` call replaces paging the body or handing its slices to a subagent.
 - **Hops** — after a recall, the items linked to what it showed (often the page that summarises them, or the document a fact came from) are offered one at a time, kept only when useful, and followed one step further.
@@ -223,7 +223,7 @@ curl -X POST http://localhost:8000/api/v1/agent/query \
 
 `LLM_PROFILE` selects the backend. Profiles are defined in [braindb/config.py](braindb/config.py) (`_LLM_PROFILES`):
 
-- **`deepinfra` — recommended default.** Model `google/gemma-4-31B-it`. Fast (5–30s per agent call), cheap, validated end-to-end.
+- **`deepinfra` — recommended default.** Model `deepseek-ai/DeepSeek-V4.1-Flash`. Fast, cheap, and JEV runs on it.
 - `nim` — NVIDIA NIM, model `google/gemma-4-31b-it`. Free tier, occasionally flaky.
 - `openai_compatible` — any OpenAI-compatible `/v1` endpoint (Ollama, LM Studio, copilot-api, remote vLLM). Set `AGENT_MODEL=<model-id>` (required — no default) and `OPENAI_BASE_URL`; `OPENAI_API_KEY` is optional for local servers without auth.
 - `vllm_workstation` / `vllm_workstation_qwen` / `vllm_workstation_gemma` — local vLLM running on your own GPU (advanced / offline; needs the server reachable from the docker network, usually via SSH tunnel).
@@ -354,7 +354,7 @@ docker logs braindb_api -f              # the agent doing the work
 
 ![Wiki writer pipeline — lock and snapshot, gather context, draft with citations, reconcile relations, validate with retry, then commit a reversible living wiki page](docs/assets/braindb-writer.svg)
 
-On a self-hosted vLLM server, two of these steps are one-token decisions (JEV; on by default, each probed first, `JEV_WIKI_TRIAGE=false` / `JEV_WIKI_GATE=false` turn them off): **triage** picks each uncovered entity's action and target page instead of an agent run, handing anything it cannot decide to the agent; the **writer gate**, inside the writer's own first request, keeps only the recalled facts that are about the page's subject and picks the section each belongs in, so the writer starts from those.
+Two of these steps are one-token decisions (JEV, as above; on by default, each probed first, `JEV_WIKI_TRIAGE=false` / `JEV_WIKI_GATE=false` turn them off): **triage** picks each uncovered entity's action and target page instead of an agent run, handing anything it cannot decide to the agent; the **writer gate**, inside the writer's own first request, keeps only the recalled facts that are about the page's subject and picks the section each belongs in, so the writer starts from those.
 
 You do **not** drive this by hand. The `POST /api/v1/wiki/{cron,maintain,write}`
 endpoints exist for **debugging / inspection only** — normal operation is the

@@ -69,7 +69,7 @@ def test_openai_base_url_does_not_leak_into_other_profiles(monkeypatch):
 @pytest.mark.parametrize(
     ("profile", "expected_model", "expected_base_url"),
     [
-        ("deepinfra", "google/gemma-4-31B-it", "https://api.deepinfra.com/v1/openai"),
+        ("deepinfra", "deepseek-ai/DeepSeek-V4.1-Flash", "https://api.deepinfra.com/v1/openai"),
         ("nim", "google/gemma-4-31b-it", "https://integrate.api.nvidia.com/v1"),
         ("vllm_workstation", "cyankiwi/gemma-4-31B-it-AWQ-4bit",
          "http://host.docker.internal:8002/v1"),

@@ -432,9 +432,9 @@ async def save_rule(
 # ====================================================================== #
 
 async def sdk_turn(agent, ctx, items: list, system: str | None) -> reader.Turn:
-    """A request of `agent` for the conversation `items` — its messages, tools
-    and chat-template arguments — built the way the SDK's chat model builds
-    its own request. JEV decides inside such a request (services/reader.py)."""
+    """A request of `agent` for the conversation `items` — its messages and
+    tools — built the way the SDK's chat model builds its own request. JEV
+    decides inside such a request (services/reader.py)."""
     from agents.models.chatcmpl_converter import Converter
     from agents.util._json import _to_dump_compatible
 
@@ -446,8 +446,7 @@ async def sdk_turn(agent, ctx, items: list, system: str | None) -> reader.Turn:
     if system:
         messages.insert(0, {"content": system, "role": "system"})
     tools = [Converter.tool_to_openai(t) for t in await agent.get_all_tools(ctx)]
-    template = (agent.model_settings.extra_body or {}).get("chat_template_kwargs")
-    return reader.Turn(_to_dump_compatible(messages), _to_dump_compatible(tools), template)
+    return reader.Turn(_to_dump_compatible(messages), _to_dump_compatible(tools))
 
 
 async def _next_turn(ctx: ToolContext, loop) -> reader.Turn:

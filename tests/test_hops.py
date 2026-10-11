@@ -1,24 +1,19 @@
 """Unit tests for JEV hops (braindb/services/hops.py) and their wiring into
 recall_memory and the wiki gate.
 
-DB-free and GPU-free. A fake vLLM endpoint renders turns with a template
-shaped like the served model's (tool output trimmed and wrapped, a reasoning
-line in the system block unless thinking is off, every assistant turn opened
-with a think block), tokenizes one token per character with the special
-markers and "\\n\\n" as single tokens, keeps a hybrid model's cache (only the
-last whole block a request ended in), and answers each neighbour by a cue in
-its text. A fake graph stands in for the relations. These pin the contract:
+DB-free and GPU-free. A fake OpenAI-compatible chat endpoint (conftest.py
+`fake_chat`) answers each neighbour by a cue in its text, and a fake graph
+stands in for the relations. These pin the contract:
 
 - recall_memory's tool schema is unchanged by its run context; with hops off,
   without a reading question, or for a call that does not lead the next
   turn, recall_memory answers exactly as before;
-- hops judge INSIDE the agent's turn: each request is the agent's next turn
-  up to the tool output, then one token with thinking off;
+- hops judge INSIDE the agent's turn: each request is the agent's next
+  request with the question line ending the tool output, thinking off;
 - only the neighbours judged useful stay, and only they are followed to the
   next hop; nothing recall showed is removed; nothing kept gives recall's
   output as it was;
-- a neighbour whose options hold little probability is rolled back; a request
-  the server renders differently falls back and leaves hops on;
+- a neighbour whose options hold little probability is rolled back;
 - with hops on, the wiki gate offers the members' neighbours after recall's.
 """
 from __future__ import annotations
@@ -26,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import math
 import re
 import uuid
 from types import SimpleNamespace
@@ -47,137 +41,31 @@ from braindb.agent.run_state import (
 )
 from braindb.services import hops, jev, reader, wiki_gate
 
-BLOCK = 64
 QUESTION = "Where did Kel Aster train?"
 
 # ---------------------------------------------------------------- the fake
 
-_SPECIAL = ["<|im_start|>", "<|im_end|>", "<tool_response>", "</tool_response>", "<think>", "</think>"]
-_WORDS = [" yes", " Yes", " no", " No"]
-_IDS = {w: i for i, w in enumerate(_SPECIAL + _WORDS + ["\n\n"], start=1)}
+_QUESTION_LINE = re.compile(r"\[([\w.]+)\] \| useful \(yes or no\):$")
 
 
-def _tok(text: str) -> list[int]:
-    if text in _WORDS:
-        return [_IDS[text]]
-    ids, i = [], 0
-    while i < len(text):
-        mark = next((s for s in _SPECIAL + ["\n\n"] if text.startswith(s, i)), None)
-        if mark:
-            ids.append(_IDS[mark])
-            i += len(mark)
-        else:
-            ids.append(1000 + ord(text[i]))
-            i += 1
-    return ids
-
-
-def _text(ids: list[int]) -> str:
-    back = {v: k for k, v in _IDS.items()}
-    return "".join(back.get(i, chr(i - 1000) if i >= 1000 else "?") for i in ids)
-
-
-def _render(messages, tools=None, kwargs=None, add_generation_prompt=False,
-            continue_final_message=False) -> list[int]:
-    kwargs = kwargs or {}
-    thinking = kwargs.get("enable_thinking", True) is not False
-    out = "<|im_start|>system\n"
-    if thinking:
-        out += f"Reasoning effort is set to {kwargs.get('reasoning_effort', 'xhigh')}.\n\n"
-    if tools:
-        out += "# Tools " + json.dumps(tools, sort_keys=True) + "\n\n"
-    rest = messages
-    if messages and messages[0]["role"] == "system":
-        out += (messages[0]["content"] or "").strip()
-        rest = messages[1:]
-    out += "<|im_end|>\n"
-    for i, m in enumerate(rest):
-        content = (m.get("content") or "")
-        content = content.strip() if isinstance(content, str) else json.dumps(content)
-        last = i == len(rest) - 1
-        if m["role"] == "user":
-            out += f"<|im_start|>user\n{content}<|im_end|>\n"
-        elif m["role"] == "assistant":
-            out += f"<|im_start|>assistant\n<think>\n{(m.get('reasoning_content') or '').strip()}\n</think>\n\n{content}"
-            for call in m.get("tool_calls") or []:
-                out += f"<tool_call>{call['function']['name']} {call['function']['arguments']}</tool_call>"
-            if not (last and continue_final_message):
-                out += "<|im_end|>\n"
-        elif m["role"] == "tool":
-            if i == 0 or rest[i - 1]["role"] != "tool":
-                out += "<|im_start|>user"
-            out += f"\n<tool_response>\n{content}\n</tool_response>"
-            if last or rest[i + 1]["role"] != "tool":
-                out += "<|im_end|>\n"
-    if add_generation_prompt:
-        out += "<|im_start|>assistant\n" + ("<think>\n" if thinking else "<think>\n\n</think>\n\n")
-    return _tok(out)
-
-
-class _Cache:
-    def __init__(self):
-        self.points: list[tuple[int, ...]] = []
-
-    def use(self, prompt: list[int], store: bool = True) -> int:
-        cached = max((len(p) for p in self.points if tuple(prompt[:len(p)]) == p), default=0)
-        if store and len(prompt) >= BLOCK:
-            self.points.append(tuple(prompt[:len(prompt) // BLOCK * BLOCK]))
-        return cached
-
-
-class _Response:
-    def __init__(self, status: int, body: dict | None = None):
-        self.status_code, self._body = status, body
-
-    def json(self):
-        return self._body
-
-    def raise_for_status(self):
-        pass
-
-
-class _FakeVLLM:
+class _Model:
     """Answers each neighbour (or the reader's probe piece) by cues in its
     text: USEFUL (or the probe's opening) is yes, anything else no, LOWMASS
-    holds little probability. `mismatch` makes the server render a hop's
-    request differently from what was assembled."""
+    holds little probability."""
 
-    def __init__(self, model: str):
-        self.model, self.mismatch = model, False
-        self.decisions, self.warms, self.cache = [], [], _Cache()
+    def __init__(self):
+        self.decisions = []
 
-    def request(self, method, url, **kwargs):
-        body = kwargs.get("json") or {}
-        if url.endswith("/v1/models"):
-            return _Response(200, {"data": [{"id": self.model, "max_model_len": 200_000}]})
-        if url.endswith("/tokenize"):
-            if "messages" in body:
-                ids = _render(body["messages"], body.get("tools"), body.get("chat_template_kwargs"),
-                              body.get("add_generation_prompt", False), body.get("continue_final_message", False))
-                if self.mismatch and body["messages"][-1]["content"].startswith("[h"):
-                    ids = ids + [999]
-                return _Response(200, {"tokens": ids})
-            return _Response(200, {"tokens": _tok(body["prompt"])})
-        assert url.endswith("/v1/completions"), url
-        prompt = body["prompt"]
-        usage = {"prompt_tokens": len(prompt), "completion_tokens": 1,
-                 "prompt_tokens_details": {"cached_tokens": self.cache.use(prompt)}}
-        if "logprob_token_ids" not in body:
-            self.warms.append(prompt)
-            return _Response(200, {"choices": [{"text": "x"}], "usage": usage})
-        text = _text(prompt)
-        lead = text.rsplit("</think>\n\n", 1)[-1]
-        anchor = re.match(r"\[([\w.]+)\]", lead).group(1)
-        content = text.rsplit("<tool_response>\n", 1)[-1].split("\n</tool_response>", 1)[0]
-        item = content.rsplit(f"[{anchor}] ", 1)[-1]
+    def __call__(self, body: dict):
+        content = body["messages"][-1]["content"]
+        anchor = _QUESTION_LINE.search(content).group(1)
+        item = content.rsplit(f"[{anchor}] ", 2)[-2] if content.count(f"[{anchor}] ") > 1 else content
         want = "yes" if ("USEFUL" in item or "opened the Rowan bakery" in item) else "no"
         mass = 0.05 if "LOWMASS" in item else 0.98
-        top = {f"token_id:{i}": math.log(mass * (0.97 if _WORDS[i - 7].strip().lower() == want else 0.01))
-               for i in body["logprob_token_ids"]}
-        self.decisions.append({"prompt": prompt, "anchor": anchor, "want": want, "lead": lead, "content": content,
-                               "cached": usage["prompt_tokens_details"]["cached_tokens"],
+        other = "no" if want == "yes" else "yes"
+        self.decisions.append({"anchor": anchor, "want": want, "body": body, "content": content,
                                "probe": "datasource probe" in content})
-        return _Response(200, {"choices": [{"logprobs": {"top_logprobs": [top]}}], "usage": usage})
+        return [(want, {want: mass * 0.97, other: mass * 0.01, "<tool_call>": 1 - mass * 0.98})]
 
 
 # ------------------------------------------------------------ the memory
@@ -213,20 +101,16 @@ def _recall_result(nodes=SHOWN):
 
 
 @pytest.fixture
-def server(monkeypatch):
+def server(monkeypatch, fake_chat):
     monkeypatch.setattr(jev.settings, "jev_hops", True)
     monkeypatch.setattr(jev.settings, "jev_reader", False)
     monkeypatch.setattr(reader, "serves", lambda: True)  # the prompt's probe has its own tests (test_reader.py)
     monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(jev.settings, "agent_model", "")
     monkeypatch.setenv("VLLM_API_KEY", "test-secret-key")
-    fake = _FakeVLLM(jev.settings.resolved_agent_model)
-    monkeypatch.setattr(jev, "_session", fake)
-    monkeypatch.setattr(jev, "BLOCK", BLOCK)
-    monkeypatch.setattr(reader, "_state", {"server": None, "options": None, "window": 0, "consts": None,
-                                           "leads": {}, "off_until": 0.0})
-    monkeypatch.setattr(reader, "ROOM", 200)
-    monkeypatch.setattr(hops, "_state", {"off_until": 0.0})
+    model = _Model()
+    fake = fake_chat(model)
+    fake.decisions = model.decisions
     monkeypatch.setattr(hops, "neighbours", _neighbours)
     monkeypatch.setattr(hops, "get_conn", contextlib.nullcontext)
     monkeypatch.setattr(tools_mod, "get_conn", contextlib.nullcontext)
@@ -307,7 +191,7 @@ def test_recall_answers_as_before_unless_hops_serve_the_call(server, monkeypatch
         out, used = _in_a_run([_call("call_1")], question="")
     else:
         out, used = _in_a_run([_call("call_0", "quick_search"), _call("call_1")])
-    assert out == today and server.decisions == [] and server.warms == []
+    assert out == today and server.bodies == []
     assert used.get("calls", 0) == 0
 
 
@@ -322,20 +206,22 @@ def test_hops_keep_only_useful_neighbours_and_follow_only_those(server):
     assert [d["anchor"] for d in asked] == ["h1.1", "h1.2", "h1.3", "h2.1"]
     assert not any(X1["content"] in d["content"] for d in asked)    # a dropped one is never followed
     assert "Kept 3 of 4 neighbours offered" in out
-    assert (used["calls"], used["failopen"]) == (1, 0) and used["requests"] == 1 + len(asked)
+    assert (used["calls"], used["failopen"]) == (1, 0) and used["requests"] == len(asked)
 
 
-def test_each_hop_decision_is_the_agents_next_turn_and_one_token(server):
-    _in_a_run([_call("call_1")])
+def test_each_hop_decision_is_the_agents_next_request_with_the_question_ending_the_output(server):
+    out, _ = _in_a_run([_call("call_1")])
     asked = [d for d in server.decisions if not d["probe"]]
-    last = len(server.warms[0]) // BLOCK * BLOCK              # the warm request's checkpoint
     for d in asked:
-        assert d["lead"] == f"[{d['anchor']}] | useful (yes or no):"
-        assert _text(d["prompt"]).endswith("</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-                                           + d["lead"])
-        assert "Reasoning effort is set to" in _text(d["prompt"])  # the agent's own template arguments
-        assert d["cached"] >= last                              # recall's output is computed once
-        assert d["content"].startswith("Found 2 items:")
+        b, tool = d["body"], d["body"]["messages"][-1]
+        assert tool["role"] == "tool" and tool["content"].startswith("Found 2 items:")
+        assert tool["content"].endswith(f"\n[{d['anchor']}] | useful (yes or no):")
+        assert [m["role"] for m in b["messages"][:2]] == ["system", "user"]          # the agent's own turns
+        assert b["messages"][0]["content"] == agent_mod.get_agent().instructions
+        assert b["tools"] and b["tool_choice"] == "none" and b["reasoning_effort"] == "none"
+        assert b["max_tokens"] == jev.ANSWER_TOKENS and b["stop"] == ["\n"]
+        so_far = tool["content"].rsplit(f"[{d['anchor']}] ", 2)[0]
+        assert out.startswith(so_far)                         # each continues what was kept
 
 
 def test_an_item_recalls_cut_left_out_counts_as_not_shown(server, monkeypatch):
@@ -363,11 +249,11 @@ def test_a_neighbour_whose_options_hold_little_probability_is_rolled_back(server
     assert N1["id"] not in out and N3["id"] in out and M1["id"] not in out   # M1 hung on N1
 
 
-def test_a_request_the_server_renders_differently_falls_back_and_hops_stay_on(server):
-    server.mismatch = True
+def test_a_failed_probe_gives_recalls_output_and_switches_hops_off(server):
+    server.reply = lambda body: [("Sure.", None)]               # answers no option
     today = _today()
     out, used = _in_a_run([_call("call_1")])
-    assert out == today and used["failopen"] == 1 and hops.wanted()
+    assert out == today and used["failopen"] == 1 and not hops.wanted()
 
 
 def test_neighbours_most_shown_items_link_to_come_first_then_pages_and_documents():
@@ -400,7 +286,6 @@ def test_a_page_is_offered_by_its_name_summary_and_sections_a_document_with_what
 
 
 def test_the_answering_agent_carries_the_hops_section_only_when_they_are_on(monkeypatch):
-    monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(reader, "serves", lambda: True)  # a server that passes the probe
     for on in (True, False):
         monkeypatch.setattr(jev.settings, "jev_hops", on)

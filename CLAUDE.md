@@ -166,7 +166,7 @@ curl -s -X DELETE http://localhost:8000/api/v1/entities/<UUID>
 
 **Direct API** (what's shown above) — call individual endpoints yourself. Full control, more verbose context. Good when you want to be precise about what's saved or recalled.
 
-**Agent endpoint** — `POST /api/v1/agent/query` — send a natural language request and let BrainDB's internal agent handle it. The agent (OpenAI Agents SDK with pluggable provider via `LLM_PROFILE` — default DeepInfra's `google/gemma-4-31B-it`, NIM also supported) has all 21 BrainDB operations as tools. Cleaner conversation context, but slower (5-30 seconds for a query).
+**Agent endpoint** — `POST /api/v1/agent/query` — send a natural language request and let BrainDB's internal agent handle it. The agent (OpenAI Agents SDK with pluggable provider via `LLM_PROFILE` — default DeepInfra's `deepseek-ai/DeepSeek-V4.1-Flash`, NIM also supported) has all 21 BrainDB operations as tools. Cleaner conversation context, but slower (5-30 seconds for a query).
 
 ```bash
 # Recall via the agent
@@ -185,7 +185,7 @@ curl -X POST http://localhost:8000/api/v1/agent/query \
   -d '{"query":"Delegate to a subagent: find near-duplicate facts and return top 10 pairs."}'
 ```
 
-An optional `need` (one sentence of what you want to find out) lets the agent's JEV steps — the reader on long entities and hops after a recall, on a self-hosted vLLM server — read for exactly that.
+An optional `need` (one sentence of what you want to find out) lets the agent's JEV steps — the reader on long entities and hops after a recall, on a server whose replies carry logprobs — read for exactly that.
 
 When working **on this repo**, prefer direct API calls (you need precision). When working **in another project** that just wants memory, prefer the agent endpoint (less ceremony).
 
@@ -197,7 +197,7 @@ When debugging the agent: set `AGENT_VERBOSE=true` in `.env` and watch `docker l
 
 ## Important Notes
 
-- `.env` contains real DB credentials and provider API keys (`DEEPINFRA_API_KEY`, `NVIDIA_NIM_API_KEY`, etc.) — **never commit it**, it is in `.gitignore`. Active provider is picked by `LLM_PROFILE` (see `braindb/config.py::_LLM_PROFILES`). `LLM_PROFILE=deepinfra` (model `google/gemma-4-31B-it`) is the recommended starting point — fast, cheap, validated end-to-end; the `vllm_*` profiles need a GPU serving an OpenAI-compatible endpoint reachable from the docker network. Note the wiki pipeline's tuning constants (turn budget, request timeout, writer handoff budget, `AGENT_WIKI_REASONING_EFFORT`) were measured against self-hosted Qwen on vLLM — `vllm_workstation_qwen` is that profile.
+- `.env` contains real DB credentials and provider API keys (`DEEPINFRA_API_KEY`, `NVIDIA_NIM_API_KEY`, etc.) — **never commit it**, it is in `.gitignore`. Active provider is picked by `LLM_PROFILE` (see `braindb/config.py::_LLM_PROFILES`). `LLM_PROFILE=deepinfra` (model `deepseek-ai/DeepSeek-V4.1-Flash`) is the recommended starting point — fast, cheap, and JEV runs on it; the `vllm_*` profiles need a GPU serving an OpenAI-compatible endpoint reachable from the docker network. Note the wiki pipeline's tuning constants (turn budget, request timeout, writer handoff budget, `AGENT_WIKI_REASONING_EFFORT`) were measured against self-hosted Qwen on vLLM — `vllm_workstation_qwen` is that profile.
 - Always-on rules (priority 100, `always_on: true`) are returned on every `/memory/context` call
 - `notes` field on any entity or relation is for running commentary — append observations over time
 - Keywords are stored as both a `TEXT[]` column on the entity AND as separate keyword entities linked via `tagged_with` relations (the keyword entities carry the embeddings for semantic search)

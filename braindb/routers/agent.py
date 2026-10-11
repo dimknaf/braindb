@@ -38,11 +38,11 @@ class AgentQueryRequest(BaseModel):
     # ~35-turn tool-call iteration leaves ~30% of the window for output.
     query: str = Field(..., min_length=1, max_length=40000)
     max_turns: int | None = Field(default=None, ge=1, le=60)
-    # Optional: what the caller is trying to find out, in a sentence. With
-    # JEV enabled on a self-hosted vLLM, the agent's recalls then keep only
-    # the items the model judges useful for it; with the JEV reader on, its
-    # long reads are read for it; with JEV hops on, recall's neighbours are
-    # judged for it. Ignored otherwise.
+    # Optional: what the caller is trying to find out, in a sentence. The
+    # JEV reader reads long bodies for it and JEV hops judge recall's
+    # neighbours for it (both on by default, on a server that passes their
+    # probe); with JEV_ENABLED, the agent's recalls keep only the items the
+    # model judges useful for it. Ignored otherwise.
     need: str | None = Field(default=None, max_length=2000)
 
 

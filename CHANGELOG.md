@@ -7,14 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.11.0] — 2026-10-11
 
-Headline: **JEV — closed decisions read from the probability of a single next token, taken inside
-the conversation that uses them.** On a self-hosted vLLM server the agent reads a long entity once,
-piece by piece, keeping only what the question needs; follows recall's relations to the page or
-document it needs; and the wiki pipeline triages uncovered entities and gates the writer's facts
-with one-token picks instead of agent runs. What a decision drops never enters the conversation, so
-it is never paid for again. On any other server, or on any failure, everything behaves as before.
-Also in this release: the agent runs on the OpenAI client (LiteLLM dropped), every request records
-what it cost, and an optional `need` on `/agent/query`.
+Headline: **JEV — closed decisions read from the probability of a single answer token, taken
+inside the conversation that uses them.** The agent reads a long entity once, piece by piece,
+keeping only what the question needs; follows recall's relations to the page or document it needs;
+and the wiki pipeline triages uncovered entities and gates the writer's facts with one-token picks
+instead of agent runs. What a decision drops never enters the conversation, so it is never paid for
+again. Every JEV request is a standard OpenAI chat completion on the agent's own server, so it runs
+wherever the replies carry logprobs and thinking turns off with `reasoning_effort` — the new
+default model on DeepInfra, DeepSeek V4.1 Flash, as well as a self-hosted vLLM. On any other server,
+or on any failure, everything behaves as before. Also in this release: the agent runs on the OpenAI
+client (LiteLLM dropped), every request records what it cost, and an optional `need` on
+`/agent/query`.
 
 ### Added
 
@@ -46,6 +49,9 @@ what it cost, and an optional `need` on `/agent/query`.
 
 ### Changed
 
+- **The `deepinfra` profile's default model is `deepseek-ai/DeepSeek-V4.1-Flash`** (was
+  `google/gemma-4-31B-it`): its replies carry the logprobs JEV reads, so every JEV feature runs on
+  the default setup. `AGENT_MODEL` still overrides it.
 - **The agent runs on the OpenAI client.** Every profile already spoke the OpenAI Chat Completions
   protocol, so the SDK's own model over the OpenAI client serves them all; LiteLLM is dropped and
   `openai-agents` / `openai` are pinned. Old LiteLLM prefixes in `AGENT_MODEL` are still accepted,
@@ -56,9 +62,11 @@ what it cost, and an optional `need` on `/agent/query`.
 ### Upgrading from v0.10.0
 
 Rebuild the image (`docker compose up -d --build`): the dependencies changed. No DB migration. The
-JEV features are on by default but act only on a server that passes their probe (a self-hosted
-vLLM); anywhere else nothing changes. Set `JEV_READER`, `JEV_HOPS`, `JEV_WIKI_TRIAGE` or
-`JEV_WIKI_GATE` to `false` to turn one off.
+JEV features are on by default and act wherever the server passes their probe (the default
+DeepInfra model and a self-hosted vLLM do); anywhere else nothing changes. Set `JEV_READER`,
+`JEV_HOPS`, `JEV_WIKI_TRIAGE` or `JEV_WIKI_GATE` to `false` to turn one off. A `.env` that sets
+`AGENT_MODEL` keeps its own model; one that relied on the `deepinfra` default now gets DeepSeek
+V4.1 Flash.
 
 ## [0.10.0] — 2026-09-12
 

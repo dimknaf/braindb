@@ -9,9 +9,11 @@ choice from a known set, so it is asked the JEV way (services/jev.py
 candidate wikis are shortlisted from that evidence (wikis among it, wikis
 that summarise it, wikis whose name carries one of the seed's keywords); a
 cached guide with worked examples (agent/prompts/wiki_triage.md and
-wiki_triage_examples.json) and the seed's evidence are read once; and each
-decision is ONE token read as probabilities over its options, thinking off.
-The only text the model writes is a new page's name.
+wiki_triage_examples.json) and the seed's evidence are read once; the model
+answers once, thinking off, the way the examples do ("action: attach" then
+"wiki: A"), and each decision is ONE token of that answer, read as
+probabilities over its options where its lead ends. The only words taken
+from the answer are a new page's name.
 
 Measured on a news memory against blind two-judge gold (198 past maintainer
 decisions, replayed with the catalog and evidence as they stood at each
@@ -22,8 +24,8 @@ cost per seed and in under half its time, most of which is the one recall.
 A seed it cannot decide confidently — low probability on the options, an
 attach with no fitting candidate, a consolidate with fewer than two
 duplicates, an empty or cut-off name, or any failure — is left to the
-maintainer agent, exactly as before. Off unless JEV_WIKI_TRIAGE is on with a
-self-hosted server.
+maintainer agent, exactly as before. On by default (JEV_WIKI_TRIAGE), once
+the server passes the probe.
 
 Custom profiles shape the agent only. Their maintainer additions are written
 for an agent that researches before it decides; added to this guide, the
@@ -61,7 +63,7 @@ ACTIONS = ["skip", "ambiguous", "consolidate", "attach", "create"]
 LABELS = list(string.ascii_uppercase[:8])  # at most 8 candidate wikis per seed
 # Below this much probability on the options the model wanted to answer
 # something else: the agent decides that seed instead.
-MIN_MASS = 0.5
+MIN_MASS = jev.MIN_MASS
 SAME = 0.5            # P(yes) from which a candidate counts as a duplicate page
 EVIDENCE_ITEMS = 12   # evidence lines shown per seed
 WORKERS = 4           # seeds of one triage unit decided in parallel
@@ -72,7 +74,7 @@ _lock = threading.Lock()
 
 def wanted() -> bool:
     """Whether JEV triage serves maintainer runs now."""
-    return (settings.jev_wiki_triage and settings.self_hosted
+    return (settings.jev_wiki_triage
             and time.monotonic() >= _state["off_until"]
             # a profile's `.replace.md` rewrites the maintainer's whole contract
             and not custom_profile.replace_or_base("", "wiki_maintainer"))
@@ -99,20 +101,19 @@ def _choice() -> tuple[jev.Choice, dict]:
                        "label": choice.options(LABELS + ["none"]),
                        "yes_no": choice.options(["yes", "no"])}
             # The model must triage a clear-cut seed right, action and wiki;
-            # these requests also put the prefix in the server's cache.
+            # this request also puts the guide in the server's cache.
             probe = _EXAMPLES["probe"]
-            body = choice.encode(probe["user"])
-            probs, mass, _ = choice.ask(body, "action:", options["action"])
+            reply = choice.reply(choice.encode(probe["user"]))
+            probs, mass = choice.ask(reply, "action:", options["action"])
             ok = max(probs, key=probs.get) == probe["action"] and mass >= MIN_MASS
             if ok:
-                probs, mass, _ = choice.ask(body, f"action: {probe['action']}\nwiki:",
-                                            {k: options["label"][k] for k in ("A", "B", "none")})
+                probs, mass = choice.ask(reply, f"action: {probe['action']}\nwiki:",
+                                         {k: options["label"][k] for k in ("A", "B", "none")})
                 ok = max(probs, key=probs.get) == probe["wiki"] and mass >= MIN_MASS
             if not ok:
                 raise jev.Unavailable("the model does not triage the probe seed reliably")
             _state.update(choice=choice, options=options)
-            logger.info("JEV wiki triage on: fixed prefix of %d tokens + %d padding",
-                        len(choice.g) - choice.pad, choice.pad)
+            logger.info("JEV wiki triage on")
         return _state["choice"], _state["options"]
 
 
@@ -156,17 +157,11 @@ def _brief(conn, seed: dict, active: dict[str, tuple[int, dict]]) -> tuple[str, 
 def _decide_one(choice: jev.Choice, options: dict, seed_id: str, text: str, labels: dict[str, str],
                 active: dict[str, tuple[int, dict]]) -> tuple[MaintainerClusterItem | None, dict]:
     """One seed's decision as the maintainer's, or None (the agent decides)."""
-    usage = {"requests": 0, "input": 0, "cached": 0, "output": 0}
-    body = choice.encode(text)
-
-    def add(u: dict) -> None:
-        usage["requests"] += 1
-        for k in ("input", "cached", "output"):
-            usage[k] += u[k]
+    reply = choice.reply(choice.encode(text))  # every decision on this seed reads this one answer
+    usage = {"requests": 1, **jev.usage_of(reply)}
 
     def ask(lead: str, opts: dict) -> tuple[str, dict, float]:
-        probs, mass, u = choice.ask(body, lead, opts)
-        add(u)
+        probs, mass = choice.ask(reply, lead, opts)
         return max(probs, key=probs.get), probs, mass
 
     action, probs, mass = ask("action:", options["action"])
@@ -194,9 +189,7 @@ def _decide_one(choice: jev.Choice, options: dict, seed_id: str, text: str, labe
             return None, usage
         decision["consolidate_nos"] = same
     elif action == "create":
-        name, u = choice.write(body, "action: create\nname:")
-        add(u)
-        decision["proposed_name"] = name
+        decision["proposed_name"] = choice.name(reply, "action: create\nname:")
     item = MaintainerClusterItem(**decision)
     if action == "create" and not item.proposed_name:
         return None, usage  # no name, or one the schema reads as none ("None", "n/a")

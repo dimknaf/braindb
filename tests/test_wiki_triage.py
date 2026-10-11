@@ -1,13 +1,14 @@
 """Unit tests for wiki triage by JEV (braindb/services/wiki_triage.py and
 `Choice` in braindb/services/jev.py).
 
-DB-free and GPU-free: a fake vLLM endpoint renders, tokenizes and answers by
-cues in the seed. These pin the contract the maintainer relies on:
+DB-free and GPU-free: a fake OpenAI-compatible chat endpoint (conftest.py
+`fake_chat`) writes the model's answer by cues in the seed. These pin the
+contract the maintainer relies on:
 
-- every decision is ONE output token (max_tokens=1) read from the options'
-  logprobs, with thinking off (the answer header is the template's empty think
-  block); the only generated text is a new page's name; a seed's text is
-  encoded once for all its picks;
+- one standard request per seed, thinking off, the guide and its worked
+  examples as chat turns; every decision is ONE token of that one answer,
+  read from its logprobs where its lead ends; the only words taken from
+  the answer are a new page's name;
 - an attach maps the picked candidate to its catalog number, a consolidate
   needs two duplicates, a create carries the written name;
 - anything uncertain (low mass, no fitting candidate, fewer than two
@@ -15,124 +16,70 @@ cues in the seed. These pin the contract the maintainer relies on:
   to the maintainer agent;
 - a profile's maintainer additions shape the agent only (never the guide),
   and triage is off under a profile that replaces the maintainer's prompt;
-- off unless enabled on a self-hosted server, with no request made.
+- off unless enabled, with no request made; on any profile whose server
+  passes the probe.
 """
 from __future__ import annotations
 
 import contextlib
-import math
 
 import pytest
 
 from braindb.agent.run_state import install_usage, release_usage
 from braindb.services import jev, wiki_triage
 
-_WORDS = [" skip", " Skip", " ambiguous", " Ambiguous", " consolidate", " Consolidate", " attach", " Attach",
-          " create", " Create", " none", " None", " yes", " Yes", " no", " No"] + [f" {c}" for c in "ABCDEFGH"]
-_IDS = {w: i for i, w in enumerate(_WORDS, start=1)}
-_MARKERS = {"<|im_start|>": 900, "<|im_end|>": 901}
+ACTIONS = wiki_triage.ACTIONS
 
 
-def _tok(text: str) -> list[int]:
-    if text in _IDS:
-        return [_IDS[text]]
-    ids, i = [], 0
-    while i < len(text):
-        marker = next((m for m in _MARKERS if text.startswith(m, i)), None)
-        if marker:
-            ids.append(_MARKERS[marker])
-            i += len(marker)
-        else:
-            ids.append(1000 + ord(text[i]))
-            i += 1
-    return ids
+def _pick(word: str, options: list[str], mass: float = 0.98) -> tuple[str, dict]:
+    """The answer token `word`, with the options' probabilities around it."""
+    alts = {f" {o}": mass * (0.97 if o == word else 0.01) for o in options}
+    alts["\n"] = max(0.0, 1.0 - sum(alts.values()))
+    return f" {word}", alts
 
 
-def _text(ids: list[int]) -> str:
-    back = {v: k for k, v in {**_IDS, **_MARKERS}.items()}
-    return "".join(back.get(i, chr(i - 1000) if i >= 1000 else "?") for i in ids)
-
-
-def _render(messages, add_generation_prompt=False, thinking=True):
-    out = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages)
-    if add_generation_prompt:  # as Qwen3 templates do: thinking off closes an empty think block
-        out += "<|im_start|>assistant\n" + ("" if thinking else "<think>\n\n</think>\n\n")
-    return _tok(out)
-
-
-class _Response:
-    def __init__(self, status: int, body: dict | None = None):
-        self.status_code, self._body = status, body
-
-    def json(self):
-        return self._body
-
-    def raise_for_status(self):
-        pass
-
-
-class _FakeVLLM:
-    """Answers each pick by cues in the current seed (the text after the last
-    'SEED:'): CUE_CREATE / CUE_SKIP / CUE_CONSOL / CUE_LOWMASS (else attach);
-    PICK_<label> or PICK_NONE for the wiki; DUP_<labels> for duplicates;
-    CUE_NONAME / CUE_NONENAME / CUE_LONGNAME for an empty / "None" / cut-off
-    name. The template closes an empty think block only with thinking off."""
+class _Model:
+    """Answers each seed by cues in it (the brief after 'SEED:'): CUE_CREATE /
+    CUE_SKIP / CUE_CONSOL / CUE_LOWMASS (else attach); PICK_<label> or
+    PICK_NONE for the wiki; DUP_<labels> for duplicates; CUE_NONAME /
+    CUE_NONENAME / CUE_LONGNAME for an empty / "None" / cut-off name. The
+    probe seed is the examples' own probe."""
 
     def __init__(self):
-        self.requests, self.encoded = [], []
         self.probe_ok, self.probe_wiki = True, "B"
 
-    def request(self, method, url, **kwargs):
-        body = kwargs.get("json") or {}
-        if url.endswith("/tokenize"):
-            if "messages" in body:
-                thinking = (body.get("chat_template_kwargs") or {}).get("enable_thinking", True)
-                return _Response(200, {"tokens": _render(body["messages"], body.get("add_generation_prompt"),
-                                                         thinking)})
-            self.encoded.append(body["prompt"])
-            return _Response(200, {"tokens": _tok(body["prompt"])})
-        self.requests.append(body)
-        prompt = _text(body["prompt"])
-        seed = prompt.rsplit("SEED:", 1)[-1]
-        lead = prompt.rsplit("<think>\n\n</think>\n\n", 1)[-1]
-        if "logprob_token_ids" not in body:                       # write: a new page's name
-            name = " None" if "CUE_NONENAME" in seed else "" if "CUE_NONAME" in seed else " Ferrow Bridge"
-            finish = "length" if "CUE_LONGNAME" in seed else "stop"
-            return _Response(200, {"choices": [{"text": name, "finish_reason": finish}],
-                                   "usage": {"prompt_tokens": len(body["prompt"]), "completion_tokens": 3}})
-        want, mass = None, 0.98
-        if lead == "action:":
-            want = ("create" if "CUE_CREATE" in seed else "skip" if "CUE_SKIP" in seed
-                    else "consolidate" if "CUE_CONSOL" in seed else "attach")
-            if "CUE_LOWMASS" in seed or ("Calder Labs hired" in seed and not self.probe_ok):
-                mass = 0.05
-        elif lead.endswith("wiki:"):
-            want = next((c for c in "ABCDEFGH" if f"PICK_{c}" in seed),
-                        self.probe_wiki if "Calder Labs hired" in seed else "none")
-        elif lead.endswith("same subject (yes or no):"):
-            label = lead.rsplit("[", 1)[-1][0]
+    def __call__(self, body: dict):
+        seed = body["messages"][-1]["content"]
+        probe = "Calder Labs hired" in seed
+        action = ("create" if "CUE_CREATE" in seed else "skip" if "CUE_SKIP" in seed
+                  else "consolidate" if "CUE_CONSOL" in seed else "attach")
+        mass = 0.05 if "CUE_LOWMASS" in seed or (probe and not self.probe_ok) else 0.98
+        out = [("action", None), (":", None), _pick(action, ACTIONS, mass)]
+        if action == "attach":
+            wiki = next((c for c in "ABCDEFGH" if f"PICK_{c}" in seed), self.probe_wiki if probe else "none")
+            out += [("\n", None), ("wiki", None), (":", None), _pick(wiki, list("ABCDEFGH") + ["none"])]
+        elif action == "consolidate":
             dups = seed.split("DUP_", 1)[-1].split()[0] if "DUP_" in seed else ""
-            want = "yes" if label in dups else "no"
-        top = {}
-        for i in body["logprob_token_ids"]:
-            word = _WORDS[i - 1].strip().lower()
-            top[f"token_id:{i}"] = math.log(mass * 0.97 if word == want.lower() else mass * 0.01)
-        return _Response(200, {"choices": [{"logprobs": {"top_logprobs": [top]}}],
-                               "usage": {"prompt_tokens": len(body["prompt"]),
-                                         "prompt_tokens_details": {"cached_tokens": 0},
-                                         "completion_tokens": 1}})
+            for label in "AB":
+                out += [("\n", None), (f"[{label}] same subject (yes or no):", None),
+                        _pick("yes" if label in dups else "no", ["yes", "no"])]
+        elif action == "create":
+            name = " None" if "CUE_NONENAME" in seed else "" if "CUE_NONAME" in seed else " Ferrow Bridge"
+            out += [("\n", None), ("name", None), (":", None)]
+            out += [(" word", None)] * 200 if "CUE_LONGNAME" in seed else ([(name, None)] if name else [])
+        return out
 
 
 @pytest.fixture
-def server(monkeypatch):
+def server(monkeypatch, fake_chat):
     monkeypatch.setattr(jev.settings, "jev_wiki_triage", True)
     monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(jev.settings, "agent_model", "")
     monkeypatch.setenv("VLLM_API_KEY", "test-secret-key")
     monkeypatch.delenv("CUSTOM_PROFILE", raising=False)
-    fake = _FakeVLLM()
-    monkeypatch.setattr(jev, "_session", fake)
-    monkeypatch.setattr(wiki_triage, "_state", {"choice": None, "options": None, "off_until": 0.0})
+    model = _Model()
+    fake = fake_chat(model)
+    fake.model_cues = model
     return fake
 
 
@@ -153,24 +100,24 @@ def test_attach_maps_the_picked_candidate_to_its_catalog_number(server):
     decision, usage = _one("a fact CUE_ATTACH PICK_B")
     assert decision.action == "attach" and decision.target_wiki_no == 7
     assert decision.entity_id == "seed-1" and decision.proposed_name is None
-    assert usage["requests"] == 2 and usage["output"] == 2           # one token per decision
-    assert sum("CUE_ATTACH" in t for t in server.encoded) == 1        # the seed is encoded once
+    assert usage["requests"] == 1                                    # every decision reads one answer
+    assert sum("CUE_ATTACH" in b["messages"][-1]["content"] for b in server.bodies) == 1
 
 
-def test_every_pick_is_one_token_with_thinking_off(server):
+def test_a_seed_is_one_standard_request_with_thinking_off_and_the_examples_as_turns(server):
     _one("a fact CUE_ATTACH PICK_A")
-    picks = [r for r in server.requests if "logprob_token_ids" in r]
-    assert picks and all(r["max_tokens"] == 1 and r["temperature"] == 0 for r in picks)
-    for r in picks:
-        tail = _text(r["prompt"]).rsplit("<|im_start|>assistant\n", 1)[-1]
-        assert tail.startswith("<think>\n\n</think>\n\n")             # the answer opens with thinking closed
-        assert tail.endswith(("action:", "wiki:"))
+    body = next(b for b in server.bodies if "CUE_ATTACH" in b["messages"][-1]["content"])
+    assert body["reasoning_effort"] == "none" and body["temperature"] == 0 and body["logprobs"] is True
+    assert body["messages"][0] == {"role": "system", "content": wiki_triage._GUIDE}
+    examples = wiki_triage._EXAMPLES["examples"]
+    assert [m["role"] for m in body["messages"][1:-1]] == ["user", "assistant"] * len(examples)
+    assert body["messages"][2]["content"] == examples[0]["answer"]  # answered as the examples answer
 
 
 def test_create_writes_only_the_name(server):
     decision, usage = _one("a bridge reopened CUE_CREATE")
     assert decision.action == "create" and decision.proposed_name == "Ferrow Bridge"
-    assert usage["requests"] == 2
+    assert usage["requests"] == 1
 
 
 def test_skip_needs_nothing_more(server):
@@ -207,7 +154,7 @@ def test_decide_returns_only_confident_seeds_and_counts_the_rest(server, monkeyp
         release_usage(token)
     assert set(decided) == {"s1"} and decided["s1"].target_wiki_no == 2   # catalog numbering from `cat`
     used = ledger.as_dict()["jev"]
-    assert used["calls"] == 2 and used["failopen"] == 1 and used["output"] == used["requests"]
+    assert used["calls"] == 2 and used["failopen"] == 1 and used["requests"] == 2
 
 
 def test_a_seed_that_fails_goes_to_the_agent_alone(server, monkeypatch):
@@ -222,22 +169,23 @@ def test_a_seed_that_fails_goes_to_the_agent_alone(server, monkeypatch):
     assert set(decided) == {"s1"} and wiki_triage.wanted()
 
 
-def test_off_unless_enabled_on_a_self_hosted_server(server, monkeypatch):
+def test_off_unless_enabled_and_on_any_profile_whose_server_passes_the_probe(server, monkeypatch):
     seeds = [{"brief": {"id": "s1"}}]
     monkeypatch.setattr(jev.settings, "jev_wiki_triage", False)
     assert not wiki_triage.wanted() and wiki_triage.decide(seeds, []) == {}
+    assert server.bodies == []
     monkeypatch.setattr(jev.settings, "jev_wiki_triage", True)
-    monkeypatch.setattr(jev.settings, "llm_profile", "deepinfra")          # a hosted gateway
-    assert not wiki_triage.wanted() and wiki_triage.decide(seeds, []) == {}
-    assert server.requests == []
+    monkeypatch.setattr(jev.settings, "llm_profile", "deepinfra")          # a hosted gateway: the probe decides
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "test-secret-key")
+    assert wiki_triage.wanted() and wiki_triage._choice() is not None
 
 
 @pytest.mark.parametrize("failure", ["action", "wiki"])
 def test_a_failed_probe_switches_triage_off(server, monkeypatch, failure):
     if failure == "action":
-        server.probe_ok = False
+        server.model_cues.probe_ok = False
     else:
-        server.probe_wiki = "A"                                         # the wrong candidate
+        server.model_cues.probe_wiki = "A"                              # the wrong candidate
     monkeypatch.setattr(wiki_triage, "get_conn", contextlib.nullcontext)
     assert wiki_triage.decide([{"brief": {"id": "s1"}}], []) == {}
     assert not wiki_triage.wanted()                                     # off until re-probed
@@ -252,7 +200,7 @@ def test_the_maintainers_profile_additions_stay_out_of_the_guide(server, monkeyp
     monkeypatch.setenv("CUSTOM_PROFILE", "news")
     assert wiki_triage.wanted()
     choice, _ = wiki_triage._choice()
-    assert "Skip non-subjects." not in _text(choice.g)
+    assert not any("Skip non-subjects." in m["content"] for m in choice.turns)
 
 
 def test_off_under_a_profile_that_replaces_the_maintainer_prompt(server, monkeypatch, tmp_path):
@@ -261,4 +209,4 @@ def test_off_under_a_profile_that_replaces_the_maintainer_prompt(server, monkeyp
     monkeypatch.setenv("CUSTOM_PROFILE_DIR", str(tmp_path))
     monkeypatch.setenv("CUSTOM_PROFILE", "own")
     assert not wiki_triage.wanted() and wiki_triage.decide([{"brief": {"id": "s1"}}], CAT) == {}
-    assert server.requests == []
+    assert server.bodies == []

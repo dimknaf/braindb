@@ -15,7 +15,7 @@ the neighbours of the shown items (relations only: no keyword tags, no
 retired pages, nothing already shown), those most of the shown items link
 to first, are appended one at a time to the tool's output, each followed by
 ONE token, "[h1.2] | useful (yes or no):", thinking off, read from the
-logprobs of the yes/no ids. A page is offered by its name, summary line and
+logprobs of its yes/no token. A page is offered by its name, summary line and
 section names, a document also with the shown item it is linked from, and
 anything else by its content. Yes (P >= KEEP): the output continues through
 it, and its own neighbours are the next hop's candidates. No, or too little
@@ -23,11 +23,11 @@ probability on the options: it is rolled back and never followed. Up to
 HOPS hops of at most CANDIDATES neighbours each. Nothing recall showed is
 removed, and anything that goes wrong gives recall's output as it was.
 
-Each decision request is the agent's next turn up to the tool's output, as
-the reader's are (reader.split_turn and reader.check): every neighbour is
-computed once, and the agent's next turn continues from the cache of what
-was kept. The agents that read carry worked examples of the question in
-their system prompt (agent/prompts/hops_system.md).
+Each decision request is the agent's next request up to the tool's output,
+then the question, as the reader's are (services/reader.py, jev.ask): every
+neighbour is computed once, and the agent's next turn continues from the
+cache of what was kept. The agents that read carry worked examples of the
+question in their system prompt (agent/prompts/hops_system.md).
 
 The wiki gate takes the job members' neighbours as extra candidates the same
 way (services/wiki_gate.py, `neighbours`).
@@ -53,7 +53,7 @@ LEAD = "| useful (yes or no):"  # asked after each neighbour, behind its anchor
 HOPS = 2            # hops followed from what recall showed
 CANDIDATES = 6      # neighbours offered per hop, those most of the shown items link to first
 KEEP = 0.9          # P(yes) from which a neighbour stays, and is followed
-MIN_MASS = 0.5      # below this the options hold too little probability: rolled back
+MIN_MASS = jev.MIN_MASS  # below this the options hold too little probability: rolled back
 PREVIEW = 400       # chars of a neighbour's content it is offered with
 SECTIONS = 12       # a page's section names it is offered with
 DEADLINE_S = 60     # for all of a recall's hops; what is left is not offered
@@ -93,8 +93,7 @@ GROUP BY t.id, t.entity_type, t.title, t.content, t.keywords
 
 def wanted() -> bool:
     """Whether hops serve agent runs now."""
-    return (settings.jev_hops and settings.self_hosted
-            and time.monotonic() >= _state["off_until"])
+    return settings.jev_hops and time.monotonic() >= _state["off_until"]
 
 
 def neighbours(conn, ids: list[str], exclude: set[str], limit: int,
@@ -178,8 +177,6 @@ def extend(turn: reader.Turn, shown: list[str], text: str, question: str) -> str
         failed = False  # nothing kept is an answer too: recall's output as it was
     except jev.Unavailable as e:
         _switch_off(e)
-    except reader.Mismatch as e:
-        logger.warning("JEV hops fell back: %s", e)
     except Exception as e:  # noqa: BLE001 - unreachable, refused or too slow: recall's output
         logger.warning("JEV hops failed open: %s", type(e).__name__)
     add_usage("jev", calls=1, failopen=int(failed), **usage)
@@ -188,9 +185,7 @@ def extend(turn: reader.Turn, shown: list[str], text: str, question: str) -> str
 
 def _extend(turn: reader.Turn, shown: list[str], text: str, question: str, deadline: float,
             usage: dict) -> str | None:
-    server, options, window, consts = reader.ready()
-    c, t = reader.split_turn(server, turn, consts)
-    leads: dict[str, list[int]] = {}
+    server = reader.ready()
 
     def spend(u: dict) -> None:
         usage["requests"] += 1
@@ -200,11 +195,9 @@ def _extend(turn: reader.Turn, shown: list[str], text: str, question: str, deadl
     # The tool's output so far: recall's, then what the hops keep.
     memory = (f"{text}\n\nNeighbours of the items above, one hop at a time, each kept only if useful for: "
               f"{question}\n")
-    # Recall's output through this line, so that a neighbour rolled back
-    # before any is kept returns to a cached block near it.
-    spend(jev.usage_of(server.complete({"prompt": c + server.encode(memory), "max_tokens": 1, "temperature": 0})))
+    size = 0  # tokens of the agent's prompt through it, as the server counted the last request
     seen, frontier = set(shown), list(shown)
-    offered, kept, checked, done = 0, 0, False, False
+    offered, kept, done = 0, 0, False
     for hop in range(1, HOPS + 1):
         with get_conn() as conn:  # its own short transaction
             cands = neighbours(conn, frontier, seen, CANDIDATES)
@@ -212,24 +205,20 @@ def _extend(turn: reader.Turn, shown: list[str], text: str, question: str, deadl
         frontier = []
         for i, n in enumerate(cands, 1):
             anchor = f"h{hop}.{i}"
-            content, lead = memory + _item(anchor, n), f"[{anchor}] {LEAD}"
-            s_ids = server.encode(content)  # the whole output so far, as the server tokenizes it
+            item = _item(anchor, n)
             # The deadline, or the room the agent keeps for its later turns:
             # the rest is not offered.
-            if time.monotonic() > deadline or len(c) + len(s_ids) + reader.ROOM > window:
+            if time.monotonic() > deadline or (
+                    size and size + len(item) / reader.CHARS_PER_TOKEN + reader.ROOM > reader.WINDOW_TOKENS):
                 done = True
                 break
-            if lead not in leads:
-                leads[lead] = server.encode(lead)
-            prompt = c + s_ids + t + leads[lead]
-            if not checked:
-                reader.check(server, turn, content, lead, prompt)
-                checked = True
-            probs, mass, u = jev.ask_ids(server, prompt, options)
+            content = memory + item
+            probs, mass, u = jev.ask(server, reader.with_content(turn, content), f"[{anchor}] {LEAD}",
+                                     jev.YES_NO, turn.tools)
             spend(u)
             offered += 1
             if mass >= MIN_MASS and probs["yes"] >= KEEP:  # stays, and is followed next hop
-                memory = content
+                memory, size = content, u["input"]
                 frontier.append(n["id"])
                 kept += 1
         if done or not frontier:

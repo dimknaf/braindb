@@ -21,7 +21,7 @@ _LLM_PROFILES: dict[str, dict[str, str]] = {
         "base_url": "https://integrate.api.nvidia.com/v1",
     },
     "deepinfra": {
-        "model": "google/gemma-4-31B-it",
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash",
         "api_key_env": "DEEPINFRA_API_KEY",
         "base_url": "https://api.deepinfra.com/v1/openai",
     },
@@ -64,7 +64,7 @@ _LLM_PROFILES: dict[str, dict[str, str]] = {
 }
 
 # Hosted gateways: a real API key is always required (no "EMPTY"
-# placeholder), and JEV, which needs a self-hosted vLLM, stays off.
+# placeholder).
 _HOSTED_PROFILES = {"nim", "deepinfra"}
 
 # The LiteLLM routing prefix an existing .env may still carry in AGENT_MODEL,
@@ -271,11 +271,13 @@ class Settings(BaseSettings):
     agent_wiki_reasoning_effort: str = ""
 
     # JEV — closed yes/no relevance judgements read from one token's
-    # probability (services/jev.py). SELF-HOSTED vLLM ONLY: it needs vLLM's
-    # token-id prompts, /tokenize and logprob_token_ids, and on any other
-    # endpoint its first-use probe keeps it off. This switch is the recall
-    # filter only: off by default, and with it off recall is unchanged. On, a
-    # recall made while answering an /agent/query request that states a
+    # probability (services/jev.py), as standard chat completions on the
+    # agent profile's own server: any OpenAI-compatible server whose replies
+    # carry logprobs and that turns thinking off with `reasoning_effort`
+    # "none". Each feature probes the server on first use and stays off where
+    # it fails; any failure gives the behaviour without it. This switch is the
+    # recall filter only: off by default, and with it off recall is unchanged.
+    # On, a recall made while answering an /agent/query request that states a
     # `need` keeps only the items the model judges useful for that need. The
     # other JEV features below (wiki triage, wiki gate, reader, hops) have
     # switches of their own.
@@ -287,35 +289,34 @@ class Settings(BaseSettings):
     # Wiki triage by JEV (services/wiki_triage.py): the maintainer's per-seed
     # decision (action + target wiki) taken as one-token picks instead of an
     # agent run; seeds it cannot decide confidently still go to the agent.
-    # On by default; SELF-HOSTED vLLM ONLY, like the rest of JEV, and only
-    # once the server passes its probe. Off under a custom profile that
-    # replaces the maintainer's prompt; a profile's maintainer additions shape
-    # the agent's decisions only.
+    # On by default, once the server passes its probe. Off under a custom
+    # profile that replaces the maintainer's prompt; a profile's maintainer
+    # additions shape the agent's decisions only.
     jev_wiki_triage: bool = True
     # The wiki writer behind a JEV gate (services/wiki_gate.py): which facts
     # recall finds about the job's subject reach the writer, and which
     # sections of a long page each goes to, are one-token picks inside the
     # gated writer's own first request; the writer then edits with only
     # those, and no research tools. Attach and create jobs only; when the
-    # gate cannot run, the full writer runs as before. On by default;
-    # SELF-HOSTED vLLM ONLY, once the server passes its probe; off under a
-    # custom profile that replaces the writer's prompt.
+    # gate cannot run, the full writer runs as before. On by default, once
+    # the server passes its probe; off under a custom profile that replaces
+    # the writer's prompt.
     jev_wiki_gate: bool = True
     # The adaptive reader, nested in the agent's conversation
     # (services/reader.py): when an /agent/query request (or one of its
     # subagents) starts reading a body longer than one tool output, the body
     # is read once, piece by piece inside the agent's own conversation, each
     # piece kept or dropped by one-token picks, and the agent continues with
-    # only what was kept. On by default; SELF-HOSTED vLLM ONLY, once the
-    # server passes its probe; with it off get_entity is unchanged.
+    # only what was kept. On by default, once the server passes its probe;
+    # with it off get_entity is unchanged.
     jev_reader: bool = True
     # Hops (services/hops.py): after a recall_memory call in an /agent/query
     # request, the relation neighbours of what recall showed are offered one
     # at a time inside the agent's own conversation, each kept or dropped by
     # a one-token pick, and only the kept ones are followed to the next hop;
     # with the wiki gate on, the job members' neighbours join its candidates.
-    # On by default; SELF-HOSTED vLLM ONLY, once the server passes its probe;
-    # with it off recall_memory is unchanged.
+    # On by default, once the server passes its probe; with it off
+    # recall_memory is unchanged.
     jev_hops: bool = True
 
     @property

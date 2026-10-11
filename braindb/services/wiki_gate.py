@@ -17,8 +17,8 @@ appends to it, LAST, the facts BrainDB's own recall turns up for the page (at
 most PACK; wikis, keywords, sources, the job's members and the facts the page
 already cites left out) and, with JEV_HOPS on, the facts one relation away
 from the members (at most PACK_HOPS, services/hops.py), one at a time, each
-followed by one token in that
-same conversation, thinking off, read from the logprobs of the options:
+followed by one question in that same conversation (services/jev.py `ask`:
+thinking off, its answer read from the logprobs of ONE token):
 - "[f2] | about the subject (yes or no):" yes: the conversation continues
   through the fact; no, or too little probability on the options: it is
   rolled back, and the next fact follows what was kept;
@@ -27,15 +27,13 @@ same conversation, thinking off, read from the logprobs of the options:
   "new" (an unsure one is left to the writer).
 The members are the writer's to cite whatever the gate says (a member left
 uncited is lost), so they are never asked about. The writer's first turn
-continues from the server's cache of all of it (services/reader.py: a hybrid
-model's server keeps only the last whole block a request ended in), and it
-edits without research tools (agent.get_gated_writer_agent), so nothing left
-out can come back.
+continues from the server's prefix cache of all of it, and it edits without
+research tools (agent.get_gated_writer_agent), so nothing left out can come
+back.
 
 Anything the gate cannot do (off, consolidate, a profile that replaces the
-writer's prompt, a failed probe, a request the server renders differently,
-an error or the deadline) gives None, and the full writer runs exactly as
-before.
+writer's prompt, a failed probe, an error or the deadline) gives None, and
+the full writer runs exactly as before.
 """
 from __future__ import annotations
 
@@ -61,7 +59,7 @@ ID_LEAD = "| about the subject (yes or no):"  # asked after each found fact, beh
 PL_LEAD = "| section:"                         # asked for each member and kept fact of a long page
 LETTERS = list(string.ascii_uppercase[:16])   # at most 16 outline sections are offered
 KEEP = 0.5         # P(yes) a found fact needs to reach the writer
-MIN_MASS = 0.5     # below this the options hold too little probability: no answer
+MIN_MASS = jev.MIN_MASS  # below this the options hold too little probability: no answer
 PACK = 8           # facts found by recall that are read
 PACK_HOPS = 6      # with JEV_HOPS on, facts one relation away from the members, read after them
 FACT_CHARS = 1200  # of each fact's content
@@ -95,7 +93,7 @@ class Gate:
 
 def wanted() -> bool:
     """Whether the gate serves writer runs now."""
-    return (settings.jev_wiki_gate and settings.self_hosted
+    return (settings.jev_wiki_gate
             and time.monotonic() >= _state["off_until"]
             # a profile's `.replace.md` rewrites the writer's whole contract
             and not custom_profile.replace_or_base("", "wiki_writer"))
@@ -167,26 +165,22 @@ _PROBE_FACTS = ({"id": "probe-1", "entity_type": "fact", "content": "Kel Aster o
                 {"id": "probe-2", "entity_type": "fact", "content": "Rowan Pell, the Brenno actor, starred in the 1990s sitcom Tarn Lane."})
 
 
-def _ready(turn: reader.Turn) -> tuple[jev.Server, dict, dict, int, dict]:
-    """The server, the yes/no and the section options, the served window and
-    the rendering markers, probed once per process in the gated writer's own
-    system prompt and tools (again after REPROBE_S when it was switched off)."""
+def _ready(turn: reader.Turn) -> jev.Server:
+    """The agent model's server, probed once per process in the gated
+    writer's own system prompt and tools (again after REPROBE_S when it was
+    switched off)."""
     with _lock:
         if time.monotonic() < _state["off_until"]:  # a run that waited here while the probe failed
             raise jev.Unavailable("the wiki gate is off until it is probed again")
         if _state["server"] is None:
+            server = jev.Server()
             try:
-                server, options, window, consts = reader.connect()
-                places = jev.option_ids(server, LETTERS + ["new"])
-                probe = reader.Turn([turn.messages[0], {"role": "user", "content": _PROBE_HEAD}],
-                                    turn.tools, turn.template_kwargs)
-                c, t = reader.split_turn(server, probe, consts)
+                probe = reader.Turn([turn.messages[0], {"role": "user", "content": _PROBE_HEAD}], turn.tools)
                 p = []
                 for i, f in enumerate(_PROBE_FACTS, 1):
-                    content, lead = f"{_PROBE_HEAD}\n\n{_fact(f'f{i}', f)}", f"[f{i}] {ID_LEAD}"
-                    prompt = c + server.encode(content) + t + server.encode(lead)
-                    reader.check(server, probe, content, lead, prompt)
-                    probs, mass, _ = jev.ask_ids(server, prompt, options)
+                    content = f"{_PROBE_HEAD}\n\n{_fact(f'f{i}', f)}"
+                    probs, mass, _ = jev.ask(server, reader.with_content(probe, content), f"[f{i}] {ID_LEAD}",
+                                             jev.YES_NO, probe.tools)
                     if mass < MIN_MASS:
                         raise jev.Unavailable("the options hold too little probability in the probe job")
                     p.append(probs["yes"])
@@ -195,9 +189,9 @@ def _ready(turn: reader.Turn) -> tuple[jev.Server, dict, dict, int, dict]:
             except jev.Unavailable:
                 raise
             except Exception as e:  # noqa: BLE001 - a probe that cannot finish keeps it off too
-                raise jev.Unavailable(str(e) if isinstance(e, reader.Mismatch) else type(e).__name__) from None
-            _state["server"] = (server, options, places, window, consts)
-            logger.info("JEV wiki gate on: a served window of %d tokens", window)
+                raise jev.Unavailable(type(e).__name__) from None
+            _state["server"] = server
+            logger.info("JEV wiki gate on")
         return _state["server"]
 
 
@@ -213,17 +207,15 @@ def prepare(turn: reader.Turn, canonical: str, old_body: str, members: list[dict
     usage = {"requests": 0, "input": 0, "cached": 0, "output": 0}
     gate = None
     try:
-        ready = _ready(turn)
+        server = _ready(turn)
         with get_conn() as conn:  # its own short transaction
             found = _found(conn, canonical, old_body, members)
         # The deadline is for the decisions: recall takes what it takes, as
         # it would for the full writer's own research.
-        gate = _decide(ready, turn, canonical, old_body, members, found, sections,
+        gate = _decide(server, turn, canonical, old_body, members, found, sections,
                        time.monotonic() + DEADLINE_S, usage)
     except jev.Unavailable as e:
         _switch_off(e)
-    except reader.Mismatch as e:
-        logger.warning("JEV wiki gate fell back: %s", e)
     except Exception as e:  # noqa: BLE001 - unreachable, refused or too slow: the full writer runs
         logger.warning("JEV wiki gate failed open: %s", type(e).__name__)
     add_usage("jev", calls=1, failopen=int(gate is None), **usage)
@@ -235,22 +227,19 @@ def prepare(turn: reader.Turn, canonical: str, old_body: str, members: list[dict
     return gate
 
 
-def _decide(ready: tuple, turn: reader.Turn, canonical: str, old_body: str, members: list[dict],
+def _decide(server: jev.Server, turn: reader.Turn, canonical: str, old_body: str, members: list[dict],
             found: list[dict], sections: list, deadline: float, usage: dict) -> Gate:
-    server, options, places, window, consts = ready
     placing = bool(sections) and len(sections) <= len(LETTERS)
-    leads: dict[str, list[int]] = {}
 
-    def ask(content_ids: list[int], lead: str, opts: dict) -> tuple[dict, float]:
+    def ask(content: str, lead: str, options: list[str]) -> tuple[dict, float, int]:
+        """`lead` asked after `content` as the writer's prompt; the prompt's size too."""
         if time.monotonic() > deadline:
             raise TimeoutError("the wiki gate's decisions missed the deadline")
-        if lead not in leads:
-            leads[lead] = server.encode(lead)
-        probs, mass, u = jev.ask_ids(server, c + content_ids + t + leads[lead], opts)
+        probs, mass, u = jev.ask(server, reader.with_content(turn, content), lead, options, turn.tools)
         usage["requests"] += 1
         for k in ("input", "cached", "output"):
             usage[k] += u[k]
-        return probs, mass
+        return probs, mass, u["input"]
 
     # The writer's prompt so far: the job, then (last) the facts kept.
     memory = f"{turn.messages[-1]['content']}\n\n### Facts found in memory\n{_subject(canonical, old_body)}"
@@ -258,46 +247,31 @@ def _decide(ready: tuple, turn: reader.Turn, canonical: str, old_body: str, memb
     if not found and not placing:
         gate.prompt = memory + "\n(none)"
         return gate
-    c, t = reader.split_turn(server, turn, consts)
-    m_ids = server.encode(memory)
-    # The prompt through the subject, so that a fact left out before any is
-    # kept rolls back to a cached block near it.
-    u = jev.usage_of(server.complete({"prompt": c + m_ids, "max_tokens": 1, "temperature": 0}))
-    usage["requests"] += 1
-    for k in ("input", "cached", "output"):
-        usage[k] += u[k]
-    checked = False
+    size = 0  # tokens of the writer's prompt through it, as the server counted the last request
     kept: list[tuple[str, dict]] = []  # (anchor, fact)
     for i, f in enumerate(found, 1):
-        content, lead = f"{memory}\n\n{_fact(f'f{i}', f)}", f"[f{i}] {ID_LEAD}"
-        s_ids = server.encode(content)  # the whole prompt so far, as the server tokenizes it
-        if len(c) + len(s_ids) + reader.ROOM > window:
+        fact = f"\n\n{_fact(f'f{i}', f)}"
+        if size and size + len(fact) / reader.CHARS_PER_TOKEN + reader.ROOM > reader.WINDOW_TOKENS:
             gate.excluded += [g["id"] for g in found[i - 1:]]
             break
-        if not checked:
-            reader.check(server, turn, content, lead, c + s_ids + t + server.encode(lead))
-            checked = True
-        probs, mass = ask(s_ids, lead, options)
+        probs, mass, prompt = ask(memory + fact, f"[f{i}] {ID_LEAD}", jev.YES_NO)
         if mass >= MIN_MASS and probs["yes"] >= KEEP:  # stays: the prompt continues through it
-            memory, m_ids = content, s_ids
+            memory, size = memory + fact, prompt
             kept.append((f"f{i}", f))
         else:                                          # rolled back: the next fact follows `memory`
             gate.excluded.append(f["id"])
     gate.found = [f for _, f in kept]
     if not kept:
         memory += "\n(none)"
-        m_ids = server.encode(memory)
     if placing:
         items = [(f"m{i}", m) for i, m in enumerate(members, 1)] + kept
-        opts = {k: places[k] for k in LETTERS[:len(sections)] + ["new"]}
-        if not checked:
-            lead = f"[{items[0][0]}] {PL_LEAD}"
-            reader.check(server, turn, memory, lead, c + m_ids + t + server.encode(lead))
+        options = LETTERS[:len(sections)] + ["new"]
 
         def place(item: tuple[str, dict]) -> tuple[dict, dict, float]:
-            return (item[1], *ask(m_ids, f"[{item[0]}] {PL_LEAD}", opts))
+            probs, mass, _ = ask(memory, f"[{item[0]}] {PL_LEAD}", options)
+            return item[1], probs, mass
 
-        # The first alone: it leaves the shared prompt's last block cached for the rest.
+        # The first alone: it leaves the shared prompt cached for the rest.
         results = [place(items[0])]
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
             results += pool.map(place, items[1:])

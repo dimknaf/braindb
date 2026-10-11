@@ -5,25 +5,29 @@ BrainDB's agents read a lot to decide a little: a recall returns up to 30
 items, and the model then reasons at length about which of them matter.
 JEV asks the served model the CLOSED question instead — "is this item
 useful for this need?" — one item per request, and reads the answer as the
-probability that the next token is "yes" rather than "no". Code only
+probability that the answer token is "yes" rather than "no". Code only
 compares that probability with a threshold: the model still owns the
 judgement (no keyword rule, no new similarity path); it states it in one
 token instead of a paragraph.
 
-Why it is cheap on a self-hosted vLLM with prefix caching: every request
-starts with the same fixed prompt G (`agent/prompts/jev_judge.md` plus the
-worked examples in `jev_examples.json`), padded to whole cache blocks, so
-the server computes G once and reuses it. A judgement then costs only its
-short uncached tail (need + item + answer header) and ONE output token.
+Every request is a standard OpenAI chat completion through the openai
+library, on the agent profile's own endpoint and model: thinking off with
+`reasoning_effort="none"`, `temperature` 0, `logprobs` with `top_logprobs`.
+The answer is the first option token the model writes, either first or
+right after it restates the question's line (some models do, as the worked
+examples write it); its probability comes from that token's top_logprobs,
+or from its own logprob when the server returns no alternatives. A request
+that repeats an earlier one's beginning is served from the server's prefix
+cache, so the fixed guide and examples, or a conversation so far, are
+computed once.
 
-SELF-HOSTED vLLM ONLY: it relies on vLLM's token-id prompts, `/tokenize`
-and `logprob_token_ids`. Hosted gateways answer 200 and silently drop
-`logprob_token_ids`, so `available()` proves every capability on first use
-and keeps JEV off otherwise. Every failure fails OPEN: the caller keeps
-exactly what it would have had without JEV.
+Any OpenAI-compatible server that returns logprobs and can turn thinking
+off can serve it; `available()` proves that on first use (a clear-cut pair
+the model must judge right) and keeps JEV off otherwise. Every failure
+fails OPEN: the caller keeps exactly what it would have had without JEV.
 
-Plain sync functions (requests + a small thread pool); async callers wrap
-them in `asyncio.to_thread`.
+Plain sync functions (the openai client + a small thread pool); async
+callers wrap them in `asyncio.to_thread`.
 """
 from __future__ import annotations
 
@@ -36,7 +40,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
-import requests
+import openai
+from openai import OpenAI
 
 # The usage ledger lives in a dependency-free module; JEV adds its tokens to
 # the request's ledger exactly like the agent's own LLM calls do.
@@ -51,26 +56,30 @@ _PROMPTS = Path(__file__).resolve().parent.parent / "agent" / "prompts"
 _GUIDE = (_PROMPTS / "jev_judge.md").read_text(encoding="utf-8").strip()
 _EXAMPLES = json.loads((_PROMPTS / "jev_examples.json").read_text(encoding="utf-8"))
 
-# The answer every judgement completes, and the spellings read back from
-# the logits. Each spelling must be ONE token (`available()` checks).
+# The line every judgement answers, as the worked examples write it.
 LEAD = "useful (yes or no):"
-_SPELLINGS = {"yes": (" yes", " Yes", "yes", "Yes"), "no": (" no", " No", "no", "No")}
+YES_NO = ["yes", "no"]
 
-# What the judge reads: the need and each item's own text, capped so need +
-# item + answer header stay inside one cache block (see BLOCK).
+# What the judge reads: the need and each item's own text, capped.
 NEED_CHARS = 500
 ITEM_CHARS = 1024
 
-# Prefix-cache block of the hybrid Qwen3.8 server JEV was measured on. That
-# server reuses a prefix only up to the last whole block an earlier request
-# ENDED in, so G is padded to whole blocks: every judgement's request then
-# ends its last whole block exactly at G and reuses all of it. 784 is a
-# multiple of vLLM's usual block of 16, so G stays whole-block there too.
-BLOCK = 784
+# Output tokens a decision may take: its answer, after the question's line
+# when the model restates it first.
+ANSWER_TOKENS = 24
+# The most alternatives the standard returns per token.
+TOP_LOGPROBS = 20
+# Below this share of the answer token the options hold too little
+# probability: the model meant to write something else (thinking, prose),
+# and there is no answer. A reply's first token is free: a tool call, the
+# end of the turn or the restated question line take some of it too, so a
+# clear answer can hold under half of it (measured: 0.44 to 0.99 for clear
+# decisions on a self-hosted Qwen; ~0 for a model that thinks first).
+MIN_MASS = 0.3
 
-# Measured on that server: 30 items took 6.2 s with 4 workers and 3.7 s
-# with 8. The pool is module-wide, so concurrent recalls together never put
-# more than 8 JEV requests on a server that other work shares.
+# Measured on a self-hosted server: 30 items took 6.2 s with 4 workers and
+# 3.7 s with 8. The pool is module-wide, so concurrent recalls together
+# never put more than 8 JEV requests on a server that other work shares.
 WORKERS = 8
 # Past the deadline, judged items keep their scores and the rest are kept
 # unjudged, so a busy server can only cost latency, never items.
@@ -102,7 +111,7 @@ def clean(text: str) -> str:
     stored string can open or close a chat turn ('<|im_end|>' inside an item
     would otherwise be read as the real special token). Blank runs are
     squeezed — they cost tokens and say nothing."""
-    text = re.sub(r"[ \t]+", " ", text.replace("<", "\u2039"))
+    text = re.sub(r"[ \t]+", " ", text.replace("<", "‹"))
     return re.sub(r"\s*\n\s*", "\n", text).strip()
 
 
@@ -133,190 +142,179 @@ def judge_text(entity_type: str, content: str | None, title: str | None = None,
     return f"[{_TAG.get(entity_type, entity_type)}] {text}"
 
 
-_THINKING_OFF = {"enable_thinking": False}
-
-_session = requests.Session()
 # Every JEV request counts toward one limit, whichever feature sends it (the
-# judge, wiki triage, the wiki gate), so together they never put more than
-# this many requests on a server that other work shares.
+# judge, wiki triage, the wiki gate, the reader, hops), so together they
+# never put more than this many requests on a server that other work shares.
 _in_flight = threading.BoundedSemaphore(WORKERS)
 
 
 class Server:
-    """The agent profile's own vLLM endpoint and model: JEV has no endpoint
-    settings of its own."""
+    """The agent profile's own endpoint and model, through the openai
+    library: JEV has no endpoint settings of its own."""
 
     def __init__(self) -> None:
-        self.base = settings.resolved_base_url.rstrip("/")
-        self.root = self.base.removesuffix("/v1")  # /tokenize lives beside /v1
-        self.headers = {"Authorization": f"Bearer {settings.resolved_api_key}"}
         self.model = settings.resolved_agent_model
+        self.client = OpenAI(base_url=settings.resolved_base_url,
+                             api_key=settings.resolved_api_key or "missing-api-key",
+                             timeout=REQUEST_TIMEOUT_S, max_retries=1)
+        # Thinking off by the standard switch, until the server refuses it.
+        self.effort = True
 
-    def _send(self, method: str, url: str, body: dict | None) -> dict:
-        for attempt in (1, 2):  # one retry on a dropped connection or a 5xx
-            try:
-                # Waiting for a free slot is bounded like the request itself,
-                # so a full limit costs a caller its timeout, never a hang.
-                if not _in_flight.acquire(timeout=REQUEST_TIMEOUT_S):
-                    raise requests.Timeout("every JEV request slot stayed busy")
+    def chat(self, messages: list[dict], tools: list[dict] | None = None,
+             max_tokens: int = ANSWER_TOKENS, stop: list[str] | None = None):
+        """One chat completion, thinking off, with the logprobs of what it
+        writes. With `tools` (an agent's own, so the request starts as its
+        requests do) the reply must be text."""
+        body = {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": 0,
+                "logprobs": True, "top_logprobs": TOP_LOGPROBS}
+        if tools:
+            body.update(tools=tools, tool_choice="none")
+        if stop:
+            body["stop"] = stop
+        # Waiting for a free slot is bounded like the request itself, so a
+        # full limit costs a caller its timeout, never a hang.
+        if not _in_flight.acquire(timeout=REQUEST_TIMEOUT_S):
+            raise TimeoutError("every JEV request slot stayed busy")
+        try:
+            return self._create(body)
+        finally:
+            _in_flight.release()
+
+    def _create(self, body: dict):
+        try:
+            return self.client.chat.completions.create(
+                **body, **({"reasoning_effort": "none"} if self.effort else {}))
+        except (openai.AuthenticationError, openai.PermissionDeniedError, openai.NotFoundError) as e:
+            raise Unavailable(f"HTTP {e.status_code}") from None
+        except openai.APIStatusError as e:
+            if e.status_code not in (400, 413, 422):
+                raise
+            if self.effort:
+                # A server that rejects the standard switch: once more without
+                # it. If the model then thinks, no option comes first and the
+                # probe keeps JEV off.
                 try:
-                    r = _session.request(method, url, json=body, headers=self.headers,
-                                         timeout=REQUEST_TIMEOUT_S)
-                finally:
-                    _in_flight.release()
-            except (requests.ConnectionError, requests.Timeout):
-                if attempt == 2:
-                    raise
-                continue
-            if r.status_code >= 500 and attempt == 1:
-                continue
-            if r.status_code in (401, 403, 404):
-                raise Unavailable(f"HTTP {r.status_code}")
-            if r.status_code in (400, 413, 422):
-                raise _ItemError(f"HTTP {r.status_code}")
-            r.raise_for_status()
-            return r.json()
-        raise AssertionError("unreachable")
-
-    def get(self, path: str) -> dict:
-        return self._send("GET", self.base + path, None)
-
-    def complete(self, body: dict) -> dict:
-        return self._send("POST", self.base + "/completions", {"model": self.model, **body})
-
-    def encode(self, text: str) -> list[int]:
-        return self._send("POST", self.root + "/tokenize", {
-            "model": self.model, "prompt": text, "add_special_tokens": False})["tokens"]
-
-    def render(self, messages: list[dict], template_kwargs: dict | None = _THINKING_OFF,
-               **options) -> list[int]:
-        """Token ids of `messages` through the server's own chat template,
-        by default thinking off (the answer header then closes an empty think
-        block); `template_kwargs=None` renders them as for a request that
-        sends no template arguments."""
-        body = {"model": self.model, "messages": messages}
-        if template_kwargs is not None:
-            body["chat_template_kwargs"] = template_kwargs
-        return self._send("POST", self.root + "/tokenize", {**body, **options})["tokens"]
+                    out = self.client.chat.completions.create(**body)
+                except openai.APIStatusError:
+                    raise _ItemError(f"HTTP {e.status_code}") from None
+                self.effort = False
+                logger.info("JEV: the server refuses reasoning_effort; asking without it")
+                return out
+            raise _ItemError(f"HTTP {e.status_code}") from None
 
 
-def _split(server: Server, turns: list[dict]) -> tuple[list[int], list[int]]:
-    """`turns` plus one more user turn through the server's template, cut
-    where that turn's content goes: the fixed tokens before it, and the
-    tokens after it (the end of the turn and the answer header). Two
-    renderings that differ only in a one-character final message share
-    everything before it, and what follows it is the header."""
-    a = server.render(turns + [{"role": "user", "content": "\x01"}], add_generation_prompt=True)
-    b = server.render(turns + [{"role": "user", "content": "\x02"}], add_generation_prompt=True)
-    n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
-    return a[:n], a[n + len(server.encode("\x01")):]
-
-
-def usage_of(out: dict) -> dict:
+def usage_of(out) -> dict:
     """One response's token usage, as the usage ledger counts it."""
-    u = out.get("usage") or {}
-    return {"input": u.get("prompt_tokens") or 0,
-            "cached": (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
-            "output": u.get("completion_tokens") or 0}
+    u = getattr(out, "usage", None)
+    details = getattr(u, "prompt_tokens_details", None)
+    return {"input": getattr(u, "prompt_tokens", 0) or 0,
+            "cached": getattr(details, "cached_tokens", 0) or 0,
+            "output": getattr(u, "completion_tokens", 0) or 0}
 
 
-def option_ids(server: Server, words: list[str]) -> dict[str, list[int]]:
-    """Option word -> its single-token spellings (leading space; as given and capitalised)."""
-    out = {}
-    for w in words:
-        ids = sorted({i[0] for s in (f" {w}", f" {w[:1].upper()}{w[1:]}")
-                      if len(i := server.encode(s)) == 1})
-        if not ids:
-            raise Unavailable(f"option {w!r} is not one token for this model")
-        out[w] = ids
-    return out
+def _option(token: str, options: list[str]) -> str | None:
+    """The option a written token answers: the option it spells (case and
+    spaces aside), or the one option it begins."""
+    t = token.strip().lower()
+    if not t:
+        return None
+    for o in options:
+        if o.lower() == t:
+            return o
+    starts = [o for o in options if len(t) >= 2 and o.lower().startswith(t)]
+    return starts[0] if len(starts) == 1 else None
 
 
-def ask_ids(server: Server, prompt: list[int],
-            options: dict[str, list[int]]) -> tuple[dict[str, float], float, dict]:
-    """Each option's probability as the next token after `prompt` (token
-    ids), the mass the options hold together, and the usage: ONE output
-    token, read from the logprobs of the options' ids."""
-    ids = sorted({i for v in options.values() for i in v})
-    out = server.complete({"prompt": prompt, "max_tokens": 1, "temperature": 0,
-                           "logprobs": 0, "logprob_token_ids": ids,
-                           "return_tokens_as_token_ids": True})
-    try:
-        top = out["choices"][0]["logprobs"]["top_logprobs"][0]
-        raw = {o: sum(math.exp(top[f"token_id:{i}"]) for i in v) for o, v in options.items()}
-    except (KeyError, IndexError, TypeError):
-        raise Unavailable("the server did not return the requested logprobs") from None
-    mass = sum(raw.values())
-    if not math.isfinite(mass):  # a broken forward pass (NaN logits) answers nothing
-        mass = 0.0
-    return {o: (p / mass if mass > 0 else 0.0) for o, p in raw.items()}, mass, usage_of(out)
+def answer(out, options: list[str], lead: str) -> tuple[dict[str, float], float]:
+    """Each option's probability at the answer in a reply, and the mass the
+    options hold together there. The answer is the first option token
+    written either first or right after the line `lead` ends with (a model
+    may restate the question's line first). Its alternatives give the
+    probabilities; a server that returns none gives the chosen token's own,
+    the rest shared by the other options. No answer: all 0, mass 0."""
+    choices = getattr(out, "choices", None) or []
+    logprobs = getattr(choices[0], "logprobs", None) if choices else None
+    tokens = getattr(logprobs, "content", None) or []
+    line = lead.strip().splitlines()[-1].strip() if lead.strip() else ""
+    said = ""
+    for tok in tokens:
+        if not said.strip() or (line and said.rstrip().endswith(line)):
+            chosen = _option(tok.token, options)
+            if chosen is not None:
+                raw = dict.fromkeys(options, 0.0)
+                if tok.top_logprobs:
+                    for alt in tok.top_logprobs:
+                        o = _option(alt.token, options)
+                        if o is not None and alt.logprob is not None:
+                            raw[o] += math.exp(alt.logprob)
+                elif tok.logprob is not None:
+                    p = math.exp(tok.logprob)
+                    raw[chosen] = p
+                    for o in options:
+                        if o != chosen:
+                            raw[o] = (1.0 - p) / (len(options) - 1)
+                mass = raw[chosen] if not tok.top_logprobs else sum(raw.values())
+                total = sum(raw.values())
+                if not math.isfinite(total) or not math.isfinite(mass) or total <= 0:
+                    return dict.fromkeys(options, 0.0), 0.0  # a broken forward pass answers nothing
+                return {o: p / total for o, p in raw.items()}, mass
+        said += tok.token
+    return dict.fromkeys(options, 0.0), 0.0
+
+
+def ask(server: Server, messages: list[dict], question: str, options: list[str],
+        tools: list[dict] | None = None) -> tuple[dict[str, float], float, dict]:
+    """`question` asked right after the last of `messages`: each option's
+    probability at the answer, the mass the options hold there, and the
+    usage. After a tool's output the question ends that output, nothing else
+    added: a template that replays reasoning keys it to the last user
+    message, so a new user turn would re-render the agent's earlier turns and
+    lose the server's prefix cache. After a user's message (a job with no
+    turns of the model's yet) it is its own user turn, which every model
+    answers directly. Either way the question line comes after one line
+    naming the options, which keeps a model that answers with tool calls
+    from reaching for one. The reply stops at the end of its first line."""
+    question = f"Answer with one word: {', '.join(options[:-1])} or {options[-1]}.\n{question}"
+    last = messages[-1]
+    if last.get("role") == "tool":
+        text = last.get("content") or ""
+        asked = messages[:-1] + [{**last, "content": f"{text}{'' if text.endswith(chr(10)) else chr(10)}{question}"}]
+    else:
+        asked = messages + [{"role": "user", "content": question}]
+    out = server.chat(asked, tools=tools, stop=["\n"])
+    probs, mass = answer(out, options, question)
+    return probs, mass, usage_of(out)
 
 
 class _Judge:
-    """What the probe proved, reused by every judgement: the padded prefix G,
-    the answer header + lead, and the yes/no token ids."""
+    """The guide and its worked examples as chat turns, reused by every
+    judgement (the server caches them after the first)."""
 
-    def __init__(self, server: Server, g: list[int], tail: list[int],
-                 options: dict[str, list[int]]) -> None:
-        self.server, self.g, self.tail, self.options = server, g, tail, options
-        self.ids = sorted(i for ids in options.values() for i in ids)
+    def __init__(self, server: Server) -> None:
+        self.server = server
+        self.turns = [{"role": "system", "content": _GUIDE}]
+        for ex in _EXAMPLES:
+            self.turns += [{"role": "user", "content": f"{_user(ex['need'], ex['item'])}\n{LEAD}"},
+                           {"role": "assistant", "content": ex["useful"]}]
 
     def ask(self, need: str, text: str) -> tuple[float | None, float, dict]:
         """P(yes) for one item, the yes+no probability mass, and the usage."""
-        prompt = self.g + self.server.encode(_user(need, text)) + self.tail
-        out = self.server.complete({
-            "prompt": prompt, "max_tokens": 1, "temperature": 0, "logprobs": 0,
-            "logprob_token_ids": self.ids, "return_tokens_as_token_ids": True})
-        try:
-            top = out["choices"][0]["logprobs"]["top_logprobs"][0]
-            mass = {answer: sum(math.exp(top[f"token_id:{i}"]) for i in ids)
-                    for answer, ids in self.options.items()}
-        except (KeyError, IndexError, TypeError):
-            raise Unavailable("the server did not return the requested logprobs") from None
-        total = mass["yes"] + mass["no"]
-        if not math.isfinite(total):  # a broken forward pass (NaN logits) answers nothing
-            total = 0.0
-        return (mass["yes"] / total if total > 0 else None), total, usage_of(out)
+        out = self.server.chat(self.turns + [{"role": "user", "content": f"{_user(need, text)}\n{LEAD}"}],
+                               stop=["\n"])
+        probs, mass = answer(out, YES_NO, LEAD)
+        return (probs["yes"] if mass > 0 else None), mass, usage_of(out)
 
 
 def _probe() -> _Judge:
-    server = Server()
-    if server.model not in {m.get("id") for m in server.get("/models").get("data", [])}:
-        raise Unavailable("the agent model is not served by this endpoint")
-    options = {}
-    for answer, spellings in _SPELLINGS.items():
-        ids = [server.encode(s) for s in spellings]
-        if any(len(i) != 1 for i in ids):
-            raise Unavailable("yes/no are not single tokens for this model")
-        options[answer] = sorted({i[0] for i in ids})
-    turns = [{"role": "system", "content": _GUIDE}]
-    for ex in _EXAMPLES:
-        turns += [{"role": "user", "content": _user(ex["need"], ex["item"])},
-                  {"role": "assistant", "content": f"{LEAD} {ex['useful']}"}]
-    # G and the answer header are cut from the template's own rendering.
-    fixed, header = _split(server, turns)
-    tail = header + server.encode(LEAD)
-    sample = _user(_PROBE_NEED, _PROBE_YES)
-    reference = server.render(
-        turns + [{"role": "user", "content": sample}, {"role": "assistant", "content": LEAD}],
-        add_generation_prompt=False, continue_final_message=True)
-    if fixed + server.encode(sample) + tail != reference:
-        raise Unavailable("the assembled prompt differs from the chat template")
-    n, pad = len(fixed), -len(fixed) % BLOCK
-    judge_ = _Judge(server, fixed + server.encode("\n") * pad, tail, options)
+    judge_ = _Judge(Server())
     # The logprobs must come back and the model must get a clear-cut pair
-    # right; these two requests also put G in the cache.
+    # right; these two requests also put the guide in the cache.
     p_yes, mass_yes, u_yes = judge_.ask(_PROBE_NEED, _PROBE_YES)
     p_no, mass_no, u_no = judge_.ask(_PROBE_NEED, _PROBE_NO)
-    if p_yes is None or p_no is None or min(mass_yes, mass_no) < 0.5 or p_yes - p_no < 0.5:
+    if p_yes is None or p_no is None or min(mass_yes, mass_no) < MIN_MASS or p_yes - p_no < 0.5:
         raise Unavailable("the model does not answer the probe pair reliably")
-    # The prompt files are sized so G lands just under whole blocks (the
-    # measured prompt pads 143 tokens). A pad of a quarter block or more
-    # means they were edited and should be re-sized: the pad is blank lines
-    # the model reads before every need.
-    logger.log(logging.WARNING if pad >= BLOCK // 4 else logging.INFO,
-               "JEV on: fixed prefix of %d tokens + %d padding; the probe used %d uncached tokens",
-               n, pad, sum(u["input"] - u["cached"] for u in (u_yes, u_no)))
+    logger.info("JEV on: the probe used %d uncached tokens",
+                sum(u["input"] - u["cached"] for u in (u_yes, u_no)))
     return judge_
 
 
@@ -348,13 +346,13 @@ def _run_probe(done: threading.Event) -> None:
 
 
 def available(wait: float = 0.0) -> bool:
-    """True when JEV is enabled on a self-hosted endpoint and the server has
-    proved every capability it needs. The probe runs once, on first use, in
-    its own thread; a caller waits for it at most `wait` seconds, so a slow
-    server costs a bounded delay, never a stuck request. A failed probe logs
-    one warning and keeps JEV off for REPROBE_S."""
+    """True when the recall filter is enabled and the server has proved
+    every capability it needs. The probe runs once, on first use, in its own
+    thread; a caller waits for it at most `wait` seconds, so a slow server
+    costs a bounded delay, never a stuck request. A failed probe logs one
+    warning and keeps JEV off for REPROBE_S."""
     global _probing
-    if not settings.jev_enabled or not settings.self_hosted:
+    if not settings.jev_enabled:
         return False
     if _judge is not None:
         return True
@@ -383,8 +381,8 @@ def _judge_all(judge_: _Judge, need: str, texts: list[str], usage: dict,
         for k in ("input", "cached", "output"):
             usage[k] += u[k]
 
-    # The first request goes alone: on a cold cache it computes G once, and
-    # the rest then reuse it instead of all computing it at the same time.
+    # The first request goes alone: on a cold cache it computes the guide
+    # once, and the rest then reuse it instead of all computing it at once.
     first = _pool.submit(judge_.ask, need, texts[0])
     if not wait([first], timeout=max(0.0, deadline - time.monotonic())).done:
         first.cancel()
@@ -435,60 +433,62 @@ def judge(need: str, texts: list[str]) -> list[float | None] | None:
 
 
 # ====================================================================== #
-# Choices — one-token picks from a cached prompt family                   #
+# Choices — picks from a cached prompt family                             #
 # ====================================================================== #
 #
 # The judge's mechanics for any closed question with named options. A prompt
-# family's fixed text (a guide + worked examples as chat turns) is rendered
-# once into a prefix G padded to whole cache blocks, so the server computes it
-# once for every request; a request adds only its own text (encoded once and
-# reused by every pick on it), the answer header (thinking off: the template
-# writes an empty think block) and a short lead, and the answer is the NEXT
-# token, read as probabilities over the options. One output token per
-# decision; the model's words are never parsed. `write` is the one exception,
-# for the rare piece of genuinely new content a decision needs (e.g. a new
-# page's name): a short line under the same prefix.
+# family's fixed text (a guide + worked examples as chat turns) starts every
+# request, so the server computes it once. The model answers a request's own
+# text the way the examples answer theirs — e.g. "action: attach\nwiki: A" —
+# once, and each decision is read where its lead ends in that answer ("action:"
+# then "wiki:"), as probabilities over its options. The model's words are
+# never parsed but for `name`, the rare piece of genuinely new content a
+# decision needs (a new page's name).
 
 
 class Choice:
-    """A cached prompt family for one-token picks (see above), on the agent
-    profile's own server."""
+    """A cached prompt family for picks (see above), on the agent profile's
+    own server."""
 
-    def __init__(self, system: str, examples: list[tuple[str, str]]) -> None:
-        self.server = server = Server()
-        turns = [{"role": "system", "content": system}]
-        for user, answer in examples:
-            turns += [{"role": "user", "content": user}, {"role": "assistant", "content": answer}]
-        fixed, self.tail = _split(server, turns)   # tail: end of the user turn + answer header
-        self.pad = -len(fixed) % BLOCK              # blank lines up to whole cache blocks
-        self.g = fixed + server.encode("\n") * self.pad
-        self._leads: dict[str, list[int]] = {}      # a family's leads are a few fixed strings
+    def __init__(self, system: str, examples: list[tuple[str, str]], answer_tokens: int = 128) -> None:
+        self.server = Server()
+        self.turns = [{"role": "system", "content": system}]
+        for user, reply in examples:
+            self.turns += [{"role": "user", "content": user}, {"role": "assistant", "content": reply}]
+        self.answer_tokens = answer_tokens
 
-    def encode(self, text: str) -> list[int]:
-        """A request's own text as tokens, for every pick on it."""
-        return self.server.encode(clean(text))
+    def encode(self, text: str) -> str:
+        """A request's own text as the requests carry it."""
+        return clean(text)
 
-    def options(self, words: list[str]) -> dict[str, list[int]]:
-        """Option word -> its single-token spellings (leading space; as given and capitalised)."""
-        return option_ids(self.server, words)
+    def options(self, words: list[str]) -> dict[str, str]:
+        """The options a decision reads, by word."""
+        return {w: w for w in words}
 
-    def _prompt(self, body: list[int], lead: str) -> list[int]:
-        if lead not in self._leads:
-            self._leads[lead] = self.server.encode(lead)
-        return self.g + body + self.tail + self._leads[lead]
+    def reply(self, body: str):
+        """The model's answer to the request text `body`, thinking off: read
+        with `ask` and `name` for every decision on it."""
+        return self.server.chat(self.turns + [{"role": "user", "content": body}],
+                                max_tokens=self.answer_tokens)
 
-    def ask(self, body: list[int], lead: str,
-            options: dict[str, list[int]]) -> tuple[dict[str, float], float, dict]:
-        """Each option's probability as the next token after the lead, for the
-        request text `body` (from `encode`), the mass the options hold
-        together, and the usage."""
-        return ask_ids(self.server, self._prompt(body, lead), options)
+    @staticmethod
+    def ask(reply, lead: str, options: dict[str, str]) -> tuple[dict[str, float], float]:
+        """Each option's probability where `lead` ends in `reply`, and the
+        mass the options hold together there."""
+        return answer(reply, list(options), lead)
 
-    def write(self, body: list[int], lead: str, max_tokens: int = 16) -> tuple[str, dict]:
-        """A short line of new content after the lead, thinking off; "" when
-        the line did not end within `max_tokens` (a cut-off line is no answer)."""
-        out = self.server.complete({"prompt": self._prompt(body, lead), "max_tokens": max_tokens,
-                                    "temperature": 0, "stop": ["\n"]})
-        choice = out["choices"][0]
-        line = (choice.get("text") or "").strip() if choice.get("finish_reason") == "stop" else ""
-        return line, usage_of(out)
+    @staticmethod
+    def name(reply, lead: str) -> str:
+        """The line `reply` writes after `lead` (a new page's name), or ""
+        when it writes none or the reply was cut off inside it."""
+        if not reply.choices:
+            return ""
+        text = reply.choices[0].message.content or ""
+        line = lead.strip().splitlines()[-1].strip()
+        at = text.find(line)
+        if at < 0:
+            return ""
+        rest = text[at + len(line):]
+        if "\n" not in rest and reply.choices[0].finish_reason == "length":
+            return ""  # a cut-off line is no answer
+        return rest.split("\n", 1)[0].strip()

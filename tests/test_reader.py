@@ -1,24 +1,19 @@
 """Unit tests for the JEV reader (braindb/services/reader.py) and its wiring
 into get_entity, the hooks and run_typed.
 
-DB-free and GPU-free. A fake vLLM endpoint renders turns with a template
-shaped like the served model's (tool output trimmed and wrapped, a reasoning
-line in the system block unless thinking is off, every assistant turn opened
-with a think block), tokenizes one token per character with the special
-markers and "\\n\\n" as single tokens, keeps a hybrid model's cache (only
-the last whole block a request ended in), and answers each piece by cues in
-its text. These pin the contract the reader relies on:
+DB-free and GPU-free. A fake OpenAI-compatible chat endpoint (conftest.py
+`fake_chat`) answers each piece by cues in its text. These pin the contract
+the reader relies on:
 
 - get_entity's tool schema is unchanged by its run context; with the reader
   off, without a reading question, or for a later page, get_entity answers
   exactly as before;
 - run_typed records a run's conversation only when the reader serves the
   request, and the hooks record it as sent, before any nudge;
-- the reader reads INSIDE the agent's turn: its requests are the agent's
-  next turn (the SDK's own messages, tools and template arguments) up to the
-  tool output, then a one-token question; every keep point lies a few
-  tokens past a block edge, so each next request and the agent's next turn
-  reuse what was kept;
+- the reader reads INSIDE the agent's turn: each request is the agent's next
+  request (the SDK's own messages and tools) with the question line ending
+  the tool output, nothing else added; each continues what was kept, which
+  the agent's next request then continues too;
 - only useful pieces come back, with a note whose spans locate everything
   left out; a low-mass piece stays;
 - only the first call of a turn is read, and anything that goes wrong gives
@@ -30,10 +25,10 @@ import asyncio
 import contextlib
 import json
 import logging
-import math
 import re
 from types import SimpleNamespace
 
+import httpx
 import openai.resources.chat.completions as chat_completions
 import pytest
 from agents.models.interface import ModelTracing
@@ -56,7 +51,6 @@ from braindb.agent.run_state import (
 from braindb.agent.schemas import AgentAnswer
 from braindb.services import jev, reader
 
-BLOCK = 64
 QUESTION = "When did the Kestrel mill open?"
 EID = "00000000-0000-0000-0000-00000000000a"
 BODY = (
@@ -72,167 +66,57 @@ ROW = {"id": EID, "entity_type": "wiki", "title": "Kestrel mill", "content": BOD
 
 # ---------------------------------------------------------------- the fake
 
-_SPECIAL = ["<|im_start|>", "<|im_end|>", "<tool_response>", "</tool_response>", "<think>", "</think>"]
-_WORDS = [" yes", " Yes", " no", " No"]
-_IDS = {w: i for i, w in enumerate(_SPECIAL + _WORDS + ["\n\n"], start=1)}
-_TAIL = "</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+_QUESTION_LINE = re.compile(r"\[(\d+\.\d+)\] \| (useful|enough to answer) \(yes or no\):$")
 
 
-def _tok(text: str) -> list[int]:
-    if text in _WORDS:
-        return [_IDS[text]]
-    ids, i = [], 0
-    while i < len(text):
-        mark = next((s for s in _SPECIAL + ["\n\n"] if text.startswith(s, i)), None)
-        if mark:
-            ids.append(_IDS[mark])
-            i += len(mark)
-        else:
-            ids.append(1000 + ord(text[i]))
-            i += 1
-    return ids
-
-
-def _text(ids: list[int]) -> str:
-    back = {v: k for k, v in _IDS.items()}
-    return "".join(back.get(i, chr(i - 1000) if i >= 1000 else "?") for i in ids)
-
-
-def _render(messages, tools=None, kwargs=None, add_generation_prompt=False,
-            continue_final_message=False) -> list[int]:
-    kwargs = kwargs or {}
-    thinking = kwargs.get("enable_thinking", True) is not False
-    out = "<|im_start|>system\n"
-    if thinking:
-        out += f"Reasoning effort is set to {kwargs.get('reasoning_effort', 'xhigh')}.\n\n"
-    if tools:
-        out += "# Tools " + json.dumps(tools, sort_keys=True) + "\n\n"
-    rest = messages
-    if messages and messages[0]["role"] == "system":
-        out += (messages[0]["content"] or "").strip()
-        rest = messages[1:]
-    out += "<|im_end|>\n"
-    for i, m in enumerate(rest):
-        content = (m.get("content") or "")
-        content = content.strip() if isinstance(content, str) else json.dumps(content)
-        last = i == len(rest) - 1
-        if m["role"] == "user":
-            out += f"<|im_start|>user\n{content}<|im_end|>\n"
-        elif m["role"] == "assistant":
-            out += f"<|im_start|>assistant\n<think>\n{(m.get('reasoning_content') or '').strip()}\n</think>\n\n{content}"
-            for call in m.get("tool_calls") or []:
-                out += f"<tool_call>{call['function']['name']} {call['function']['arguments']}</tool_call>"
-            if not (last and continue_final_message):
-                out += "<|im_end|>\n"
-        elif m["role"] == "tool":
-            if i == 0 or rest[i - 1]["role"] != "tool":
-                out += "<|im_start|>user"
-            out += f"\n<tool_response>\n{content}\n</tool_response>"
-            if last or rest[i + 1]["role"] != "tool":
-                out += "<|im_end|>\n"
-    if add_generation_prompt:
-        out += "<|im_start|>assistant\n" + ("<think>\n" if thinking else "<think>\n\n</think>\n\n")
-    return _tok(out)
-
-
-class _Cache:
-    """A hybrid model's prefix cache: a request leaves one checkpoint, at the
-    last whole block it ended in, and reuses the longest one that prefixes it."""
+class _Model:
+    """Answers each piece by cues in it (the text after the asked anchor's
+    frame): USEFUL (or the probe's opening) is yes, anything else no;
+    ENOUGH answers "enough to answer"; LOWMASS holds little probability;
+    NANCUE answers NaN. `probe_ok` False inverts the probe's answers."""
 
     def __init__(self):
-        self.points: list[tuple[int, ...]] = []
+        self.decisions, self.probe_ok = [], True
 
-    def use(self, prompt: list[int], store: bool = True) -> int:
-        cached = max((len(p) for p in self.points if tuple(prompt[:len(p)]) == p), default=0)
-        if store and len(prompt) >= BLOCK:
-            self.points.append(tuple(prompt[:len(prompt) // BLOCK * BLOCK]))
-        return cached
-
-
-class _Response:
-    def __init__(self, status: int, body: dict | None = None):
-        self.status_code, self._body = status, body
-
-    def json(self):
-        return self._body
-
-    def raise_for_status(self):
-        pass
-
-
-class _FakeVLLM:
-    """Answers each piece by cues in it: USEFUL (or the probe's opening) is
-    yes, anything else no, LOWMASS holds little probability. `probe_ok`
-    False inverts the probe's answers; `mismatch` makes the server render a
-    read's question differently from what the reader assembles."""
-
-    def __init__(self, model: str):
-        self.model, self.window, self.probe_ok, self.mismatch = model, 200_000, True, False
-        self.renders, self.decisions, self.warms, self.cache = [], [], [], _Cache()
-
-    def request(self, method, url, **kwargs):
-        body = kwargs.get("json") or {}
-        if url.endswith("/v1/models"):
-            return _Response(200, {"data": [{"id": self.model, "max_model_len": self.window}]})
-        if url.endswith("/tokenize"):
-            if "messages" in body:
-                self.renders.append(body)
-                ids = _render(body["messages"], body.get("tools"), body.get("chat_template_kwargs"),
-                              body.get("add_generation_prompt", False),
-                              body.get("continue_final_message", False))
-                last = body["messages"][-1]["content"]
-                if self.mismatch and last.startswith("[") and "probe" not in json.dumps(body["messages"]):
-                    ids = ids + [999]
-                return _Response(200, {"tokens": ids})
-            return _Response(200, {"tokens": _tok(body["prompt"])})
-        assert url.endswith("/v1/completions"), url
-        prompt = body["prompt"]
-        usage = {"prompt_tokens": len(prompt), "completion_tokens": 1,
-                 "prompt_tokens_details": {"cached_tokens": self.cache.use(prompt)}}
-        if "logprob_token_ids" not in body:
-            self.warms.append(prompt)
-            return _Response(200, {"choices": [{"text": "x"}], "usage": usage})
-        text = _text(prompt)
-        lead = text.rsplit("</think>\n\n", 1)[-1]
-        anchor = re.match(r"\[(\d+\.\d+)\]", lead).group(1)
-        content = text.rsplit("<tool_response>\n", 1)[-1].split("\n</tool_response>", 1)[0]
+    def __call__(self, body: dict):
+        content = body["messages"][-1]["content"]
+        anchor, kind = _QUESTION_LINE.search(content).groups()
         piece = content.rsplit(f"[{anchor}] (", 1)[-1]
-        kind = "enough" if lead.endswith(reader.ENOUGH_LEAD) else "useful"
-        if kind == "enough":  # does what was kept answer the question
+        kind = "useful" if kind == "useful" else "enough"
+        if kind == "enough":
             want = "yes" if "ENOUGH" in piece else "no"
         else:
             want = "yes" if ("USEFUL" in piece or "opened the Rowan bakery" in piece) else "no"
         if not self.probe_ok and "Rowan" in piece:
             want = "no" if want == "yes" else "yes"
         mass = 0.05 if "LOWMASS" in piece else 0.98
-        top = {f"token_id:{i}": math.log(mass * (0.97 if _WORDS[i - 7].strip().lower() == want else 0.01))
-               for i in body["logprob_token_ids"]}
+        other = "no" if want == "yes" else "yes"
+        alts = {want: mass * 0.97, other: mass * 0.01, "<tool_call>": 1 - mass * 0.98}
         if "NANCUE" in piece:  # a broken forward pass: every logprob is NaN
-            top = {k: float("nan") for k in top}
-        self.decisions.append({"prompt": prompt, "anchor": anchor, "want": want, "kind": kind,
-                               "cached": usage["prompt_tokens_details"]["cached_tokens"],
+            alts = {k: float("nan") for k in alts}
+        self.decisions.append({"anchor": anchor, "kind": kind, "want": want, "body": body,
                                "probe": "datasource probe" in content})
-        return _Response(200, {"choices": [{"logprobs": {"top_logprobs": [top]}}], "usage": usage})
+        return [(want, alts)]
 
 
 def _fresh_state() -> dict:
-    return {"server": None, "options": None, "window": 0, "consts": None, "leads": {}, "off_until": 0.0}
+    return {"server": None, "off_until": 0.0}
 
 
 @pytest.fixture
-def server(monkeypatch):
+def server(monkeypatch, fake_chat):
     monkeypatch.setattr(jev.settings, "jev_reader", True)
     monkeypatch.setattr(jev.settings, "jev_hops", False)  # on by default; hops have their own tests
     monkeypatch.setattr(reader, "serves", lambda: True)     # the prompt's probe has its own tests
     monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(jev.settings, "agent_model", "")
     monkeypatch.setenv("VLLM_API_KEY", "test-secret-key")
-    fake = _FakeVLLM(jev.settings.resolved_agent_model)
-    monkeypatch.setattr(jev, "_session", fake)
-    monkeypatch.setattr(jev, "BLOCK", BLOCK)
+    model = _Model()
+    fake = fake_chat(model)
+    fake.model_cues, fake.decisions = model, model.decisions
     monkeypatch.setattr(reader, "_state", _fresh_state())
-    for name, value in (("MARGIN", 1), ("WINDOW", 24), ("MIN_PIECE", 30), ("ROOM", 200)):
-        monkeypatch.setattr(reader, name, value)
+    monkeypatch.setattr(reader, "PIECE_CHARS", 120)
+    monkeypatch.setattr(reader, "MIN_PIECE_CHARS", 30)
     monkeypatch.setattr(tools_mod, "MAX_OUTPUT_CHARS", 400)
     monkeypatch.setattr(tools_mod, "get_conn", _db(ROW))
     return fake
@@ -362,17 +246,18 @@ def test_get_entity_schema_is_unchanged_by_its_run_context():
         "title": "get_entity_args", "type": "object"}
 
 
-@pytest.mark.parametrize("enabled,profile,question,recorded", [
-    (True, "vllm_workstation_qwen", QUESTION, True),
-    (True, "deepinfra", QUESTION, False),           # the reader needs a self-hosted server
-    (False, "vllm_workstation_qwen", QUESTION, False),
-    (True, "vllm_workstation_qwen", "", False)])    # no reading question: nothing to read for
+@pytest.mark.parametrize("enabled,off,question,recorded", [
+    (True, False, QUESTION, True),
+    (True, True, QUESTION, False),           # off until the server is probed again
+    (False, False, QUESTION, False),
+    (True, False, "", False)])               # no reading question: nothing to read for
 def test_run_typed_records_the_loop_only_when_the_reader_serves_the_request(
-        monkeypatch, enabled, profile, question, recorded):
+        monkeypatch, enabled, off, question, recorded):
+    import time
+
     monkeypatch.setattr(jev.settings, "jev_reader", enabled)
     monkeypatch.setattr(jev.settings, "jev_hops", False)  # on by default; hops have their own tests
-    monkeypatch.setattr(jev.settings, "llm_profile", profile)
-    monkeypatch.setattr(reader, "_state", _fresh_state())
+    monkeypatch.setattr(reader, "_state", {"server": None, "off_until": time.monotonic() + 600 if off else 0.0})
     seen = []
 
     async def fake_run(starting_agent, input, max_turns, **kwargs):
@@ -396,7 +281,6 @@ def test_run_typed_records_the_loop_only_when_the_reader_serves_the_request(
 
 def test_a_nested_run_records_its_own_loop_and_leaves_its_callers_alone(monkeypatch):
     monkeypatch.setattr(jev.settings, "jev_reader", True)
-    monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(reader, "_state", _fresh_state())
     seen = []
 
@@ -475,16 +359,23 @@ def test_parts_follow_wiki_sections_or_markdown_headings():
     assert reader._parts("datasource", "no headings at all") == [("text", 0)]
 
 
+def test_pieces_end_at_the_strongest_boundary_near_their_size(monkeypatch):
+    monkeypatch.setattr(reader, "PIECE_CHARS", 100)
+    body = "a" * 80 + "\n\n" + "b" * 30 + ". " + "c" * 200
+    cuts = reader._cuts(body, [("text", 0)])
+    assert reader._cut(body, cuts, 0) == 82                  # the paragraph, past three quarters of a piece
+    assert reader._cut("x" * 500, reader._cuts("x" * 500, [("text", 0)]), 0) == 100   # no boundary: the size
+    assert reader._cut(body[:110], reader._cuts(body[:110], [("text", 0)]), 0) == 110  # the rest fits: all of it
+
+
 # ====================================================================== #
 # get_entity: unchanged unless the reader reads                           #
 # ====================================================================== #
 
-@pytest.mark.parametrize("how", ["off", "no question", "hosted"])
+@pytest.mark.parametrize("how", ["off", "no question"])
 def test_get_entity_answers_as_before_unless_the_reader_reads(server, monkeypatch, how):
     if how == "off":
         monkeypatch.setattr(jev.settings, "jev_reader", False)
-    if how == "hosted":
-        monkeypatch.setattr(jev.settings, "llm_profile", "deepinfra")
     question = "" if how == "no question" else QUESTION
 
     async def body(ledger):
@@ -493,7 +384,7 @@ def test_get_entity_answers_as_before_unless_the_reader_reads(server, monkeypatc
 
     full, page, used = _in_a_run(body, question)
     assert full == _today() and page == _today(0, 100)
-    assert used.get("calls", 0) == 0 and server.decisions == []
+    assert used.get("calls", 0) == 0 and server.bodies == []
 
 
 def test_a_later_page_is_never_read(server):
@@ -501,7 +392,7 @@ def test_a_later_page_is_never_read(server):
         await _turn(agent_mod.get_agent(), [_call("call_1")])
         return await _get("call_1", offset=100, limit=100)
 
-    assert _in_a_run(body) == _today(100, 100) and server.decisions == []
+    assert _in_a_run(body) == _today(100, 100) and server.bodies == []
 
 
 # ====================================================================== #
@@ -531,64 +422,45 @@ def test_a_long_read_keeps_only_useful_pieces_inside_the_agents_own_turn(server,
     assert all(b1 <= a2 for (_, b1), (a2, _) in zip(dropped, dropped[1:]))  # in order, apart
     assert kept_chars + sum(b - a for a, b in dropped) == len(BODY)   # every char accounted for
 
-    # The reader's turn IS the agent's next turn, as the SDK sends it.
-    frame = next(r for r in server.renders if r["messages"][-1]["content"] == "Q"
-                 and r["messages"][-2]["content"] == "x" and QUESTION in json.dumps(r["messages"]))
-    assert frame["messages"][:-2] == sent["messages"][:-1]
-    assert frame["messages"][-2] == {**sent["messages"][-1], "content": "x"}
-    assert frame["tools"] == sent["tools"] and frame["continue_final_message"] is True
-    assert "chat_template_kwargs" not in frame                    # the agent sends none either
-
-    # One token per piece; each keep point a few tokens past a block edge;
-    # each request reuses what was kept, and so does the agent's next turn.
-    # A kept piece is followed by "enough to answer", asked at the same point.
+    # Each request IS the agent's next request, as the SDK sends it, with the
+    # question line ending the tool output and nothing else added: standard
+    # parameters, thinking off, the reply text only.
     asked = [d for d in server.decisions if not d["probe"]]
     reads = [d for d in asked if d["kind"] == "useful"]
-    assert len(server.warms) == 1 and len(reads) >= 4
+    assert len(reads) >= 4
     assert [d["anchor"] for d in asked if d["kind"] == "enough"] == [d["anchor"] for d in reads[:-1] if d["want"] == "yes"]
-    last = len(server.warms[0]) // BLOCK * BLOCK               # the warm request's checkpoint
-    for i, d in enumerate(reads):
-        lead = _text(d["prompt"]).rsplit("</think>\n\n", 1)[-1]
-        assert lead == f"[{d['anchor']}] | useful (yes or no):"
-        assert _text(d["prompt"]).endswith(_TAIL + lead)
-        keep_point = len(d["prompt"]) - len(_tok(_TAIL)) - len(_tok(lead)) - 1
-        enough = f"[{d['anchor']}] | enough to answer (yes or no):"
-        bound = min(reader.WINDOW, BLOCK - 2 - len(_tok(_TAIL)) - max(len(_tok(lead)), len(_tok(enough))))
-        if i < len(reads) - 1:
-            assert reader.MARGIN <= keep_point % BLOCK <= bound
-        assert d["cached"] == last                              # kept or not, it continues from M
-        if d["want"] == "yes":
-            last = keep_point // BLOCK * BLOCK
-            e = next((x for x in asked if x["kind"] == "enough" and x["anchor"] == d["anchor"]), None)
-            if e is not None:   # the same point: it reuses the piece's checkpoint and leaves the same one
-                assert e["prompt"][:keep_point + 1] == d["prompt"][:keep_point + 1]
-                assert e["cached"] == last and len(e["prompt"]) // BLOCK * BLOCK == last
-    agent_next = _render(sent["messages"], sent["tools"], None, add_generation_prompt=True)
-    assert server.cache.use(agent_next, store=False) == last > 0
-    assert (used["calls"], used["requests"], used["failopen"]) == (1, 1 + len(asked), 0)
+    tool = {k: v for k, v in sent["messages"][-1].items() if k != "content"}
+    for d in asked:
+        b = d["body"]
+        assert b["messages"][:-1] == sent["messages"][:-1]
+        assert {k: v for k, v in b["messages"][-1].items() if k != "content"} == tool
+        lead = f"[{d['anchor']}] " + (reader.LEAD if d["kind"] == "useful" else reader.ENOUGH_LEAD)
+        assert b["messages"][-1]["content"].endswith("\nAnswer with one word: yes or no.\n" + lead)
+        assert b["tools"] == sent["tools"] and b["tool_choice"] == "none" and b["reasoning_effort"] == "none"
+        assert b["max_tokens"] == jev.ANSWER_TOKENS and b["stop"] == ["\n"] and b["temperature"] == 0
+
+    # Each request continues what was kept, and so does the agent's next one:
+    # its output begins with everything every decision was asked after.
+    for d in reads:
+        so_far = d["body"]["messages"][-1]["content"].rsplit(f"[{d['anchor']}] (", 1)[0]
+        assert out.startswith(so_far)
+    assert (used["calls"], used["requests"], used["failopen"]) == (1, len(asked), 0)
 
 
-def _small_turn(template_kwargs: dict | None = None) -> reader.Turn:
+def _small_turn() -> reader.Turn:
     """A short conversation whose next turn reads ROW."""
     return reader.Turn(
         messages=[{"role": "user", "content": QUESTION},
                   {"role": "assistant", "content": None, "tool_calls": [
                       {"id": "c1", "type": "function", "function": {"name": "get_entity", "arguments": "{}"}}]},
                   {"role": "tool", "tool_call_id": "c1", "content": ""}],
-        tools=[], template_kwargs=template_kwargs)
+        tools=[])
 
 
 def _read(turn: reader.Turn, row: dict = ROW) -> str | None:
     async def body(ledger):
         return await asyncio.to_thread(reader.read, turn, row, QUESTION)
     return _in_a_run(body)
-
-
-def test_the_reader_renders_with_the_agents_own_template_arguments(server):
-    out = _read(_small_turn({"reasoning_effort": "low"}))
-    mine = [r for r in server.renders if QUESTION in json.dumps(r["messages"])]
-    assert out is not None and mine
-    assert all(r["chat_template_kwargs"] == {"reasoning_effort": "low"} for r in mine)
 
 
 def test_a_piece_whose_options_hold_little_probability_stays(server, monkeypatch):
@@ -625,16 +497,16 @@ def test_not_enough_or_too_little_probability_reads_on(server, monkeypatch):
         assert [d for d in server.decisions if d["kind"] == "enough" and not d["probe"]]
 
 
-def test_reading_stops_where_the_agent_would_run_out_of_room(server):
+def test_reading_stops_where_the_agent_would_run_out_of_room(server, monkeypatch):
     assert _read(_small_turn()) is not None
     reads = [d for d in server.decisions if not d["probe"] and d["kind"] == "useful"]
-    after = next(i for i, d in enumerate(reads) if d["want"] == "yes") + 1
-    assert after < len(reads)                   # a piece follows the kept one
-    lead = _text(reads[after]["prompt"]).rsplit("</think>\n\n", 1)[-1]
-    end = len(reads[after]["prompt"]) - len(_tok(_TAIL)) - len(_tok(lead))  # C + the output so far
-    # A window one token short of that piece with the room the agent keeps:
-    # re-probed, the reader stops there.
-    server.window, reader._state["server"] = end + reader.ROOM - 1, None
+    kept = next(i for i, d in enumerate(reads) if d["want"] == "yes")
+    assert kept + 1 < len(reads)                           # a piece follows the kept one
+    b = reads[kept]["body"]
+    size = len(json.dumps(b["messages"]) + json.dumps(b.get("tools") or [])) // 4   # as the server counted it
+    # A window just short of the next piece with the room the agent keeps: the reader stops there.
+    monkeypatch.setattr(reader, "WINDOW_TOKENS", size + reader.ROOM + 1)
+    server.decisions.clear()
     out = _read(_small_turn())
     unread = _spans(out[out.index("\nKept "):], "Not read (the context limit):")
     assert unread and unread[0][0] > 0 and unread[-1][1] == len(BODY)
@@ -660,7 +532,7 @@ def test_a_call_whose_output_does_not_lead_the_next_turn_is_not_read(server, cal
 
 
 def test_a_failed_probe_keeps_the_reader_off(server):
-    server.probe_ok = False
+    server.model_cues.probe_ok = False
 
     async def body(ledger):
         await _turn(agent_mod.get_agent(), [_call("call_1")])
@@ -669,18 +541,6 @@ def test_a_failed_probe_keeps_the_reader_off(server):
     out, used = _in_a_run(body)
     assert out == _today() and (used["calls"], used["failopen"]) == (1, 1)
     assert not reader.wanted()
-
-
-def test_a_request_the_server_renders_differently_falls_back_and_the_reader_stays_on(server):
-    server.mismatch = True
-
-    async def body(ledger):
-        await _turn(agent_mod.get_agent(), [_call("call_1")])
-        return await _get("call_1"), ledger.as_dict()["jev"]
-
-    out, used = _in_a_run(body)
-    assert out == _today() and (used["calls"], used["failopen"]) == (1, 1)
-    assert reader.wanted() and [d for d in server.decisions if not d["probe"]] == []
 
 
 def test_a_turn_that_cannot_be_built_falls_back(server, monkeypatch):
@@ -739,12 +599,10 @@ def test_a_body_too_long_to_read_this_way_is_skipped(server, monkeypatch):
 
 
 def test_a_probe_that_cannot_finish_switches_the_reader_off(server, monkeypatch):
-    import requests
+    def unreachable(body):
+        raise httpx.ConnectError("down")
 
-    def unreachable(method, url, **kwargs):
-        raise requests.ConnectionError("down")
-
-    monkeypatch.setattr(server, "request", unreachable)
+    server.reply = unreachable
 
     async def body(ledger):
         await _turn(agent_mod.get_agent(), [_call("call_1")])
@@ -758,7 +616,6 @@ def test_a_probe_that_cannot_finish_switches_the_reader_off(server, monkeypatch)
 def test_a_subagent_run_while_the_reader_is_off_never_writes_its_callers_record(monkeypatch):
     monkeypatch.setattr(jev.settings, "jev_reader", True)
     monkeypatch.setattr(jev.settings, "jev_hops", False)  # on by default; hops have their own tests
-    monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(reader, "_state", _fresh_state())
     seen = []
 
@@ -786,21 +643,22 @@ def test_a_subagent_run_while_the_reader_is_off_never_writes_its_callers_record(
     assert outer is not None and inner is None and after is outer   # the subagent records nothing
 
 
-@pytest.mark.parametrize("on,profile", [(False, "vllm_workstation_qwen"), (True, "vllm_workstation_qwen"),
-                                        (True, "deepinfra")])
-def test_only_the_agents_that_read_carry_the_reading_section_and_only_when_it_is_on(monkeypatch, on, profile):
+@pytest.mark.parametrize("on,passes", [(False, True), (True, True), (True, False)])
+def test_only_the_agents_that_read_carry_the_reading_section_and_only_when_it_serves(monkeypatch, on, passes):
+    def probe():
+        if not passes:
+            raise jev.Unavailable("the model does not judge the probe pieces reliably")
+
     monkeypatch.setattr(jev.settings, "jev_reader", on)
     monkeypatch.setattr(jev.settings, "jev_hops", False)  # on by default; hops have their own tests
     monkeypatch.setattr(reader, "_state", _fresh_state())
-    monkeypatch.setattr(reader, "ready", lambda: None)    # a server that passes the probe
-    monkeypatch.setattr(jev.settings, "llm_profile", profile)
+    monkeypatch.setattr(reader, "ready", probe)
+    monkeypatch.setattr(jev.settings, "llm_profile", "deepinfra")   # any profile: the probe decides
     monkeypatch.setattr(jev.settings, "agent_model", "")
-    monkeypatch.setenv("VLLM_API_KEY", "test-secret-key")
     monkeypatch.setenv("DEEPINFRA_API_KEY", "test-secret-key")
     monkeypatch.setattr(agent_mod, "_cache", {})
-    reading = on and profile == "vllm_workstation_qwen"
     for agent in (agent_mod.get_agent(), agent_mod.get_subagent()):
-        if reading:
+        if on and passes:
             assert agent.instructions == (agent_mod.SYSTEM_PROMPT.rstrip() + "\n\n"
                                           + agent_mod._READER_SECTION)
         else:
@@ -809,11 +667,10 @@ def test_only_the_agents_that_read_carry_the_reading_section_and_only_when_it_is
 
 
 def test_a_server_that_fails_the_probe_gets_the_plain_prompt_and_no_probe_per_request(monkeypatch):
-    # The switches are on by default, and any configured URL counts as self-hosted (Ollama too):
-    # the reading examples go in only once the server has passed the reader's probe.
+    # The switches are on by default, and any configured server is asked:
+    # the reading examples go in only once it has passed the reader's probe.
     monkeypatch.setattr(jev.settings, "jev_reader", True)
     monkeypatch.setattr(jev.settings, "jev_hops", True)
-    monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(reader, "_state", _fresh_state())
     probes = []
 
@@ -830,11 +687,17 @@ def test_a_server_that_fails_the_probe_gets_the_plain_prompt_and_no_probe_per_re
 def test_the_reading_examples_go_in_once_the_server_passes_the_probe(monkeypatch):
     monkeypatch.setattr(jev.settings, "jev_reader", True)
     monkeypatch.setattr(jev.settings, "jev_hops", True)
-    monkeypatch.setattr(jev.settings, "llm_profile", "vllm_workstation_qwen")
     monkeypatch.setattr(reader, "_state", _fresh_state())
     monkeypatch.setattr(reader, "ready", lambda: None)
     assert agent_mod._reading_prompt() == "\n\n".join(
         [agent_mod.SYSTEM_PROMPT.rstrip(), agent_mod._READER_SECTION, agent_mod._HOPS_SECTION])
+
+
+def test_the_reading_examples_say_to_answer_the_question_line_in_plain_text():
+    # The agents reply only with tool calls, but a question line ending a
+    # tool's output is answered in plain text: one word, the same for every model.
+    for section in (agent_mod._READER_SECTION, agent_mod._HOPS_SECTION):
+        assert "your reply is only its answer, yes or no, as plain text" in section
 
 
 def test_a_piece_answered_with_nan_logprobs_stays_unjudged(server, monkeypatch):

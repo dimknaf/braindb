@@ -40,7 +40,7 @@ See [`tests/README.md`](tests/README.md) for what is and isn't covered.
 
 ## Adding a new LLM provider
 
-The reference implementation and recommended default is `deepinfra` with `google/gemma-4-31B-it` — fast, cheap, validated end-to-end on the wiki/maintainer/writer pipeline. Other providers are configured the same way.
+The reference implementation and recommended default is `deepinfra` with `deepseek-ai/DeepSeek-V4.1-Flash` — fast, cheap, and its replies carry the logprobs JEV reads. Other providers are configured the same way.
 
 Every profile is an OpenAI-compatible Chat Completions endpoint, driven by the OpenAI Agents SDK through the OpenAI client. To add a provider:
 

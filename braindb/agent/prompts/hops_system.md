@@ -22,3 +22,4 @@ Question: What does the Rowan bakery sell, and when is it open?
   page: Rowan bakery - a bakery on Tarn Street opened by Kel Aster in 2018.
   sections: overview; founder; breads; opening hours; sources
 [h1.1] | useful (yes or no): yes
+When a tool's output ends with such a question line, your reply is only its answer, yes or no, as plain text: the one time you reply without a tool call.
