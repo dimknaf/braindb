@@ -38,7 +38,7 @@ from braindb.services.keyword_service import (
     sync_keywords_for_entity,
 )
 from braindb.services.search import fuzzy_search, preview, slice_content
-from braindb.services import reader
+from braindb.services import hops, reader
 from braindb.services import wiki_sections as ws
 from braindb.services import wiki_jobs as wj
 from braindb.agent.run_state import (
@@ -161,6 +161,7 @@ def _verbose(name: str):
 @function_tool
 @_verbose("recall_memory")
 async def recall_memory(
+    ctx: ToolContext,
     queries: list[str],
     max_results: int = settings.recall_default_max_results,
 ) -> str:
@@ -236,7 +237,10 @@ async def recall_memory(
             )
         for rule in result.always_on_rules:
             lines.append(f"[RULE priority={rule.ext.get('priority')}] {rule.content}")
-        return _truncate("\n".join(lines))
+        text = _truncate("\n".join(lines))
+        # With JEV_HOPS on, the neighbours of these items that JEV keeps for
+        # the request's question follow them (services/hops.py).
+        return await _hop(ctx, [str(item.id) for item in result.items], text) or text
     except Exception as e:
         return _err(str(e))
 
@@ -467,6 +471,25 @@ async def first_turn(agent, prompt: str) -> reader.Turn:
     tools = [Converter.tool_to_openai(t) for t in await agent.get_all_tools(ctx)]
     template = (agent.model_settings.extra_body or {}).get("chat_template_kwargs")
     return reader.Turn(_to_dump_compatible(messages), _to_dump_compatible(tools), template)
+
+
+async def _hop(ctx: ToolContext, shown: list[str], text: str) -> Optional[str]:
+    """Recall's output extended by JEV hops inside the agent's own
+    conversation (services/hops.py), or None: recall_memory answers as it
+    always has."""
+    loop, question = get_loop(), get_reading()
+    if loop is None or not question or not shown or not hops.wanted():
+        return None
+    if not reader.first_call(loop.response, ctx.tool_call_id):
+        add_usage("jev", skipped=1)
+        return None
+    try:
+        turn = await _next_turn(ctx, loop)
+    except Exception as e:  # noqa: BLE001 - e.g. an SDK change: answer as without hops
+        logger.warning("JEV hops could not build the agent's next turn: %r", e)
+        add_usage("jev", calls=1, failopen=1)
+        return None
+    return await asyncio.to_thread(hops.extend, turn, shown, text, question)
 
 
 async def _read_long(ctx: ToolContext, row: dict) -> Optional[str]:

@@ -20,7 +20,7 @@ from braindb.agent.run_state import (
     set_reading,
 )
 from braindb.db import get_conn
-from braindb.services import reader
+from braindb.services import hops, reader
 from braindb.services.activity_log import log_activity
 
 logger = logging.getLogger(__name__)
@@ -58,10 +58,11 @@ async def agent_query(body: AgentQueryRequest):
     # shape stays {"answer", "max_turns"}.
     usage, usage_token = install_usage()
     need_token = set_need((body.need or "").strip())
-    # What the JEV reader reads long bodies for: the need, else a short query
-    # (services/reader.py). Empty while the reader is off.
+    # What the JEV reader reads long bodies for, and hops judge recall's
+    # neighbours for: the need, else a short query (services/reader.py).
+    # Empty while both are off.
     reading_token = set_reading(
-        reader.reading_question(body.need, body.query) if reader.wanted() else "")
+        reader.reading_question(body.need, body.query) if reader.wanted() or hops.wanted() else "")
     try:
         result = await run_agent_query(body.query, max_turns=body.max_turns)
         with get_conn() as conn:

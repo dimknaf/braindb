@@ -90,7 +90,7 @@ from braindb.agent.tools import (
     view_tree,
 )
 from braindb.config import settings
-from braindb.services import reader
+from braindb.services import hops, reader
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +104,15 @@ SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system_prompt.md").read_te
 # reader's separation of needed pieces from the rest (AUROC 0.81 to 0.90 on
 # dev, 0.88 held out) and put 0.99 of the answer's probability on yes or no.
 _READER_SECTION = (Path(__file__).parent / "prompts" / "reader_system.md").read_text(encoding="utf-8")
+# ...and, with hops on, how a neighbour offered after a recall is judged.
+_HOPS_SECTION = (Path(__file__).parent / "prompts" / "hops_system.md").read_text(encoding="utf-8")
 
 
 def _reading_prompt() -> str:
     """The system prompt of an agent that reads for a request."""
-    if settings.jev_reader and settings.self_hosted:
-        return f"{SYSTEM_PROMPT.rstrip()}\n\n{_READER_SECTION}"
-    return SYSTEM_PROMPT
+    sections = [s for on, s in ((settings.jev_reader, _READER_SECTION), (settings.jev_hops, _HOPS_SECTION))
+                if on and settings.self_hosted]
+    return "\n\n".join([SYSTEM_PROMPT.rstrip(), *sections]) if sections else SYSTEM_PROMPT
 
 # Every tool except the final submit (that one is typed per purpose).
 _BASE_TOOLS = [
@@ -445,10 +447,11 @@ async def run_typed(
     # into the ledger its caller installed; only the outermost one reports.
     usage, usage_token = install_usage()
     usage.add_tag(get_run_tag())
-    # The JEV reader reads long bodies inside this run's conversation, from a
-    # record the hooks keep (run_state.py); recorded only when it serves the
-    # request. A nested run (a subagent) records its own, or none.
-    loop_token = install_loop(record=bool(get_reading()) and reader.wanted())
+    # The JEV reader reads long bodies, and hops extend recall, inside this
+    # run's conversation, from a record the hooks keep (run_state.py);
+    # recorded only when one of them serves the request. A nested run (a
+    # subagent) records its own, or none.
+    loop_token = install_loop(record=bool(get_reading()) and (reader.wanted() or hops.wanted()))
     # Layer-3 nudge: when the run is about to exhaust `max_turns`, the hook
     # appends a synthetic "you have N turns left, finalise via final_answer"
     # user message to the conversation. One nudge per run; disabled when

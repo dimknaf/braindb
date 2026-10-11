@@ -397,9 +397,11 @@ def connect() -> tuple[jev._Server, dict, int, dict]:
     return server, options, window, consts
 
 
-def _ready() -> tuple[jev._Server, dict, int]:
-    """The server, the yes/no options and the served window, probed once per
-    process (again after REPROBE_S when a probe or a read switched it off)."""
+def ready() -> tuple[jev._Server, dict, int, dict]:
+    """The server, the yes/no options, the served window and the rendering
+    markers, probed once per process (again after REPROBE_S when a probe or a
+    read switched it off). Shared with services/hops.py, which judges inside
+    a tool output the same way."""
     with _lock:
         if time.monotonic() < _state["off_until"]:  # a read that waited here while the probe failed
             raise jev.Unavailable("the reader is off until it is probed again")
@@ -413,7 +415,7 @@ def _ready() -> tuple[jev._Server, dict, int]:
                 raise jev.Unavailable(str(e) if isinstance(e, Mismatch) else type(e).__name__) from None
             _state.update(server=server, options=options, window=window)
             logger.info("JEV reader on: a served window of %d tokens", window)
-        return _state["server"], _state["options"], _state["window"]
+        return _state["server"], _state["options"], _state["window"], _state["consts"]
 
 
 def read(turn: Turn, row: dict, question: str) -> str | None:
@@ -442,8 +444,8 @@ def read(turn: Turn, row: dict, question: str) -> str | None:
 
 def _read(turn: Turn, row: dict, body: str, question: str, started: float,
           usage: dict) -> str | None:
-    server, options, window = _ready()
-    c, t = split_turn(server, turn, _state["consts"])
+    server, options, window, consts = ready()
+    c, t = split_turn(server, turn, consts)
 
     def spend(u: dict) -> None:
         usage["requests"] += 1

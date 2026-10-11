@@ -305,6 +305,14 @@ class Settings(BaseSettings):
     # only what was kept. SELF-HOSTED vLLM ONLY; off by default, and with it
     # off get_entity is unchanged.
     jev_reader: bool = False
+    # Hops (services/hops.py): after a recall_memory call in an /agent/query
+    # request, the relation neighbours of what recall showed are offered one
+    # at a time inside the agent's own conversation, each kept or dropped by
+    # a one-token pick, and only the kept ones are followed to the next hop;
+    # with the wiki gate on, the job members' neighbours join its candidates.
+    # SELF-HOSTED vLLM ONLY; off by default, and with it off recall_memory
+    # is unchanged.
+    jev_hops: bool = False
 
     @property
     def resolved_agent_model(self) -> str:

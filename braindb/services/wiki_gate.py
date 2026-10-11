@@ -15,7 +15,9 @@ worked examples of the two questions below, cached for every job), then the
 job (subject, members, rules, the page or its lettered outline). `prepare`
 appends to it, LAST, the facts BrainDB's own recall turns up for the page (at
 most PACK; wikis, keywords, sources, the job's members and the facts the page
-already cites left out), one at a time, each followed by one token in that
+already cites left out) and, with JEV_HOPS on, the facts one relation away
+from the members (at most PACK_HOPS, services/hops.py), one at a time, each
+followed by one token in that
 same conversation, thinking off, read from the logprobs of the options:
 - "[f2] | about the subject (yes or no):" yes: the conversation continues
   through the fact; no, or too little probability on the options: it is
@@ -50,7 +52,7 @@ from braindb.agent.run_state import add_usage
 from braindb.config import settings
 from braindb.db import get_conn
 from braindb.schemas.search import ContextRequest
-from braindb.services import jev, reader
+from braindb.services import hops, jev, reader
 from braindb.services.context import assemble_context
 from braindb.services.wiki_jobs import fetch_members, keywords_from_meta, parse_refs
 
@@ -62,6 +64,7 @@ LETTERS = list(string.ascii_uppercase[:16])   # at most 16 outline sections are 
 KEEP = 0.5         # P(yes) a found fact needs to reach the writer
 MIN_MASS = 0.5     # below this the options hold too little probability: no answer
 PACK = 8           # facts found by recall that are read
+PACK_HOPS = 6      # with JEV_HOPS on, facts one relation away from the members, read after them
 FACT_CHARS = 1200  # of each fact's content
 DEADLINE_S = 90    # for all of a job's decisions
 WORKERS = 8        # placements of one job in parallel (jev's in-flight limit still applies)
@@ -143,8 +146,12 @@ def _found(conn, canonical: str, old_body: str, members: list[dict]) -> list[dic
     result = assemble_context(conn, ContextRequest(queries=queries, max_results=30, include_always_on_rules=False))
     ids = [str(it.id) for it in result.items
            if it.entity_type in ("fact", "thought") and str(it.id).lower() not in skip][:PACK]
+    if settings.jev_hops:  # then the members' own relation neighbours (services/hops.py)
+        near = hops.neighbours(conn, [m["id"] for m in members], skip | {i.lower() for i in ids}, PACK_HOPS,
+                               types=("fact", "thought"))
+        ids += [n["id"] for n in near]
     rows = {r["id"]: r for r in fetch_members(conn, ids)}
-    return [rows[i] for i in ids if i in rows]  # recall's order
+    return [rows[i] for i in ids if i in rows]  # recall's order, then the neighbours'
 
 
 def _switch_off(error: Exception) -> None:
