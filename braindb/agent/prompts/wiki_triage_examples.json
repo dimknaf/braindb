@@ -1,0 +1,23 @@
+{
+  "examples": [
+    {"user": "SEED: Orla Venn was promoted to head of research at Calder Labs in May 2026.\nEVIDENCE:\n- [fact] Calder Labs builds battery-cell testing robots.\n- [fact] Orla Venn joined Calder Labs in 2021.\nCANDIDATE WIKIS:\n[A] Calder Labs - battery testing robotics company (5200ch)\n[B] Grid batteries - storage technology (9100ch)",
+     "answer": "action: attach\nwiki: A"},
+    {"user": "SEED: The Ferrow Bridge reopened to traffic on 3 March 2026 after repairs.\nEVIDENCE:\n- [fact] Ferrow Bridge crosses the Lune river in Hallam county.\n- [fact] Repairs on Ferrow Bridge began in 2025.\nCANDIDATE WIKIS:\n[A] Hallam county - region overview (3000ch)\n[B] Lune river - river (1800ch)",
+     "answer": "action: create\nname: Ferrow Bridge"},
+    {"user": "SEED: Dimi said the meeting went well.\nEVIDENCE:\n- [fact] Dimi Ortan is a chemist at Pell University.\n- [fact] Dimi Kass is a football coach in Varno.\nCANDIDATE WIKIS:\n[A] Dimi Ortan - chemist (2100ch)\n[B] Dimi Kass - football coach (1500ch)",
+     "answer": "action: ambiguous"},
+    {"user": "SEED: _kw_7f3a2c\nEVIDENCE:\n- [keyword] _kw_7f3a2c\nCANDIDATE WIKIS:\n[A] Calder Labs - battery testing robotics company (5200ch)",
+     "answer": "action: skip"},
+    {"user": "SEED: Tessel Bank raised its savings rate to 4.1% in April 2026.\nEVIDENCE:\n- [fact] Tessel Bank is a retail bank headquartered in Marrow.\n- [wiki] Tessel Bank plc - retail bank in Marrow\nCANDIDATE WIKIS:\n[A] Tessel Bank - retail bank (2600ch)\n[B] Tessel Bank plc - retail bank in Marrow (4100ch)\n[C] Marrow - city (1200ch)",
+     "answer": "action: consolidate\n[A] same subject (yes or no): yes\n[B] same subject (yes or no): yes\n[C] same subject (yes or no): no"},
+    {"user": "SEED: User mortenqa posted \"Rustle: a tiny static site generator written in Rust\" to a link aggregator.\nEVIDENCE:\n- [fact] mortenqa has posted three projects to the aggregator this year.\nCANDIDATE WIKIS:\n[A] Rust - programming language (8800ch)",
+     "answer": "action: create\nname: Rustle"},
+    {"user": "SEED: Calder Labs opened a second factory in Brenno in June 2026.\nEVIDENCE:\n- [fact] Calder Labs builds battery-cell testing robots.\nCANDIDATE WIKIS:\n[A] Brenno - town (900ch)\n[B] Calder Labs - battery testing robotics company (5200ch)",
+     "answer": "action: attach\nwiki: B"}
+  ],
+  "probe": {
+    "user": "SEED: Calder Labs hired 40 engineers for its Brenno factory in July 2026.\nEVIDENCE:\n- [fact] Calder Labs opened a factory in Brenno in June 2026.\nCANDIDATE WIKIS:\n[A] Brenno - town (900ch)\n[B] Calder Labs - battery testing robotics company (5600ch)",
+    "action": "attach",
+    "wiki": "B"
+  }
+}

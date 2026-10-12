@@ -20,22 +20,35 @@ its already-validated `payload` into `braindb.agent.run_state.last_submit`
 (a ContextVar). `run_typed` reads it back after `Runner.run` returns.
 asyncio's per-Task context isolation makes nested/parallel runs safe.
 """
+import asyncio
 import json
 import logging
 from uuid import uuid4
 from pathlib import Path
 from typing import TypeVar
 
-from agents import Agent, ModelSettings, Runner, StopAtTools, set_tracing_disabled
-from agents.extensions.models.litellm_model import LitellmModel
-from litellm import BadRequestError, ContextWindowExceededError
+from agents import (
+    Agent,
+    ModelSettings,
+    OpenAIChatCompletionsModel,
+    RunContextWrapper,
+    Runner,
+    StopAtTools,
+    set_tracing_disabled,
+)
+from openai import AsyncOpenAI, BadRequestError, UnprocessableEntityError
 from pydantic import BaseModel
 
 from braindb.agent.hooks import CountdownHooks
 from braindb.agent.run_state import (
+    get_reading,
     get_run_tag,
+    install_loop,
     install_slot,
+    install_usage,
+    release_loop,
     release_slot,
+    release_usage,
     reset_run_tag,
     set_run_tag,
 )
@@ -67,6 +80,7 @@ from braindb.agent.tools import (
     save_rule,
     save_source,
     save_thought,
+    sdk_turn,
     search_sql,
     submit_answer,
     submit_maintainer,
@@ -79,10 +93,35 @@ from braindb.agent.tools import (
     view_tree,
 )
 from braindb.config import settings
+from braindb.services import hops, reader
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system_prompt.md").read_text(encoding="utf-8")
+
+# With the JEV reader on (services/reader.py), the agents that read entities
+# for a request — the answering agent and its subagents — also carry how a
+# long read is judged, with worked examples: the reader asks its one-token
+# question inside their own conversation, so their system prompt is where
+# the examples are cached. On needs over long pages they lifted the
+# reader's separation of needed pieces from the rest (AUROC 0.81 to 0.90 on
+# dev, 0.88 held out) and put 0.99 of the answer's probability on yes or no.
+_READER_SECTION = (Path(__file__).parent / "prompts" / "reader_system.md").read_text(encoding="utf-8")
+# ...and, with hops on, how a neighbour offered after a recall is judged.
+_HOPS_SECTION = (Path(__file__).parent / "prompts" / "hops_system.md").read_text(encoding="utf-8")
+# The writer behind the JEV gate (services/wiki_gate.py), with worked
+# examples of the gate's two questions.
+_GATED_WRITER_PROMPT = (Path(__file__).parent / "prompts" / "writer_gated_system.md").read_text(encoding="utf-8")
+
+
+def _reading_prompt() -> str:
+    """The system prompt of an agent that reads for a request: with the
+    examples of each JEV reading feature that is on, once the server has
+    passed the reader's probe (one it fails gets the plain prompt). Probes
+    on first use: build these agents off the event loop."""
+    sections = [s for on, s in ((reader.wanted(), _READER_SECTION), (hops.wanted(), _HOPS_SECTION)) if on]
+    return "\n\n".join([SYSTEM_PROMPT.rstrip(), *sections]) if sections and reader.serves() else SYSTEM_PROMPT
+
 
 # Every tool except the final submit (that one is typed per purpose).
 _BASE_TOOLS = [
@@ -164,12 +203,37 @@ def _expected_shape_hint(expected_cls: type[BaseModel]) -> str:
     return json.dumps({"payload": example_payload})
 
 
-def _model() -> LitellmModel:
-    return LitellmModel(
+_OPENAI_URL = "https://api.openai.com/v1"
+
+
+def _endpoint() -> str:
+    # No base URL configured (openai_compatible without OPENAI_BASE_URL)
+    # means OpenAI's own endpoint, named explicitly: the client would
+    # otherwise take an empty OPENAI_BASE_URL from the environment.
+    return settings.resolved_base_url or _OPENAI_URL
+
+
+def _model() -> OpenAIChatCompletionsModel:
+    # Every profile speaks the OpenAI Chat Completions protocol (hosted
+    # gateways, vLLM, Ollama, LM Studio), so the SDK's own model over the
+    # OpenAI client serves them all. A provider with its own non-OpenAI API
+    # would need a different model class here — this is the one place.
+    # The client refuses an empty key when it is built; a missing key must
+    # fail at the provider on the first request instead, as it always did.
+    return OpenAIChatCompletionsModel(
         model=settings.resolved_agent_model,
-        api_key=settings.resolved_api_key,
-        base_url=settings.resolved_base_url,
+        openai_client=AsyncOpenAI(base_url=_endpoint(),
+                                  api_key=settings.resolved_api_key or "missing-api-key"),
     )
+
+
+def _is_context_window(e: Exception) -> bool:
+    """The request is over the model's context window: vLLM and the hosted
+    gateways answer 400 with a 'maximum context length' / 'maximum model
+    length' message, OpenAI with the `context_length_exceeded` code."""
+    message = str(e).lower()
+    return (getattr(e, "code", None) == "context_length_exceeded"
+            or "context length" in message or "maximum model length" in message)
 
 
 def _build(
@@ -178,6 +242,8 @@ def _build(
     extra_tools: tuple = (),
     extra_stop_tools: tuple[str, ...] = (),
     reasoning_effort: str = "",
+    instructions: str = SYSTEM_PROMPT,
+    base_tools: tuple | None = None,
 ) -> Agent:
     """Build an agent. NOTE: no `output_type` — see module docstring. The
     structured contract lives on `submit_tool`'s argument schema, not on
@@ -193,41 +259,44 @@ def _build(
 
     `reasoning_effort` (blank = send nothing) is passed only by the wiki
     agents; see `settings.agent_wiki_reasoning_effort`.
+
+    `instructions` and `base_tools` default to the shared system prompt and
+    `_BASE_TOOLS`; only the gated writer replaces them (it has no search,
+    memory or delegation tools, so its system prompt must not offer them).
     """
     set_tracing_disabled(disabled=True)
-    # `extra_args` is forwarded verbatim into the LiteLLM call. `timeout`
-    # lands as `kwargs["timeout"]` — which LiteLLM resolves ahead of its
-    # 600s fallback; a TRANSPORT deadline only, it never enters the request
-    # body and cannot steer the model, unlike `output_type` / `tool_choice`
-    # (see the module docstring — those stay unset deliberately). Without it
-    # a long wiki write is abandoned client-side at 600s while the server is
-    # still working.
+    # `extra_args` is forwarded verbatim into the client call. `timeout` is
+    # the OpenAI client's per-request deadline, replacing its 600s default;
+    # a TRANSPORT deadline only, it never enters the request body and cannot
+    # steer the model, unlike `output_type` / `tool_choice` (see the module
+    # docstring — those stay unset deliberately). Without it a long wiki
+    # write is abandoned client-side at 600s while the server is still
+    # working.
     #
-    # `reasoning_effort` belongs in the request BODY, but it cannot travel as
-    # a plain kwarg: the SDK's LitellmModel lifts that exact key out of
-    # `reasoning` / `extra_body` / `extra_args` and promotes it to a top-level
-    # `reasoning_effort=` argument on `litellm.acompletion()`, where LiteLLM
-    # checks it against a PER-PROVIDER allow-list — `openai` (which every
-    # OpenAI-compatible profile resolves to) does not list it, so the call
-    # raises `UnsupportedParamsError` before any request is sent. Nesting it
-    # under `chat_template_kwargs` sidesteps that: the SDK only intercepts the
-    # literal top-level key, so the dict is copied through into LiteLLM's
-    # `extra_body` and forwarded into the JSON body unfiltered, which is where
-    # vLLM reads chat-template variables from. VLLM-SPECIFIC by nature — a
-    # hosted provider may reject the unknown body key, so this stays blank
-    # unless an operator opts in on a self-hosted profile.
+    # `reasoning_effort` travels nested under `chat_template_kwargs` in the
+    # request BODY, which is where vLLM reads chat-template variables from;
+    # a top-level `reasoning_effort` is a different, provider-checked
+    # parameter (under LiteLLM it once killed every wiki job before a
+    # request was sent). VLLM-SPECIFIC by nature — a hosted provider may
+    # reject the unknown body key, so this stays blank unless an operator
+    # opts in on a self-hosted profile.
     extra_args = {"timeout": settings.agent_request_timeout}
     extra_body = (
         {"chat_template_kwargs": {"reasoning_effort": reasoning_effort}}
         if reasoning_effort else None
     )
+    # OpenAI's own endpoint keeps chat completions by default (`store`);
+    # recalled memories must not be kept there. Other endpoints get no
+    # `store` at all — a strict server could reject it.
+    store = False if _endpoint().startswith(_OPENAI_URL) else None
     agent = Agent(
         name=name,
-        instructions=SYSTEM_PROMPT,
+        instructions=instructions,
         model=_model(),
         model_settings=ModelSettings(extra_args=extra_args,
-                                     extra_body=extra_body),
-        tools=[*_BASE_TOOLS, *extra_tools, submit_tool],
+                                     extra_body=extra_body,
+                                     store=store),
+        tools=[*(_BASE_TOOLS if base_tools is None else base_tools), *extra_tools, submit_tool],
         tool_use_behavior=StopAtTools(
             stop_at_tool_names=["final_answer", *extra_stop_tools],
         ),
@@ -239,7 +308,9 @@ def _build(
     return agent
 
 
-_cache: dict[str, Agent] = {}
+# Keyed by the instructions too: an agent that reads for a request carries
+# the JEV reading examples only while the server serves them (_reading_prompt).
+_cache: dict[tuple[str, str], Agent] = {}
 
 
 def _cached(
@@ -249,16 +320,20 @@ def _cached(
     extra_tools: tuple = (),
     extra_stop_tools: tuple[str, ...] = (),
     reasoning_effort: str = "",
+    instructions: str = SYSTEM_PROMPT,
+    base_tools: tuple | None = None,
 ) -> Agent:
-    a = _cache.get(key)
+    a = _cache.get((key, instructions))
     if a is None:
         a = _build(
             name, submit_tool,
             extra_tools=extra_tools,
             extra_stop_tools=extra_stop_tools,
             reasoning_effort=reasoning_effort,
+            instructions=instructions,
+            base_tools=base_tools,
         )
-        _cache[key] = a
+        _cache[(key, instructions)] = a
     return a
 
 
@@ -297,7 +372,7 @@ _SUBAGENT_EXTRA_TOOLS = (
 
 def get_agent() -> Agent:
     """Default agent: general recall/save (public /agent/query)."""
-    return _cached("answer", "BrainDB Memory Agent", submit_answer)
+    return _cached("answer", "BrainDB Memory Agent", submit_answer, instructions=_reading_prompt())
 
 
 def get_maintainer_agent() -> Agent:
@@ -314,13 +389,36 @@ def get_writer_agent() -> Agent:
     )
 
 
+def get_gated_writer_agent() -> Agent:
+    """The writer behind the JEV gate (services/wiki_gate.py): the page's own
+    tools only — no recall, search, subagent or entity writes — so the facts
+    the gate left out cannot come back and its context holds only the job."""
+    return _cached(
+        "writer_gated", "BrainDB Wiki Writer", submit_wiki,
+        extra_tools=_WRITER_EXTRA_TOOLS,
+        extra_stop_tools=_WRITER_EXTRA_STOP_TOOLS,
+        reasoning_effort=settings.agent_wiki_reasoning_effort,
+        instructions=_GATED_WRITER_PROMPT,
+        base_tools=(),
+    )
+
+
+async def first_turn(agent: Agent, prompt: str) -> reader.Turn:
+    """`agent`'s first request for `prompt` (its system prompt, the prompt,
+    its tools and chat-template arguments): the wiki gate decides inside it
+    before the agent runs."""
+    ctx = RunContextWrapper(context=None)
+    return await sdk_turn(agent, ctx, [{"role": "user", "content": prompt}], await agent.get_system_prompt(ctx))
+
+
 def get_subagent() -> Agent:
     # Shared surface: any agent can delegate, so a subagent spawned from
     # /agent/query also inherits the wiki effort setting. Accepted because
     # subagent runs are overwhelmingly wiki work.
     return _cached("subagent", "BrainDB Subagent", submit_subagent,
                    extra_tools=_SUBAGENT_EXTRA_TOOLS,
-                   reasoning_effort=settings.agent_wiki_reasoning_effort)
+                   reasoning_effort=settings.agent_wiki_reasoning_effort,
+                   instructions=_reading_prompt())
 
 
 def create_braindb_agent() -> Agent:
@@ -360,6 +458,16 @@ async def run_typed(
     # every TOOL line it emits is attributable (see run_state.set_run_tag).
     # Set before Runner.run — ContextVars are captured at Task creation.
     tag_token = set_run_tag(uuid4().hex[:6])
+    # Token usage of this run goes into the request's usage ledger (the
+    # hooks below add each LLM call). A nested run (subagent, retry) adds
+    # into the ledger its caller installed; only the outermost one reports.
+    usage, usage_token = install_usage()
+    usage.add_tag(get_run_tag())
+    # The JEV reader reads long bodies, and hops extend recall, inside this
+    # run's conversation, from a record the hooks keep (run_state.py);
+    # recorded only when one of them serves the request. A nested run (a
+    # subagent) records its own, or none.
+    loop_token = install_loop(record=bool(get_reading()) and (reader.wanted() or hops.wanted()))
     # Layer-3 nudge: when the run is about to exhaust `max_turns`, the hook
     # appends a synthetic "you have N turns left, finalise via final_answer"
     # user message to the conversation. One nudge per run; disabled when
@@ -465,23 +573,22 @@ async def run_typed(
             f"The run terminated without the typed final tool firing — "
             f"the model likely ended with plain prose."
         )
-    except ContextWindowExceededError:
-        # The conversation is already over the model's window. A retry
-        # without input truncation would just hit the same wall, so we
-        # re-raise and let the router fail the job cleanly. Real fix is
-        # upstream: keep prompts/tool-results small enough that the
-        # handoff threshold catches us first. See routers/wiki.py's
-        # `_body_block_or_stub` for the prompt-side mitigation.
-        raise
-    except BadRequestError as e:
-        # Quantised models (Qwen AWQ-INT4) occasionally emit malformed
-        # JSON in tool-call args; the OpenAI client raises BadRequestError
-        # before the tool body runs. One fresh attempt usually recovers.
-        # Bounded to depth 1 via the `_bad_request_retried` flag —
-        # recursion uses run_typed itself rather than duplicating the
-        # setup. The current slot is released by `finally`; the recursive
-        # call installs its own.
-        if _bad_request_retried:
+    except (BadRequestError, UnprocessableEntityError) as e:
+        # Over the model's window: a retry without input truncation would
+        # just hit the same wall, so we re-raise and let the router fail the
+        # job cleanly. Real fix is upstream: keep prompts/tool-results small
+        # enough that the handoff threshold catches us first. See
+        # routers/wiki.py's `_body_block_or_stub` for the prompt-side
+        # mitigation.
+        #
+        # Otherwise: quantised models (Qwen AWQ-INT4) occasionally emit
+        # malformed JSON in tool-call args; the OpenAI client raises
+        # BadRequestError before the tool body runs. One fresh attempt
+        # usually recovers. Bounded to depth 1 via the
+        # `_bad_request_retried` flag — recursion uses run_typed itself
+        # rather than duplicating the setup. The current slot is released by
+        # `finally`; the recursive call installs its own.
+        if _is_context_window(e) or _bad_request_retried:
             raise
         logger.warning(
             "%s: BadRequestError on first attempt (%s); "
@@ -493,6 +600,10 @@ async def run_typed(
             _bad_request_retried=True,
         )
     finally:
+        if usage_token is not None:
+            logger.info("Usage [%s] (%s): %s", get_run_tag(), agent.name, usage.line())
+        release_usage(usage_token)
+        release_loop(loop_token)
         reset_run_tag(tag_token)
         release_slot(token)
 
@@ -503,5 +614,7 @@ async def run_agent_query(query: str, max_turns: int | None = None) -> dict:
     the response shape stays `{"answer","max_turns"}` for backward
     compatibility."""
     turns = max_turns or settings.agent_max_turns
-    payload: AgentAnswer = await run_typed(query, get_agent(), AgentAnswer, max_turns=turns)
+    # Built off the event loop: on first use it probes the server for JEV.
+    agent = await asyncio.to_thread(get_agent)
+    payload: AgentAnswer = await run_typed(query, agent, AgentAnswer, max_turns=turns)
     return {"answer": payload.answer, "max_turns": turns}

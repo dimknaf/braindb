@@ -12,6 +12,7 @@ These logs go to stdout and are visible via `docker logs braindb_api`.
 
 Follows the pattern in fa-automation/tasks/linkedin_research/tools.py.
 """
+import asyncio
 import functools
 import json
 import logging
@@ -22,6 +23,7 @@ from uuid import UUID
 
 import psycopg2.extras
 from agents import function_tool
+from agents.tool_context import ToolContext
 
 from braindb.config import settings
 from braindb.db import get_conn
@@ -36,9 +38,19 @@ from braindb.services.keyword_service import (
     sync_keywords_for_entity,
 )
 from braindb.services.search import fuzzy_search, preview, slice_content
+from braindb.services import hops, reader
 from braindb.services import wiki_sections as ws
 from braindb.services import wiki_jobs as wj
-from braindb.agent.run_state import get_run_tag, record_handoff, record_submit
+from braindb.agent.run_state import (
+    add_usage,
+    get_loop,
+    get_need,
+    get_reading,
+    get_run_tag,
+    note_tool,
+    record_handoff,
+    record_submit,
+)
 from braindb.agent.schemas import (
     AgentAnswer,
     MaintainerClusterDecision,
@@ -108,12 +120,14 @@ def _verbose(name: str):
 
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
+            note_tool(name)  # per-request tool counts (usage ledger), verbose or not
             t0 = None
             if settings.agent_verbose:
                 # Bind positional args to param names for readable logging
                 bound = {}
                 for i, val in enumerate(args):
-                    if i < len(param_names):
+                    # A tool's run context (it carries the run's input) is not an argument.
+                    if i < len(param_names) and not isinstance(val, ToolContext):
                         bound[param_names[i]] = val
                 bound.update(kwargs)
                 try:
@@ -147,6 +161,7 @@ def _verbose(name: str):
 @function_tool
 @_verbose("recall_memory")
 async def recall_memory(
+    ctx: ToolContext,
     queries: list[str],
     max_results: int = settings.recall_default_max_results,
 ) -> str:
@@ -185,8 +200,16 @@ async def recall_memory(
     """
     try:
         req = ContextRequest(queries=queries, max_results=max_results)
-        with get_conn() as conn:
-            result = assemble_context(conn, req)
+        need = get_need() if settings.jev_enabled else ""
+
+        def _recall():
+            with get_conn() as conn:
+                return assemble_context(conn, req, need=need)
+
+        # With a need (and JEV on), JEV judges the items over HTTP for a few
+        # seconds: off the event loop, so concurrent runs keep going.
+        # Otherwise the recall runs inline exactly as before.
+        result = await asyncio.to_thread(_recall) if need else _recall()
         # EVERY item must survive into the rendered output — the per-query
         # quota guarantees membership, and a blind tail-truncate would undo
         # that guarantee for low-ranked reserved items (items are sorted by
@@ -214,7 +237,12 @@ async def recall_memory(
             )
         for rule in result.always_on_rules:
             lines.append(f"[RULE priority={rule.ext.get('priority')}] {rule.content}")
-        return _truncate("\n".join(lines))
+        text = _truncate("\n".join(lines))
+        # With JEV_HOPS on, the neighbours of the items shown that JEV keeps
+        # for the request's question follow them (services/hops.py). An item
+        # the cut above left out was not shown: hops may offer it.
+        shown = [str(item.id) for item in result.items if str(item.id) in text]
+        return await _hop(ctx, shown, text) or text
     except Exception as e:
         return _err(str(e))
 
@@ -403,9 +431,80 @@ async def save_rule(
 # ENTITIES — read / update / delete                                      #
 # ====================================================================== #
 
+async def sdk_turn(agent, ctx, items: list, system: str | None) -> reader.Turn:
+    """A request of `agent` for the conversation `items` — its messages and
+    tools — built the way the SDK's chat model builds its own request. JEV
+    decides inside such a request (services/reader.py)."""
+    from agents.models.chatcmpl_converter import Converter
+    from agents.util._json import _to_dump_compatible
+
+    model = agent.model
+    messages = Converter.items_to_messages(
+        items, model=model.model, base_url=str(model._client.base_url),
+        should_replay_reasoning_content=model.should_replay_reasoning_content,
+        strict_feature_validation=model._strict_feature_validation)
+    if system:
+        messages.insert(0, {"content": system, "role": "system"})
+    tools = [Converter.tool_to_openai(t) for t in await agent.get_all_tools(ctx)]
+    extra = agent.model_settings.extra_body
+    return reader.Turn(_to_dump_compatible(messages), _to_dump_compatible(tools),
+                       _to_dump_compatible(extra) if extra else None)
+
+
+async def _next_turn(ctx: ToolContext, loop) -> reader.Turn:
+    """The agent's next turn up to this call's output, from the conversation
+    the hooks recorded."""
+    items = loop.items + loop.response + [
+        {"type": "function_call_output", "call_id": ctx.tool_call_id, "output": ""}]
+    return await sdk_turn(loop.agent, ctx, items, loop.system)
+
+
+async def _hop(ctx: ToolContext, shown: list[str], text: str) -> Optional[str]:
+    """Recall's output extended by JEV hops inside the agent's own
+    conversation (services/hops.py), or None: recall_memory answers as it
+    always has."""
+    loop, question = get_loop(), get_reading()
+    if loop is None or not question or not shown or not hops.wanted():
+        return None
+    if not reader.first_call(loop.response, ctx.tool_call_id):
+        add_usage("jev", skipped=1)
+        return None
+    try:
+        turn = await _next_turn(ctx, loop)
+    except Exception as e:  # noqa: BLE001 - e.g. an SDK change: answer as without hops
+        logger.warning("JEV hops could not build the agent's next turn: %r", e)
+        add_usage("jev", calls=1, failopen=1)
+        return None
+    return await asyncio.to_thread(hops.extend, turn, shown, text, question)
+
+
+async def _read_long(ctx: ToolContext, row: dict) -> Optional[str]:
+    """A long body read by the JEV reader inside the agent's own conversation
+    (services/reader.py), or None: then get_entity answers as it always has."""
+    loop, question = get_loop(), get_reading()
+    if loop is None or not question or not reader.wanted():
+        return None
+    if str(row.get("id")) in loop.read:  # read once already: the agent wants this page as it is
+        return None
+    if not reader.first_call(loop.response, ctx.tool_call_id):
+        add_usage("jev", skipped=1)
+        return None
+    try:
+        turn = await _next_turn(ctx, loop)
+    except Exception as e:  # noqa: BLE001 - e.g. an SDK change: answer as without the reader
+        logger.warning("JEV reader could not build the agent's next turn: %r", e)
+        add_usage("jev", calls=1, failopen=1)
+        return None
+    text = await asyncio.to_thread(reader.read, turn, row, question)
+    if text is not None:
+        loop.read.add(str(row.get("id")))
+    return text
+
+
 @function_tool
 @_verbose("get_entity")
-async def get_entity(entity_id: str, offset: int = 0, limit: Optional[int] = None) -> str:
+async def get_entity(ctx: ToolContext, entity_id: str, offset: int = 0,
+                     limit: Optional[int] = None) -> str:
     """Fetch ONE entity by ID — the full-content read (recall/list only give
     previews; come here to read a thing fully).
 
@@ -432,6 +531,16 @@ async def get_entity(entity_id: str, offset: int = 0, limit: Optional[int] = Non
         d = dict(row)
         d.pop("embedding", None)
         d.pop("search_vector", None)
+        # Starting to read a body longer than one output (a full read, or its
+        # first page, whatever its size): with the JEV reader on, it is read
+        # once for the request's question and only what it needs comes back.
+        # Later pages, and any page of a body read once already in this run
+        # (a fact's exact source span included), are never touched: they
+        # reach whatever it left out.
+        if offset == 0 and len(d.get("content") or "") > MAX_OUTPUT_CHARS:
+            text = await _read_long(ctx, d)
+            if text is not None:
+                return text
         if offset == 0 and limit is None:
             return _truncate(json.dumps(d, default=str, indent=2))
         # Explicit slice request → return exactly that slice + paging meta,
@@ -956,7 +1065,7 @@ async def delegate_to_subagent(task: str) -> str:
         # leak the subagent's SubagentResult into the parent's run_typed.
         payload: SubagentResult = await run_typed(
             task,
-            get_subagent(),
+            await asyncio.to_thread(get_subagent),  # may probe the server for JEV: off the loop
             SubagentResult,
             max_turns=settings.agent_subagent_max_turns,
         )

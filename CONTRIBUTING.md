@@ -40,32 +40,34 @@ See [`tests/README.md`](tests/README.md) for what is and isn't covered.
 
 ## Adding a new LLM provider
 
-The reference implementation and recommended default is `deepinfra` with `google/gemma-4-31B-it` — fast, cheap, validated end-to-end on the wiki/maintainer/writer pipeline. Other providers are configured the same way.
+The reference implementation and recommended default is `deepinfra` with `deepseek-ai/DeepSeek-V4.1-Flash` — fast, cheap, and its replies carry the logprobs JEV reads. Other providers are configured the same way.
 
-LiteLLM does the heavy lifting — providers are selected by a prefix in the model string. To add a provider:
+Every profile is an OpenAI-compatible Chat Completions endpoint, driven by the OpenAI Agents SDK through the OpenAI client. To add a provider:
 
 1. Open [`braindb/config.py`](braindb/config.py) and add an entry to `_LLM_PROFILES`:
    ```python
    "my_provider": {
-       "model": "my_provider/vendor/model-id",   # exact string LiteLLM expects
+       "model": "vendor/model-id",                      # the provider's own model id
        "api_key_env": "MY_PROVIDER_API_KEY",
+       "base_url": "https://api.my-provider.example/v1",
    },
    ```
+   If it is a hosted gateway (a real key is always required), also add its name to `_HOSTED_PROFILES`.
 2. Add `MY_PROVIDER_API_KEY=` to [`.env.example`](.env.example).
 3. Add the env passthrough to [`docker-compose.yml`](docker-compose.yml) under the `api` service.
 4. (Optional) Document the provider in the README and BRAINDB_GUIDE.
 
-No other code changes required — the agent resolves model and key through `settings.resolved_agent_model` and `settings.resolved_api_key`, which read the active profile.
+No other code changes required — the agent resolves model, key and endpoint through `settings.resolved_agent_model`, `settings.resolved_api_key` and `settings.resolved_base_url`, which read the active profile. A provider that does *not* speak the OpenAI protocol would need a different model class in `braindb/agent/agent.py::_model()`, the one place the model is built.
 
 ### Self-hosted OpenAI-compatible servers (vLLM, Ollama, llama.cpp)
 
-If you just want to point at *any* OpenAI-compatible `/v1` endpoint without touching code, use the built-in **`openai_compatible`** profile: set `LLM_PROFILE=openai_compatible`, `AGENT_MODEL=openai/<model-id>`, and `OPENAI_BASE_URL` in your `.env` (plus `OPENAI_API_KEY` if the server needs auth). It takes its base URL from the environment — uniquely; every other profile's `base_url` is fixed in the table below.
+If you just want to point at *any* OpenAI-compatible `/v1` endpoint without touching code, use the built-in **`openai_compatible`** profile: set `LLM_PROFILE=openai_compatible`, `AGENT_MODEL=<model-id>`, and `OPENAI_BASE_URL` in your `.env` (plus `OPENAI_API_KEY` if the server needs auth). It takes its base URL from the environment — uniquely; every other profile's `base_url` is fixed in the table below.
 
-To **bake in** a recurring self-hosted target as its own named profile instead, add a `base_url` field to the entry and use LiteLLM's `openai/` prefix to route through the OpenAI-compatible code path:
+To **bake in** a recurring self-hosted target as its own named profile instead, add an entry with its `base_url`:
 
 ```python
 "vllm_workstation": {
-    "model": "openai/cyankiwi/gemma-4-31B-it-AWQ-4bit",
+    "model": "cyankiwi/gemma-4-31B-it-AWQ-4bit",
     "api_key_env": "VLLM_API_KEY",
     "base_url": "http://host.docker.internal:8002/v1",
 },
@@ -73,7 +75,7 @@ To **bake in** a recurring self-hosted target as its own named profile instead, 
 
 When `base_url` points at the Docker host (`host.docker.internal`), the `api` service in [`docker-compose.yml`](docker-compose.yml) needs `extra_hosts: ["host.docker.internal:host-gateway"]` so the container can reach the host's loopback. The compose file in this repo already declares it.
 
-If your server runs without auth, leave the matching `*_API_KEY` env var unset — `settings.resolved_api_key` falls back to the literal `"EMPTY"` for any profile that has a `base_url`, which keeps the OpenAI client happy.
+If your server runs without auth, leave the matching `*_API_KEY` env var unset — `settings.resolved_api_key` falls back to the literal `"EMPTY"` for any self-hosted profile (one with a `base_url` that is not a hosted gateway), which keeps the OpenAI client happy. Model ids written with a profile's old LiteLLM prefix (`deepinfra/`, `nvidia_nim/`, or `openai/` / `hosted_vllm/` on self-hosted profiles) are still accepted, with a warning; a self-hosted model id that itself starts with `openai/` is then written with the prefix twice (`openai/openai/gpt-oss-20b`).
 
 ## Adding a new database migration
 

@@ -364,7 +364,7 @@ curl -X POST http://localhost:8000/api/v1/entities/datasources/ingest \
 
 ### BrainDB Agent — natural language queries
 
-`POST /api/v1/agent/query` — instead of orchestrating individual API calls, send a plain English request and let BrainDB's internal agent handle it. The agent uses the OpenAI Agents SDK with LiteLLM (provider pluggable via `LLM_PROFILE` — **`deepinfra` with `google/gemma-4-31B-it` is the recommended default**; `nim` and local vLLM are also supported) and has access to all 21 BrainDB operations as function tools.
+`POST /api/v1/agent/query` — instead of orchestrating individual API calls, send a plain English request and let BrainDB's internal agent handle it. The agent uses the OpenAI Agents SDK (provider pluggable via `LLM_PROFILE` — **`deepinfra` with `deepseek-ai/DeepSeek-V4.1-Flash` is the recommended default**; `nim` and local vLLM are also supported) and has access to all 21 BrainDB operations as function tools.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/agent/query \
@@ -374,6 +374,8 @@ curl -X POST http://localhost:8000/api/v1/agent/query \
 ```
 
 (`max_turns` is optional; the default — currently 20 — is used when omitted.)
+
+(`need` is optional too: one sentence, at most 2,000 characters, of what you want to find out, e.g. `"need": "the date Kestrel Mill reopened"`. The agent's JEV steps read for it — the reader on long entities and hops after a recall, both on by default, on a server whose replies carry logprobs (see README) — and so does the recall filter when `JEV_ENABLED=true`; without it, a short `query` serves. Elsewhere it has no effect.)
 
 **Save via the agent**:
 ```bash
@@ -395,10 +397,12 @@ The agent has these tools internally: `recall_memory`, `quick_search`, `save_fac
 - **DeepInfra — recommended default**: set `LLM_PROFILE=deepinfra` and `DEEPINFRA_API_KEY=...` in `.env`. Fast (5–30s per agent call), cheap, validated end-to-end. Get a key at https://deepinfra.com/
 - **NVIDIA NIM** (free-tier alternative): set `LLM_PROFILE=nim` and `NVIDIA_NIM_API_KEY=...` in `.env`. Get a key at https://build.nvidia.com/
 - **Self-hosted vLLM** (advanced / offline / requires GPU workstation): set `LLM_PROFILE=vllm_workstation` (or `..._qwen`, `..._gemma`) — points at a vLLM server bound to the Docker host's loopback at `:8002` / `:8010` / `:8009` respectively. Reach it from the docker network via an SSH tunnel if the GPU is on a remote machine. No API key needed if the server runs without auth. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to add your own self-hosted profile.
-- Profiles live in `braindb/config.py::_LLM_PROFILES`. Add new providers there (e.g. `together`, `openai`) by adding a dict entry — no code change required.
+- Profiles live in `braindb/config.py::_LLM_PROFILES`. Add new providers there (e.g. `together`, `openai`) by adding a dict entry (model id, key env var, base URL; hosted gateways also go in `_HOSTED_PROFILES`) — no code change required.
 - Optional override: set `AGENT_MODEL=` in `.env` to use a non-default model for the active profile.
 
 **Verbose logging**: set `AGENT_VERBOSE=true` in `.env` to log every tool call to stdout (visible via `docker logs braindb_api -f`). The HTTP response stays clean — only `answer` and `max_turns`.
+
+**Usage**: every `/agent/query` request records the tokens it spent — the agent's requests (subagents included) and any JEV decisions: requests, input, cached input, output — in `details.usage` of its `agent_query` row in the activity log, and in one `Usage (agent_query)` log line; on failure too.
 
 **Encoding**: when constructing the JSON body, use ASCII characters only (plain hyphens `-`, no em-dashes `—`). On Windows shells, special characters may get mangled and the server returns 400 Bad Request.
 

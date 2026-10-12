@@ -6,6 +6,7 @@ the Stage-2 `wiki_scheduler` sidecar. `/cron` and `/jobs` are pure SQL and
 non-destructive; `/maintain` and `/write` (later steps) drive the existing
 agent endpoint.
 """
+import asyncio
 import logging
 import re
 from datetime import datetime, timezone
@@ -14,13 +15,14 @@ from pathlib import Path
 from fastapi import APIRouter, Query
 
 from braindb import custom_profile
-from braindb.agent.agent import run_typed, get_maintainer_agent, get_writer_agent
+from braindb.agent.agent import first_turn, run_typed, get_gated_writer_agent, get_maintainer_agent, get_writer_agent
 from braindb.agent.run_state import install_handoff_slot, release_handoff_slot
-from braindb.agent.schemas import MaintainerClusterDecision, WikiWriteResult
+from braindb.agent.schemas import MaintainerClusterDecision, MaintainerClusterItem, WikiWriteResult
 from braindb.config import settings
 from braindb.db import get_conn
 from braindb.services.activity_log import log_activity
-from braindb.services import wiki_jobs
+from braindb.services import wiki_gate, wiki_jobs, wiki_triage
+from braindb.services.wiki_sections import parse_sections
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,7 @@ router = APIRouter(prefix="/api/v1/wiki", tags=["wiki"])
 _PROMPTS = Path(__file__).parent.parent / "agent" / "prompts"
 _MAINTAINER_PROMPT = (_PROMPTS / "wiki_maintainer_prompt.md").read_text(encoding="utf-8")
 _WRITER_PROMPT = (_PROMPTS / "wiki_writer_prompt.md").read_text(encoding="utf-8")
+_GATED_STEPS = (_PROMPTS / "wiki_writer_gated.md").read_text(encoding="utf-8")
 
 
 def _now_line() -> str:
@@ -74,6 +77,8 @@ async def wiki_maintain():
     call; each seed's own triage job is then closed with its own status
     (skip→rejected, attach→done+suggestion, …), exactly as in the
     one-at-a-time path. A singleton (or flag off) is just a 1-seed unit.
+    With JEV_WIKI_TRIAGE on, JEV first decides the seeds it can with
+    one-token picks (services/wiki_triage.py); the agent decides the rest.
     """
     # 1. Claim the unit (primary + related) + per-seed staleness guard — one txn.
     with get_conn() as conn:
@@ -114,46 +119,66 @@ async def wiki_maintain():
         # numbering used to resolve its chosen number(s) back to ids below.
         cat = wiki_jobs.list_active_wikis(conn)
 
-    # 2. ONE agent call for all live seeds. The prompt directs it to RESEARCH
-    #    EACH seed's own subject (recall_memory / view_tree / delegate) before
-    #    deciding — co-occurrence is not identity. Returns one decision per seed.
-    catalog_txt = (
-        "\n".join(
-            f"{i}. {w['canonical_name']} ({w['char_count']}ch)"
-            for i, w in enumerate(cat, 1)
-        )
-        or "(no existing wikis yet — attach/consolidate are impossible; "
-           "use create/skip/ambiguous)"
-    )
-    # Optional custom-profile shaping: a `.replace.md` may swap the template
-    # (before `.format`), and `.add.md` fragments are appended AFTER `.format`
-    # (so a fragment's literal `{`/`}` can never reach str.format). No active
-    # profile -> both are no-ops and this prompt is byte-identical to the base.
-    _maintainer_tmpl = custom_profile.replace_or_base(_MAINTAINER_PROMPT, "wiki_maintainer")
-    prompt = _maintainer_tmpl.format(
-        seeds=_seeds_block(seeds), wiki_catalog=catalog_txt
-    ) + _now_line() + custom_profile.additions("wiki_maintainer")
-    # `run_typed` returns an SDK-validated MaintainerClusterDecision, or raises
-    # if the model never submitted — handled below like any agent failure.
-    try:
-        res: MaintainerClusterDecision = await run_typed(
-            prompt, get_maintainer_agent(), MaintainerClusterDecision, max_turns=30
-        )
-    except Exception as e:
-        logger.exception("maintainer agent failed")
-        with get_conn() as conn:
-            wiki_jobs.finish_jobs(conn, [s["job_id"] for s in seeds], "failed",
-                                  f"agent error: {e}"[:500])
-            # A crashed run must be visible in the DB audit trail too, not
-            # only in wiki_job.last_error and the container log.
-            log_activity(conn, "wiki_maintain", None, None, details={
-                "result": "failed",
-                "jobs": [s["job_id"] for s in seeds],
-                "error": str(e)[:500],
-            })
-        return {"claimed": len(jobs), "result": "failed", "reason": str(e)}
+    # 2a. JEV triage (JEV_WIKI_TRIAGE, services/wiki_triage.py): each seed it
+    #     decides with one-token picks skips the agent run; the rest go to the
+    #     agent below. Off -> nothing here runs and every seed goes to the agent.
+    by_id: dict[str, MaintainerClusterItem] = {}
+    if wiki_triage.wanted():
+        try:
+            by_id = await asyncio.to_thread(wiki_triage.decide, seeds, cat)
+        except Exception:
+            logger.exception("JEV wiki triage failed; the agent decides every seed")
+    jev_ids = set(by_id)
+    agent_seeds = [s for s in seeds if s["brief"]["id"] not in jev_ids]
+    agent_error: str | None = None
 
-    by_id = {d.entity_id: d for d in res.decisions}
+    # 2. ONE agent call for all live seeds JEV did not decide. The prompt
+    #    directs it to RESEARCH EACH seed's own subject (recall_memory /
+    #    view_tree / delegate) before deciding — co-occurrence is not
+    #    identity. Returns one decision per seed.
+    if agent_seeds:
+        catalog_txt = (
+            "\n".join(
+                f"{i}. {w['canonical_name']} ({w['char_count']}ch)"
+                for i, w in enumerate(cat, 1)
+            )
+            or "(no existing wikis yet — attach/consolidate are impossible; "
+               "use create/skip/ambiguous)"
+        )
+        # Optional custom-profile shaping: a `.replace.md` may swap the
+        # template (before `.format`), and `.add.md` fragments are appended
+        # AFTER `.format` (so a fragment's literal `{`/`}` can never reach
+        # str.format). No active profile -> both are no-ops and this prompt is
+        # byte-identical to the base.
+        _maintainer_tmpl = custom_profile.replace_or_base(_MAINTAINER_PROMPT, "wiki_maintainer")
+        prompt = _maintainer_tmpl.format(
+            seeds=_seeds_block(agent_seeds), wiki_catalog=catalog_txt
+        ) + _now_line() + custom_profile.additions("wiki_maintainer")
+        # `run_typed` returns an SDK-validated MaintainerClusterDecision, or
+        # raises if the model never submitted — handled below like any agent
+        # failure.
+        try:
+            res: MaintainerClusterDecision = await run_typed(
+                prompt, get_maintainer_agent(), MaintainerClusterDecision, max_turns=30
+            )
+        except Exception as e:
+            logger.exception("maintainer agent failed")
+            with get_conn() as conn:
+                wiki_jobs.finish_jobs(conn, [s["job_id"] for s in agent_seeds], "failed",
+                                      f"agent error: {e}"[:500])
+                # A crashed run must be visible in the DB audit trail too,
+                # not only in wiki_job.last_error and the container log.
+                log_activity(conn, "wiki_maintain", None, None, details={
+                    "result": "failed",
+                    "jobs": [s["job_id"] for s in agent_seeds],
+                    "error": str(e)[:500],
+                })
+            if not jev_ids:
+                return {"claimed": len(jobs), "result": "failed", "reason": str(e)}
+            agent_error = f"agent error: {e}"[:500]  # JEV's decisions still apply below
+        else:
+            # The agent saw only its own seeds; JEV's decisions stand.
+            by_id.update({d.entity_id: d for d in res.decisions if d.entity_id not in jev_ids})
 
     # 3. Per seed: apply its decision + close its OWN job (same resolution as the
     #    one-at-a-time path). A seed the model omitted is released for a normal
@@ -164,6 +189,9 @@ async def wiki_maintain():
             for s in seeds:
                 eid = s["brief"]["id"]
                 d = by_id.get(eid)
+                if d is None and agent_error:
+                    outcomes[eid] = {"action": "failed", "error": agent_error}  # job closed above
+                    continue
                 if d is None:
                     wiki_jobs.release_or_fail_jobs(
                         conn, [s["job_id"]], "maintainer omitted this seed")
@@ -171,7 +199,8 @@ async def wiki_maintain():
                     continue
                 outcomes[eid] = _apply_decision(
                     conn, decision=d.model_dump(), orphan=s["brief"],
-                    job_id=s["job_id"], cat=cat, batch_id=batch_id)
+                    job_id=s["job_id"], cat=cat, batch_id=batch_id,
+                    decided_by="jev" if eid in jev_ids else None)
         except Exception:
             logger.exception("maintainer persistence failed")
             raise
@@ -196,7 +225,8 @@ def _seeds_block(seeds: list[dict]) -> str:
 
 
 def _apply_decision(conn, *, decision: dict, orphan: dict, job_id: str,
-                    cat: list[dict], batch_id: str | None) -> dict:
+                    cat: list[dict], batch_id: str | None,
+                    decided_by: str | None = None) -> dict:
     """Resolve ONE maintainer decision for one seed and close THAT seed's triage
     job — the exact attach/create/consolidate/skip handling used in the
     one-at-a-time path, applied per seed. Wikis are referenced by catalog NUMBER
@@ -271,8 +301,11 @@ def _apply_decision(conn, *, decision: dict, orphan: dict, job_id: str,
         wiki_jobs.finish_job(conn, job_id, "failed", f"unknown action {action!r}")
         outcome = {"action": action, "error": "unknown action"}
 
+    # Who decided is part of the audit trail once JEV triage is on (agent
+    # decisions keep their rows as they were).
     log_activity(conn, "wiki_maintain", orphan["entity_type"], orphan_id,
-                 details={"job_id": job_id, **outcome})
+                 details={"job_id": job_id, **outcome,
+                          **({"decided_by": decided_by} if decided_by else {})})
     return outcome
 
 
@@ -303,6 +336,82 @@ _INLINE_BODY_MAX_CHARS = 4000
 _DENSITY_NUDGE_CHARS = 30000
 
 
+# The writer prompt's research steps (Step 1 gather, Step 2 the identity
+# subagent, Step 3 write for the resolved entity), which the gate's outcome
+# replaces: from this heading up to the next one.
+_STEPS = ("## Mandatory order of work", "## Identity discipline")
+
+# How much of a long page's target sections a gated job shows inline.
+_GATED_SECTIONS_MAX_CHARS = 12000
+
+
+def _gated_template(tmpl: str) -> str | None:
+    """The writer template with its research steps replaced by the gate's
+    (the checked facts come last in the prompt), or None when the template
+    does not hold those steps."""
+    a, b = tmpl.find(_STEPS[0]), tmpl.find(_STEPS[1])
+    if a < 0 or b < a:
+        return None
+    return tmpl[:a] + _GATED_STEPS + tmpl[b:]
+
+
+def _gated_outline_block(wiki_id: str, revision: int, old_body: str, sections: list) -> str:
+    """A long page as a gated job's prompt shows it before the facts: its
+    outline, lettered for the gate's placement."""
+    lines = [f"[BODY OMITTED — {len(old_body)} chars, too large to inline (wiki_id {wiki_id}, revision {revision}).",
+             "Outline (section: chars - its first words):"]
+    lines += wiki_gate.outline(sections)
+    lines.append("Where this job's facts belong, and those sections in full, follow the facts at the end of this "
+                 "prompt. Read another section with read_wiki_section whenever the job's rules need it (the header, "
+                 "the references, a section a fact also changes). Edit with edit_wiki_section (expect_revision "
+                 'as above), then validate_wiki and final_answer(mode="attach", body="").]'
+                 + _density_nudge(len(old_body)))
+    return "\n".join(lines)
+
+
+def _gated_sections_block(gate, sections: list) -> str:
+    """What a gated job's prompt ends with on a long page: where each fact
+    goes, and only those sections in full (within a budget)."""
+    targets: dict[str, list[str]] = {}
+    for fid, name in gate.sections.items():
+        targets.setdefault(name, []).append(fid)
+    unplaced = [f["id"] for f in gate.members + gate.found if f["id"] not in gate.sections]
+    shown, too_long, budget = [], [], _GATED_SECTIONS_MAX_CHARS
+    for s in sections:
+        if s.name in targets:
+            if s.char_count <= budget:
+                shown.append(f"<!-- section: {s.name} -->\n{s.content.strip()}")
+                budget -= s.char_count
+            else:
+                too_long.append(s.name)
+    lines = ["### Where this job's facts belong (section <- fact ids)"]
+    lines += [f"- {'a NEW section (name it)' if name == 'new' else name} <- {', '.join(ids)}"
+              for name, ids in targets.items()]
+    if unplaced:
+        lines.append(f"Place these yourself, reading the sections you need: {', '.join(unplaced)}")
+    if too_long:
+        lines.append(f"Too long to show here; read before replacing: {', '.join(too_long)}")
+    if shown:
+        lines.append("Those sections in full:")
+    return "\n\n" + "\n".join(lines) + ("\n\n" + "\n\n".join(shown) if shown else "")
+
+
+def _density_nudge(chars: int) -> str:
+    """The paragraph a page above _DENSITY_NUDGE_CHARS adds to its stub."""
+    if chars <= _DENSITY_NUDGE_CHARS:
+        return ""
+    return (
+        f"\n\nThis page is ALREADY LONG ({chars} chars). Prefer\n"
+        f"density over growth: integrate into existing prose rather than\n"
+        f"append parallel sentences, and where a NON-member detail you\n"
+        f"turned up belongs to a neighbouring subject, name that page in\n"
+        f"prose instead of restating it here — or leave it out; it stays\n"
+        f"an orphan and comes back for its own page later. This never\n"
+        f"applies to a MEMBER of this job: every member must be cited\n"
+        f"here regardless of length."
+    )
+
+
 def _body_block_or_stub(mode: str, wiki_id: str | None, old_body: str) -> str:
     """For attach mode with a body too large to safely inline, return a
     stub directing the agent to use the section tools instead. Small
@@ -310,18 +419,7 @@ def _body_block_or_stub(mode: str, wiki_id: str | None, old_body: str) -> str:
     if not old_body:
         return "(none — create mode)"
     if mode == "attach" and wiki_id and len(old_body) > _INLINE_BODY_MAX_CHARS:
-        nudge = ""
-        if len(old_body) > _DENSITY_NUDGE_CHARS:
-            nudge = (
-                f"\n\nThis page is ALREADY LONG ({len(old_body)} chars). Prefer\n"
-                f"density over growth: integrate into existing prose rather than\n"
-                f"append parallel sentences, and where a NON-member detail you\n"
-                f"turned up belongs to a neighbouring subject, name that page in\n"
-                f"prose instead of restating it here — or leave it out; it stays\n"
-                f"an orphan and comes back for its own page later. This never\n"
-                f"applies to a MEMBER of this job: every member must be cited\n"
-                f"here regardless of length."
-            )
+        nudge = _density_nudge(len(old_body))
         return (
             f"[BODY OMITTED — {len(old_body)} chars, too large to inline.\n"
             f"Use the section tools to navigate without consuming context:\n"
@@ -343,7 +441,12 @@ async def wiki_write():
     content gate, no manifest, no code-built ledger. The only guarantees are
     process/bookkeeping: the prior version is snapshotted (reversible) and
     `summarises` relations are reconciled *additively* from the LLM's inline
-    refs. The LLM researches with its own tools before writing.
+    refs. The LLM researches with its own tools before writing — unless
+    JEV_WIKI_GATE takes an attach/create job: the facts memory holds about the
+    subject are then checked one at a time inside the gated writer's own first
+    request, and it gets only those kept (and, on a long page, only the
+    sections they belong in) and edits without research tools
+    (services/wiki_gate.py).
     """
     # 1. Pick + claim a bucket.
     with get_conn() as conn:
@@ -445,16 +548,47 @@ async def wiki_write():
     # `.add.md` fragments are appended after substitution. No active profile ->
     # both are no-ops and this prompt is byte-identical to the base.
     _writer_tmpl = custom_profile.replace_or_base(_WRITER_PROMPT, "wiki_writer")
-    prompt = (
-        _writer_tmpl
-        .replace("%%MODE%%", mode)
-        .replace("%%CANONICAL%%", canonical)
-        .replace("%%WIKI_ID%%", bucket["target_wiki_id"] or "(assigned after write)")
-        .replace("%%MEMBERS%%", _members_block(members))
-        .replace("%%CURRENT_BODY%%", _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
-        .replace("%%RELATED_WIKIS%%", _related_wikis_block(related))
-        .replace("%%DUPLICATES%%", _dupes_block(dupes))
-    ) + _now_line() + custom_profile.additions("wiki_writer")
+
+    def _prompt(tmpl: str, members_block: str, body_block: str) -> str:
+        return (
+            tmpl
+            .replace("%%MODE%%", mode)
+            .replace("%%CANONICAL%%", canonical)
+            .replace("%%WIKI_ID%%", bucket["target_wiki_id"] or "(assigned after write)")
+            .replace("%%MEMBERS%%", members_block)
+            .replace("%%CURRENT_BODY%%", body_block)
+            .replace("%%RELATED_WIKIS%%", _related_wikis_block(related))
+            .replace("%%DUPLICATES%%", _dupes_block(dupes))
+        ) + _now_line() + custom_profile.additions("wiki_writer")
+
+    # 2b. The JEV gate (JEV_WIKI_GATE, services/wiki_gate.py), inside the
+    #     gated writer's own first request: the job is its prompt (research
+    #     steps replaced, a long page as its lettered outline), then LAST the
+    #     facts memory holds about the subject, each kept or rolled back by
+    #     one token, and on a long page each member's and kept fact's section;
+    #     those sections close the prompt. None (off, consolidate, a profile
+    #     that replaces the writer's prompt, or anything the gate cannot do)
+    #     -> the full writer, with exactly today's prompt.
+    gate = None
+    long_page = mode == "attach" and len(old_body) > _INLINE_BODY_MAX_CHARS
+    sections: list = []
+    _gated = _gated_template(_writer_tmpl)
+    try:
+        if mode in ("attach", "create") and _gated is not None and wiki_gate.wanted():
+            sections = parse_sections(old_body)[1] if long_page else []
+            head = _prompt(_gated, wiki_gate.members_block(members),
+                           _gated_outline_block(bucket["target_wiki_id"], wiki["revision"], old_body, sections)
+                           if long_page else _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
+            turn = await first_turn(get_gated_writer_agent(), head.strip())
+            gate = await asyncio.to_thread(wiki_gate.prepare, turn, canonical, old_body, members, sections)
+    except Exception:
+        logger.exception("JEV wiki gate failed; the full writer runs")
+        gate = None
+    if gate:
+        prompt = gate.prompt + (_gated_sections_block(gate, sections) if long_page else "")
+    else:
+        prompt = _prompt(_writer_tmpl, _members_block(members),
+                         _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
     # Capture pre-run revision on the target wiki for `attach` mode so we
     # can detect whether the writer used the section-edit tools (each
     # bumps `wikis_ext.revision` directly). The writer may then submit an
@@ -492,8 +626,10 @@ async def wiki_write():
     handoff_slot, handoff_token = install_handoff_slot()
     try:
         try:
+            # Built here so a build failure releases the jobs like any agent error.
+            writer_agent = get_gated_writer_agent() if gate else get_writer_agent()
             res: WikiWriteResult = await run_typed(
-                prompt, get_writer_agent(), WikiWriteResult, max_turns=30,
+                prompt, writer_agent, WikiWriteResult, max_turns=30,
                 token_budget=settings.agent_writer_handoff_token_budget,
             )
             depth = 0
@@ -539,7 +675,7 @@ async def wiki_write():
                     depth, max_depth, mode, job_ids,
                 )
                 res = await run_typed(
-                    f"{prompt}\n\n{seed}", get_writer_agent(), WikiWriteResult,
+                    f"{prompt}\n\n{seed}", writer_agent, WikiWriteResult,
                     max_turns=30,
                     token_budget=settings.agent_writer_handoff_token_budget,
                 )
@@ -561,6 +697,7 @@ async def wiki_write():
                                      "result": disp, "mode": mode,
                                      "jobs": job_ids,
                                      "error": "handoff depth exhausted",
+                                     **({"gate": gate.record()} if gate else {}),
                                  })
                 return {"written": 0, "result": disp,
                         "reason": "handoff depth exhausted"}
@@ -574,6 +711,7 @@ async def wiki_write():
                              bucket.get("target_wiki_id"), details={
                                  "result": disp, "mode": mode,
                                  "jobs": job_ids, "error": str(e)[:500],
+                                 **({"gate": gate.record()} if gate else {}),
                              })
             return {"written": 0, "result": disp, "reason": str(e)}
     finally:
@@ -641,6 +779,7 @@ async def wiki_write():
                                  "revision": pre_revision,
                                  "members": len(member_ids),
                                  "members_gone": gone, **rel,
+                                 **({"gate": gate.record()} if gate else {}),
                              })
             logger.info(
                 "writer no-op accepted: pre_rev=%s, all %d members already "
@@ -716,6 +855,7 @@ async def wiki_write():
         log_activity(conn, "wiki_write", "wiki", wiki_id, details={
             "mode": mode, "revision": revision, "jobs": job_ids,
             "members": len(member_ids), "retired": retired, **rel,
+            **({"gate": gate.record()} if gate else {}),
         })
 
     return {"written": 1, "wiki_id": wiki_id, "mode": mode,

@@ -218,3 +218,165 @@ def make_relation(api: str) -> Callable[..., dict]:
         assert r.status_code == 201, f"create relation failed: {r.status_code} {r.text}"
         return r.json()
     return _make
+
+
+# ---------------------------------------------------------------------------
+# JEV's model server, faked: no test ever reaches a real one
+# ---------------------------------------------------------------------------
+
+class FakeChat:
+    """An OpenAI-compatible chat completions endpoint for the JEV tests, put
+    behind the real openai client (a MockTransport of httpx2, the HTTP
+    library the openai client uses), so every request
+    is built and every reply read exactly as in production.
+
+    Each request's JSON body is kept in `bodies`. `reply(body)` says what the
+    model writes: a list of tokens, each `(text, {token: probability})` for a
+    token with alternatives (the chosen one is `text`) or `(text, None)`; or
+    an HTTP status for that request alone (`asked(body)` gives the question
+    line and the content it is asked about, in either of jev's forms).
+    `status` answers every request with that status; `alternatives = False`
+    returns only the chosen token's logprob (as some gateways do);
+    `continues = False` makes it a server that does not continue a reply the
+    request opens (it starts a new turn, as a hosted gateway did), so jev
+    asks it in the standard form. jev's own check of that (`Server.mode`) is
+    answered here. `max_tokens` and `stop` apply as a server applies them;
+    usage counts 4 chars of the request a token, and caches what it shares
+    with the request before."""
+
+    def __init__(self, model: str, reply):
+        import threading
+
+        self.model, self.reply = model, reply
+        self.bodies: list[dict] = []
+        self.status: int | None = None
+        self.alternatives = True
+        self.continues = True
+        self._lock = threading.Lock()
+        self._last = ""
+
+    @staticmethod
+    def asked(body: dict) -> tuple[str, str]:
+        """The question line a JEV request asks, and the content it asks it
+        about: the reply's opening and the message before it (continue form),
+        or the last line of the last message and the rest of it, or the
+        message before when the question is its own turn (standard form)."""
+        msgs = body["messages"]
+        last = msgs[-1]
+        if last["role"] == "assistant":
+            return last["content"], msgs[-2]["content"]
+        lines = (last["content"] or "").rstrip("\n").split("\n")
+        if last["role"] == "user" and len(msgs) > 1 and msgs[-2]["role"] == "user":
+            return lines[-1], msgs[-2]["content"]
+        return lines[-1], "\n".join(lines[:-1])
+
+    def _check(self, body: dict):
+        """jev's check that a reply the request opens is continued."""
+        from braindb.services import jev
+
+        if not self.continues:
+            return [("\n", None)]                   # a new turn begins: no answer
+        want = "yes" if jev._PROBE_YES in body["messages"][-2]["content"] else "no"
+        return [(f" {want}", {f" {want}": 0.98, f" {'no' if want == 'yes' else 'yes'}": 0.01})]
+
+    def handle(self, request):
+        import json as _json
+        import math
+
+        import httpx2
+
+        from braindb.services import jev
+
+        body = _json.loads(request.content)
+        with self._lock:
+            self.bodies.append(body)
+        status = self.status or None
+        if not status and body.get("continue_final_message") and body["messages"][0]["content"] == jev._GUIDE:
+            tokens = self._check(body)
+        elif not status and body.get("continue_final_message") and not self.continues:
+            tokens = [("\n", None)]
+        else:
+            tokens = None if status else self.reply(body)
+        if isinstance(tokens, int):
+            status = tokens
+        if status:
+            return httpx2.Response(status, json={"error": {"message": "refused by the fake", "type": "test"}})
+        out, finish = [], "stop"
+        for text, alts in tokens:
+            if len(out) >= body.get("max_tokens", 16):
+                finish = "length"
+                break
+            if any(s and s in text for s in body.get("stop") or []):
+                break
+            out.append((text, alts))
+        lp = []
+        for text, alts in out:
+            alts = alts or {text: 1.0}
+            p = alts.get(text, 1.0)
+            lp.append({"token": text, "logprob": math.log(p) if p > 0 else -9999.0, "bytes": None,
+                       "top_logprobs": [{"token": t, "logprob": math.log(q) if q > 0 else -9999.0, "bytes": None}
+                                        for t, q in alts.items()] if self.alternatives else []})
+        sent = _json.dumps(body.get("messages")) + _json.dumps(body.get("tools") or [])
+        with self._lock:
+            shared = next((i for i, (a, b) in enumerate(zip(sent, self._last)) if a != b), min(len(sent), len(self._last)))
+            self._last = sent
+        payload = {
+            "id": "chatcmpl-fake", "object": "chat.completion", "created": 0, "model": self.model,
+            "choices": [{"index": 0, "finish_reason": finish,
+                         "message": {"role": "assistant", "content": "".join(t for t, _ in out)},
+                         "logprobs": {"content": lp} if body.get("logprobs") else None}],
+            "usage": {"prompt_tokens": len(sent) // 4, "completion_tokens": len(out),
+                      "total_tokens": len(sent) // 4 + len(out),
+                      "prompt_tokens_details": {"cached_tokens": shared // 4}}}
+        # NaN must survive into the reply (a broken forward pass): json.dumps writes it, httpx2's json= would not.
+        return httpx2.Response(200, content=_json.dumps(payload).encode(),
+                              headers={"content-type": "application/json"})
+
+
+def _serve(monkeypatch, handler) -> None:
+    """Every openai client JEV builds talks to `handler` instead of a network."""
+    import httpx2
+    import openai
+
+    from braindb.services import jev
+
+    monkeypatch.setattr(jev, "OpenAI", lambda **kw: openai.OpenAI(
+        **kw, http_client=httpx2.Client(transport=httpx2.MockTransport(handler))))
+
+
+@pytest.fixture(autouse=True)
+def _no_model_server(monkeypatch):
+    """JEV's features are on by default and ask the agent profile's server on
+    first use: no test may reach a real one, and none may inherit another's
+    JEV state. Unless a test installs a fake (`fake_chat`), every JEV request
+    is refused as unauthorised, so JEV stays off, as on a server it cannot use."""
+    try:
+        import httpx2
+
+        from braindb.services import hops, jev, reader, wiki_gate, wiki_triage
+    except ImportError:  # an environment without the package: integration tests only
+        yield
+        return
+    _serve(monkeypatch, lambda request: httpx2.Response(401, json={"error": {"message": "no model server in tests"}}))
+    monkeypatch.setattr(jev, "_judge", None)
+    monkeypatch.setattr(jev, "_off_until", 0.0)
+    monkeypatch.setattr(jev, "_modes", {})
+    monkeypatch.setattr(reader, "_state", {"server": None, "off_until": 0.0})
+    monkeypatch.setattr(hops, "_state", {"off_until": 0.0})
+    monkeypatch.setattr(wiki_gate, "_state", {"server": None, "off_until": 0.0})
+    monkeypatch.setattr(wiki_triage, "_state", {"choice": None, "options": None, "off_until": 0.0})
+    yield
+
+
+@pytest.fixture
+def fake_chat(monkeypatch):
+    """Factory: `fake_chat(reply)` serves every JEV request from a FakeChat
+    answering with `reply` (see FakeChat), on the agent profile's model."""
+    from braindb.services import jev
+
+    def install(reply) -> FakeChat:
+        fake = FakeChat(jev.settings.resolved_agent_model, reply)
+        _serve(monkeypatch, fake.handle)
+        return fake
+
+    return install

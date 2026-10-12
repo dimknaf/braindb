@@ -43,6 +43,7 @@ import json
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -118,6 +119,27 @@ def _call_judge(prompt_text: str, model_id: str, timeout: float = 180) -> str:
     return body["choices"][0]["message"]["content"]
 
 
+# A self-hosted judge that reasons at length can miss a deadline or drop a
+# connection under load. Without retries such a nugget scored 0.0, silently,
+# exactly like a real "not met" - so the arm that hit more timeouts looked
+# worse. Transport failures are now retried with backoff, and a nugget that
+# still fails is COUNTED as a judge error (kept separate from parse errors)
+# so a run with errors is visible and can be re-judged.
+_RETRY_BACKOFF_S = (10, 30, 60)
+
+
+def _call_judge_with_retries(prompt_text: str, model_id: str, timeout: float,
+                             retries: int) -> str:
+    for attempt in range(retries + 1):
+        try:
+            return _call_judge(prompt_text, model_id, timeout=timeout)
+        except Exception:
+            if attempt == retries:
+                raise
+            time.sleep(_RETRY_BACKOFF_S[min(attempt, len(_RETRY_BACKOFF_S) - 1)])
+    raise AssertionError("unreachable")
+
+
 # ---- Verdict parsing --------------------------------------------------------
 
 _SCORE_RE = re.compile(r'"score"\s*:\s*([0-9.]+)')
@@ -174,10 +196,12 @@ def _judge_one_question(
     rubric: list[str],
     model_id: str,
     timeout: float,
+    retries: int = 0,
 ) -> dict:
     nugget_results = []
     cumulative = 0.0
     parse_errors = 0
+    judge_errors = 0
     for nugget in rubric:
         prompt_text = (
             unified_llm_judge_base_prompt
@@ -186,10 +210,11 @@ def _judge_one_question(
             .replace("<llm_response>", llm_response)
         )
         try:
-            raw = _call_judge(prompt_text, model_id, timeout=timeout)
+            raw = _call_judge_with_retries(prompt_text, model_id, timeout, retries)
             verdict = _parse_judge_response(raw)
         except Exception as e:
             verdict = {"score": 0.0, "error": f"{type(e).__name__}: {e}"}
+            judge_errors += 1
         if verdict.get("parse_error"):
             parse_errors += 1
         nugget_results.append({"nugget": nugget, "verdict": verdict})
@@ -199,11 +224,13 @@ def _judge_one_question(
         "nugget_count": len(rubric),
         "nugget_average_score": round(avg, 4),
         "parse_errors": parse_errors,
+        "judge_errors": judge_errors,
         "nuggets": nugget_results,
     }
 
 
-def judge_conversation(conv_dir: Path, model_id: str, timeout: float = 180) -> dict:
+def judge_conversation(conv_dir: Path, model_id: str, timeout: float = 180,
+                       workers: int = 1, retries: int = 0) -> dict:
     """Score every (answer, rubric) pair in one conv subdirectory.
 
     Reads ``answers.json`` + ``probing_questions.json``. Writes
@@ -218,35 +245,49 @@ def judge_conversation(conv_dir: Path, model_id: str, timeout: float = 180) -> d
     by_category: dict[str, list[dict]] = {}
     category_scores: dict[str, dict] = {}
 
-    for category, questions in answers.items():
-        rubrics = [item.get("rubric", []) for item in probing.get(category, [])]
-        per_q = []
-        for i, ans_item in enumerate(questions):
-            question = ans_item["question"]
-            response = ans_item["llm_response"]
-            rubric = rubrics[i] if i < len(rubrics) else []
-            if not rubric:
-                per_q.append({
-                    "question": question,
-                    "skipped": True,
-                    "reason": "no rubric for this index",
-                })
-                continue
-            qstart = time.monotonic()
-            result = _judge_one_question(question, response, rubric, model_id, timeout)
-            result["question"] = question
-            result["llm_response_preview"] = (response or "")[:300]
-            result["elapsed_s"] = round(time.monotonic() - qstart, 2)
-            per_q.append(result)
-            print(
-                f"  [{conv_dir.name} {category} {i+1}/{len(questions)}] "
-                f"score={result['nugget_average_score']:.2f} "
-                f"nuggets={result['nugget_count']} "
-                f"parse_err={result['parse_errors']} "
-                f"({result['elapsed_s']}s)",
-                flush=True,
-            )
-        by_category[category] = per_q
+    def _judge(category: str, i: int, n: int, question: str, response: str,
+               rubric: list[str]) -> dict:
+        qstart = time.monotonic()
+        result = _judge_one_question(question, response, rubric, model_id, timeout, retries)
+        result["question"] = question
+        result["llm_response_preview"] = (response or "")[:300]
+        result["elapsed_s"] = round(time.monotonic() - qstart, 2)
+        print(
+            f"  [{conv_dir.name} {category} {i+1}/{n}] "
+            f"score={result['nugget_average_score']:.2f} "
+            f"nuggets={result['nugget_count']} "
+            f"parse_err={result['parse_errors']} "
+            f"judge_err={result['judge_errors']} "
+            f"({result['elapsed_s']}s)",
+            flush=True,
+        )
+        return result
+
+    # Questions are independent, so `workers` > 1 judges them in parallel;
+    # each question's nuggets stay sequential and results keep their order.
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        pending: dict[str, list] = {}
+        for category, questions in answers.items():
+            rubrics = [item.get("rubric", []) for item in probing.get(category, [])]
+            slots: list = []
+            for i, ans_item in enumerate(questions):
+                question = ans_item["question"]
+                response = ans_item["llm_response"]
+                rubric = rubrics[i] if i < len(rubrics) else []
+                if not rubric:
+                    slots.append({
+                        "question": question,
+                        "skipped": True,
+                        "reason": "no rubric for this index",
+                    })
+                    continue
+                slots.append(pool.submit(_judge, category, i, len(questions),
+                                         question, response, rubric))
+            pending[category] = slots
+        for category, slots in pending.items():
+            by_category[category] = [s.result() if hasattr(s, "result") else s for s in slots]
+
+    for category, per_q in by_category.items():
         non_skipped = [q for q in per_q if "skipped" not in q]
         cat_avg = (
             sum(q["nugget_average_score"] for q in non_skipped) / len(non_skipped)
@@ -268,6 +309,7 @@ def judge_conversation(conv_dir: Path, model_id: str, timeout: float = 180) -> d
     aggregate = {
         "overall_average_score": round(overall_avg, 4),
         "total_questions_judged": len(overall_questions),
+        "judge_errors": sum(q.get("judge_errors", 0) for q in overall_questions),
         "categories": category_scores,
         "model_id": model_id,
         "judge_endpoint": QWEN_BASE_URL,
@@ -295,6 +337,14 @@ def _parse_args() -> argparse.Namespace:
                    help="per-judge-call HTTP timeout")
     p.add_argument("--model", default=None,
                    help="override judge model id (otherwise auto-resolved from vLLM /v1/models)")
+    p.add_argument("--workers", type=int, default=1,
+                   help="questions judged in parallel (default 1 = sequential)")
+    p.add_argument("--retries", type=int, default=2,
+                   help="retries per nugget on timeouts / dropped connections before it is "
+                        "counted as a judge error")
+    p.add_argument("--require-endpoint", default=None,
+                   help="refuse to start unless the judge endpoint starts with this prefix, so "
+                        "answers can never be sent to the hosted default by mistake")
     return p.parse_args()
 
 
@@ -305,8 +355,12 @@ def main() -> int:
         print(f"run dir not found: {run_dir}")
         return 1
 
+    if args.require_endpoint and not QWEN_BASE_URL.startswith(args.require_endpoint):
+        print(f"REFUSING: judge endpoint is not {args.require_endpoint!r} "
+              f"(set QWEN_BASE_URL); nothing was sent")
+        return 2
     model_id = args.model or _resolve_qwen_model()
-    print(f"judge: {QWEN_BASE_URL}  model={model_id}")
+    print(f"judge: {QWEN_BASE_URL}  model={model_id}  workers={args.workers}")
 
     only_ids = None
     if args.only_conv:
@@ -324,7 +378,8 @@ def main() -> int:
     for conv_dir in conv_dirs:
         print(f"\n--- {conv_dir.name} ---")
         try:
-            agg = judge_conversation(conv_dir, model_id, timeout=args.timeout)
+            agg = judge_conversation(conv_dir, model_id, timeout=args.timeout,
+                                     workers=args.workers, retries=args.retries)
             aggregates.append({"conv": conv_dir.name, **agg})
         except Exception as e:
             print(f"!!! failed: {e}")

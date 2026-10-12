@@ -12,8 +12,11 @@ if config.config_file_name is not None:
 
 db_url = os.environ.get("DATABASE_URL", "")
 if db_url:
-    # Alembic uses sync engine — strip asyncpg driver if present
+    # Alembic uses a sync engine on the one driver BrainDB installs
+    # (psycopg2), named explicitly: SQLAlchemy 2.1 maps a bare postgresql://
+    # to psycopg 3 instead, which would stop the API at start-up.
     db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
+    db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
     config.set_main_option("sqlalchemy.url", db_url)
 
 target_metadata = None
