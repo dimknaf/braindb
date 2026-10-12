@@ -76,7 +76,8 @@ jobs:
         # context) pin its contract against fake model servers: every
         # switch off leaves outputs and tool schemas byte-identical, each
         # decision is one token, and every failure falls back; their *_db.py
-        # files use the same Postgres service.
+        # files use the same Postgres service, as does graph_expand_db, which
+        # pins recall's traversal to the path query it replaced.
         run: |
           docker exec braindb_api python -m pytest \
             tests/test_final_answer_rename.py \
@@ -94,6 +95,7 @@ jobs:
             tests/test_reader.py \
             tests/test_hops.py \
             tests/test_context_jev_db.py \
+            tests/test_graph_expand_db.py \
             -v
 
       - name: Dump api logs on failure
