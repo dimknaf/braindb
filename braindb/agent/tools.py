@@ -206,10 +206,9 @@ async def recall_memory(
             with get_conn() as conn:
                 return assemble_context(conn, req, need=need)
 
-        # With a need (and JEV on), JEV judges the items over HTTP for a few
-        # seconds: off the event loop, so concurrent runs keep going.
-        # Otherwise the recall runs inline exactly as before.
-        result = await asyncio.to_thread(_recall) if need else _recall()
+        # Off the event loop: a slow recall (or JEV judging its items over
+        # HTTP, with a need) never stalls the other requests the API serves.
+        result = await asyncio.to_thread(_recall)
         # EVERY item must survive into the rendered output — the per-query
         # quota guarantees membership, and a blind tail-truncate would undo
         # that guarantee for low-ranked reserved items (items are sorted by
@@ -257,9 +256,13 @@ async def quick_search(query: str, limit: int = 10) -> str:
         limit: Max results (default 10).
     """
     try:
-        with get_conn() as conn:
-            rows = fuzzy_search(conn, query, None, 0.0, limit)
-            track_access(conn, [r["id"] for r in rows])
+        def _search():
+            with get_conn() as conn:
+                found = fuzzy_search(conn, query, None, 0.0, limit)
+                track_access(conn, [r["id"] for r in found])
+            return found
+
+        rows = await asyncio.to_thread(_search)
         lines = [f"Found {len(rows)} items:"]
         for r in rows:
             lines.append(
@@ -522,10 +525,13 @@ async def get_entity(ctx: ToolContext, entity_id: str, offset: int = 0,
                (legacy behaviour, unchanged).
     """
     try:
-        with get_conn() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT * FROM entities WHERE id = %s", (entity_id,))
-                row = cur.fetchone()
+        def _fetch():
+            with get_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute("SELECT * FROM entities WHERE id = %s", (entity_id,))
+                    return cur.fetchone()
+
+        row = await asyncio.to_thread(_fetch)
         if not row:
             return _err(f"entity {entity_id} not found")
         d = dict(row)
@@ -759,14 +765,17 @@ async def view_entity_relations(entity_id: str) -> str:
         entity_id: UUID of the entity.
     """
     try:
-        with get_conn() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    """SELECT id, from_entity_id, to_entity_id, relation_type, relevance_score, description
-                       FROM relations WHERE from_entity_id = %s OR to_entity_id = %s""",
-                    (entity_id, entity_id),
-                )
-                rows = [dict(r) for r in cur.fetchall()]
+        def _relations():
+            with get_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        """SELECT id, from_entity_id, to_entity_id, relation_type, relevance_score, description
+                           FROM relations WHERE from_entity_id = %s OR to_entity_id = %s""",
+                        (entity_id, entity_id),
+                    )
+                    return [dict(r) for r in cur.fetchall()]
+
+        rows = await asyncio.to_thread(_relations)
         if not rows:
             return "No relations."
         lines = [f"{len(rows)} relations:"]
@@ -825,8 +834,12 @@ async def view_tree(entity_id: str, max_depth: int = 2) -> str:
         return _err("max_depth must be 1-3")
     try:
         from braindb.services.tree import build_entity_tree
-        with get_conn() as conn:
-            tree = build_entity_tree(conn, entity_id, max_depth=max_depth)
+
+        def _tree():
+            with get_conn() as conn:
+                return build_entity_tree(conn, entity_id, max_depth=max_depth)
+
+        tree = await asyncio.to_thread(_tree)
         if tree is None:
             return _err(f"Entity not found: {entity_id}")
         return _truncate(json.dumps(tree, indent=2, default=str, ensure_ascii=False))
