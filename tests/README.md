@@ -57,6 +57,7 @@ A few tests drive internal services (e.g. `graph_expand`) over a direct DB conne
 | `test_agent.py` | `/agent/query` smoke — 200 with an `answer` field on a trivial prompt, 4xx on empty or missing query. Needs a configured LLM provider (credentials pass through from `.env`). |
 | `test_jev.py`, `test_reader.py`, `test_hops.py`, `test_wiki_triage.py`, `test_wiki_gate.py` (+ their `*_db.py`), `test_context_jev_db.py` | JEV against fake model servers, no LLM: every decision is one token, a failed probe or request falls back to the behaviour without JEV, and with JEV off the agent's outputs and tool schemas are unchanged. |
 | `test_usage_ledger.py` | The per-request usage ledger: every run of an `/agent/query` request adds into it, and it is recorded on failure too. |
+| `test_graph_expand_db.py` | Recall's graph traversal against the path-listing query it replaced, on a graph with a hub, a cycle, parallel relations, a NULL score, a self-loop and tied seeds: same rows, order and values. |
 
 ## What is NOT covered
 

@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] — 2026-10-12
+
+Headline: **recall stays fast on densely connected memories and on low-resource devices, with
+exactly the same results.** Recall's graph step no longer lists every path through the graph:
+on a copy of a real memory it takes about a second instead of up to a minute, and writes next to
+no temporary files instead of gigabytes; on slow storage the old step could take many minutes. The
+agent's database tools no longer hold up the rest of the API while they run, and reads no longer
+re-index stored text.
+
+### Fixed
+
+- **Recall's graph expansion.** It produced one row per path from every seed, three hops deep in
+  both directions, each row carrying the entity's full text, and then sorted them all. Entities
+  with many relations multiply the paths, so one recall could run for minutes and spill gigabytes
+  to disk. It now keeps the best relevance per entity and depth and reads each entity it reached
+  once. The rows, depths and scores are the same; where two seeds reach an entity equally, the
+  same one now wins every time. On a copy of a real memory, 25 recalls returned identical results
+  in 71 s instead of 19 minutes, writing 23 MB of temporary files instead of 175 GB.
+- **The agent's database tools ran on the event loop.** `recall_memory`, `quick_search`,
+  `get_entity`, `view_tree` and `view_entity_relations` now run in a worker thread, so a slow
+  query no longer stalls `/health` or other requests.
+- **Reads re-indexed stored text.** Recall's access counting fired the full-text trigger on every
+  entity it returned, re-tokenizing whole bodies. The trigger now fires only when the title,
+  content or keywords are written (migration 006). The stored index is unchanged.
+
+### Upgrading from v0.11.0
+
+Rebuild and restart (`docker compose up -d --build`); migration 006 runs at start. No data changes
+and nothing to re-embed.
+
 ## [0.11.0] — 2026-10-12
 
 Headline: **JEV — closed decisions read from the probability of a single answer token, taken

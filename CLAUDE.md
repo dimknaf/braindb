@@ -82,7 +82,7 @@ braindb/
 │       ├── tools.py                   # 21 @function_tool wrappers
 │       ├── run_state.py               # per-run state: typed submit, usage ledger, reading question
 │       └── prompts/system_prompt.md   # baked-in skill content (agent-voiced)
-├── alembic/                           # DB migrations (raw SQL, no ORM) — current: 004
+├── alembic/                           # DB migrations (raw SQL, no ORM) — current: 006
 ├── data/sources/                      # Drop files here — watcher picks them up
 │   ├── ingested/                      # Auto-moved here on success
 │   └── failed/                        # Auto-moved here on error (with .error.txt sidecar)

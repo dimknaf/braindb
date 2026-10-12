@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import threading
 import time
 from types import SimpleNamespace
 
@@ -284,6 +285,22 @@ def test_agent_query_carries_its_need_to_the_run_and_clears_it(monkeypatch):
 
     assert asyncio.run(two_requests()) == ""
     assert seen == ["what X said", ""]
+
+
+def test_recall_memory_runs_off_the_event_loop_with_or_without_a_need(monkeypatch):
+    # A slow recall must never stall the other requests the API serves.
+    on_main = []
+
+    def fake_assemble(conn, req, need=None):
+        on_main.append(threading.current_thread() is threading.main_thread())
+        return ContextResponse(query="x", items=[], total_found=0)
+
+    monkeypatch.setattr(tools_mod, "assemble_context", fake_assemble)
+    monkeypatch.setattr(tools_mod, "get_conn", _no_db)
+    monkeypatch.setattr(tools_mod.settings, "jev_enabled", False)
+    args = json.dumps({"queries": ["x"]})
+    asyncio.run(tools_mod.recall_memory.on_invoke_tool(_recall_ctx(args), args))
+    assert on_main == [False]
 
 
 def test_recall_memory_passes_the_need_only_while_jev_is_enabled(monkeypatch):
